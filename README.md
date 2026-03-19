@@ -64,6 +64,8 @@ git push origin --delete feature/你的功能名稱
 ### 四、同步 develop（After Successfully Merged in Main）
 
 ```bash
+git checkout main
+git pull
 git checkout develop
 git merge main
 git push origin develop
