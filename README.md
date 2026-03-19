@@ -48,10 +48,16 @@ git push origin feature/你的功能名稱
 ### 三、Merge 完後 Clear Branch
 
 ```bash
+# 查看本地分支
+git branch
+
+# 查看 GitHub 分支
+git branch -r
+
 # 刪除本地分支
 git branch -d feature/你的功能名稱
 
-# 刪除 GitHub 上的分支
+# 刪除 GitHub 分支
 git push origin --delete feature/你的功能名稱
 ```
 
