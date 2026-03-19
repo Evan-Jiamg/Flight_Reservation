@@ -1,98 +1,122 @@
-CREATE TABLE Info (
-    infoId VARCHAR(50) PRIMARY KEY,
-    departureDate DATE,
-    arrivalDate DATE,
-    departure VARCHAR(100),
-    destination VARCHAR(100)
-);
+-- 1. 旅程資訊 (Info)
+CREATE TABLE
+    Info (
+        infoId INT AUTO_INCREMENT PRIMARY KEY,
+        departureDate DATE NOT NULL,
+        -- location 展開為 departure 與 destination
+        departure VARCHAR(100) NOT NULL,
+        destination VARCHAR(100) NOT NULL,
+        
+        UNIQUE (departure, destination)
+    );
 
-CREATE TABLE Passenger (
-    passengerID VARCHAR(50) PRIMARY KEY,
-    lastName VARCHAR(50),
-    firstName VARCHAR(50),
-    gender VARCHAR(10),
-    birthDate DATE,
-    nationality VARCHAR(50)
-);
+-- 2. 乘客 (Passenger)
+CREATE TABLE
+    Passenger (
+        passengerID INT AUTO_INCREMENT PRIMARY KEY,
+        lastName VARCHAR(50) NOT NULL,
+        firstName VARCHAR(50) NOT NULL,
+        gender CHAR(1) NOT NULL CHECK (gender IN ('M', 'F')),
+        birthDate DATE NOT NULL,
+        nationality VARCHAR(50) NOT NULL
+    );
 
 -- 3. 訂單 (Order)
-CREATE TABLE `Order` (
-    orderID VARCHAR(50) PRIMARY KEY,
-    orderPrice DECIMAL(10, 2),
-    orderDate DATE
-);
+CREATE TABLE
+    `Order` (
+        orderID INT AUTO_INCREMENT PRIMARY KEY,
+        orderPrice INT NOT NULL CHECK (orderPrice > 0),
+        orderDate DATETIME NOT NULL
+    );
 
 -- 4. 交易 (Transaction)
--- 包含與訂單的 1:1 關係 (產生 Generates)
-CREATE TABLE `Transaction` (
-    transNo VARCHAR(50) PRIMARY KEY,
-    cardID VARCHAR(50),
-    cardName VARCHAR(100),
-    expiryDate VARCHAR(10),
-    securityCode VARCHAR(10),
-    transTime DATETIME,
-    orderID VARCHAR(50) UNIQUE, -- 1:1 關係的外鍵
-    FOREIGN KEY (orderID) REFERENCES `Order`(orderID)
-);
+CREATE TABLE
+    `Transaction` (
+        transNo INT AUTO_INCREMENT PRIMARY KEY,
+        cardID VARCHAR(50) NOT NULL,
+        cardName VARCHAR(100) NOT NULL,
+        expiryDate CHAR(5) NOT NULL CHECK (expiryDate REGEXP '^[0-9]{2}/[0-9]{2}$'),
+        securityCode CHAR(4) NOT NULL CHECK (securityCode REGEXP '^[0-9]{3,4}$'),
+        transTime DATETIME NOT NULL,
+        orderID INT UNIQUE NOT NULL,
+        FOREIGN KEY (orderID) REFERENCES `Order` (orderID)
+        
+        -- 確保 [同張卡 + 同時間] → 唯一一筆交易，防止重複提交
+        CONSTRAINT unique_card_time UNIQUE (cardID, transTime)
+    );
 
 -- 5. 航班 (Itinerary)
-CREATE TABLE Itinerary (
-    ItineraryNum VARCHAR(50) PRIMARY KEY,
-    departureTime DATETIME,
-    arrivalTime DATETIME,
-    travelTime INT
-);
+CREATE TABLE
+    Itinerary (
+        itineraryNum INT AUTO_INCREMENT PRIMARY KEY,
+        departureTime TIME NOT NULL,
+        arrivalDate DATE NOT NULL,
+        arrivalTime TIME NOT NULL,
+        travelTime TIME NOT NULL,
+        departureDate DATE NOT NULL,
+        FOREIGN KEY (departureDate) REFERENCES Info (departureDate)
+        
+        -- 確保實際 [出發 → 抵達] 時間差，等於 總旅行時間 (travelTime)
+        CONSTRAINT check_travel_time CHECK (
+            TIMESTAMPDIFF (
+                MINUTE,
+                CONCAT (departureDate, ' ', departureTime),
+                CONCAT (arrivalDate, ' ', arrivalTime)
+            ) = TIME_TO_SEC (travelTime) / 60
+        )
+    );
 
 -- 6. 航空公司 (Airline)
-CREATE TABLE Airline (
-    airlineCode VARCHAR(50) PRIMARY KEY,
-    airlineName VARCHAR(100)
-);
+CREATE TABLE
+    Airline (
+        airlineCode VARCHAR(50) PRIMARY KEY,
+        airlineName VARCHAR(100) NOT NULL UNIQUE
+    );
 
 -- 7. 航段 (flightSegment)
--- 包含與航空公司的 N:1 關係 (經營 Operates)
-CREATE TABLE flightSegment (
-    segmentID VARCHAR(50) PRIMARY KEY,
-    departureTime DATETIME,
-    arrivalTime DATETIME,
-    airportName VARCHAR(100),
-    duration INT,
-    airlineCode VARCHAR(50), -- N:1 關係的外鍵
-    FOREIGN KEY (airlineCode) REFERENCES Airline(airlineCode)
-);
+CREATE TABLE
+    flightSegment (
+        segmentID INT AUTO_INCREMENT PRIMARY KEY,
+        departureTime TIME NOT NULL,
+        arrivalTime TIME NOT NULL,
+        departureAirport VARCHAR(100) NOT NULL,
+        arrivalAirport VARCHAR(100) NOT NULL,
+        duration TIME NOT NULL,
+        airlineCode VARCHAR(50) NOT NULL,
+        FOREIGN KEY (airlineCode) REFERENCES Airline (airlineCode),
+        
+        -- 確保航段 [出發 → 抵達] 時間差，等於 飛行時間 (duration)
+        CONSTRAINT check_segment_duration CHECK (
+            TIMESTAMPDIFF (MINUTE, departureTime, arrivalTime) = TIME_TO_SEC (duration) / 60
+        ),
+        UNIQUE (departureAirport, arrivalAirport)
+    );
 
--- 8. 機票 (Ticket)
--- 匯集了多個關聯的外鍵與關係屬性
-CREATE TABLE Ticket (
-    ticketId VARCHAR(50) PRIMARY KEY,
-    cabinClass VARCHAR(50),
-    
-    -- [關係] 包含 Contains (訂單 1 : N 機票)
-    orderID VARCHAR(50),
-    ticketNum INT,                   -- 關係屬性：機票數量
-    ticketTotalPrice DECIMAL(10, 2), -- 關係屬性：機票總價
-    
-    -- [關係] 對應 Corresponds (旅程資訊 1 : N 機票)
-    infoId VARCHAR(50),
-    
-    -- [關係] 屬於 Belongs (乘客 1 : 1 機票)
-    passengerID VARCHAR(50) UNIQUE,
-    
-    -- [關係] 對應 Corresponds (機票 N : 1 航班)
-    ItineraryNum VARCHAR(50),
-    
-    FOREIGN KEY (orderID) REFERENCES `Order`(orderID),
-    FOREIGN KEY (infoId) REFERENCES Info(infoId),
-    FOREIGN KEY (passengerID) REFERENCES Passenger(passengerID),
-    FOREIGN KEY (ItineraryNum) REFERENCES Itinerary(ItineraryNum)
-);
+-- 8. 航班_航段 關聯 (Itinerary_flightSegment)
+CREATE TABLE
+    Itinerary_flightSegment (
+        itineraryNum INT,
+        segmentID INT,
+        PRIMARY KEY (itineraryNum, segmentID),
+        FOREIGN KEY (itineraryNum) REFERENCES Itinerary (itineraryNum),
+        FOREIGN KEY (segmentID) REFERENCES flightSegment (segmentID)
+    );
 
--- 9. 航班_航段 關聯表 (Itinerary_flightSegment)
--- 處理 航班與航段之間的 N:M 關係 (包含 Includes)
-CREATE TABLE Itinerary_flightSegment (
-    ItineraryNum VARCHAR(50),
-    segmentID VARCHAR(50),
-    PRIMARY KEY (ItineraryNum, segmentID),
-    FOREIGN KEY (ItineraryNum) REFERENCES Itinerary(ItineraryNum),
-    FOREIGN KEY (segmentID) REFERENCES flightSegment(segmentID)
-);
+-- 9. 機票 (Ticket)
+CREATE TABLE
+    Ticket (
+        ticketId INT AUTO_INCREMENT PRIMARY KEY,
+        cabinClass VARCHAR(50) NOT NULL CHECK (
+            cabinClass IN ('Economy', 'Premium Economy', 'Business', 'First')
+        ),
+        orderID INT NOT NULL,
+        ticketNum INT NOT NULL CHECK (ticketNum > 0),
+        ticketTotalPrice INT NOT NULL CHECK (ticketTotalPrice > 0),
+        infoId INT NOT NULL,
+        passengerID INT NOT NULL,
+        itineraryNum INT NOT NULL,
+        FOREIGN KEY (orderID) REFERENCES `Order` (orderID),
+        FOREIGN KEY (infoId) REFERENCES Info (infoId),
+        FOREIGN KEY (passengerID) REFERENCES Passenger (passengerID),
+        FOREIGN KEY (itineraryNum) REFERENCES Itinerary (itineraryNum)
+    );
