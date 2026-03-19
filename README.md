@@ -2,8 +2,8 @@
 
 ## Project Framework
 
-- main    → 受保護，只能透過 PR 進入
-- develop → 主要開發分支
+- main    → 受保護，只能透過 Pull Rreqest 進入
+- develop → Main Develop Branch
 
 ## Daily Workflow Instruction:
 
