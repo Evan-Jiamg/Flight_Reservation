@@ -41,7 +41,7 @@ CREATE TABLE
         orderID INT UNIQUE NOT NULL,
         FOREIGN KEY (orderID) REFERENCES `Order` (orderID)
         
-        -- 確保 [同張卡 + 同時間] → 唯一一筆交易，防止重複提交
+        -- 確保 [同張卡 + 同時間] -> 唯一一筆交易，防止重複提交
         CONSTRAINT unique_card_time UNIQUE (cardID, transTime)
     );
 
@@ -56,7 +56,7 @@ CREATE TABLE
         departureDate DATE NOT NULL,
         FOREIGN KEY (departureDate) REFERENCES Info (departureDate)
         
-        -- 確保實際 [出發 → 抵達] 時間差，等於 總旅行時間 (travelTime)
+        -- 確保實際 [出發 -> 抵達] 時間差，等於 總旅行時間 (travelTime)
         CONSTRAINT check_travel_time CHECK (
             TIMESTAMPDIFF (
                 MINUTE,
@@ -85,7 +85,7 @@ CREATE TABLE
         airlineCode VARCHAR(50) NOT NULL,
         FOREIGN KEY (airlineCode) REFERENCES Airline (airlineCode),
         
-        -- 確保航段 [出發 → 抵達] 時間差，等於 飛行時間 (duration)
+        -- 確保航段 [出發 -> 抵達] 時間差，等於 飛行時間 (duration)
         CONSTRAINT check_segment_duration CHECK (
             TIMESTAMPDIFF (MINUTE, departureTime, arrivalTime) = TIME_TO_SEC (duration) / 60
         ),
