@@ -1,0 +1,192 @@
+% =====================================================================
+%  Convergence Analysis
+%  Fills the currently empty subsection "4.4 Convergence Analysis".
+%  \input this from sections__problem_formulation.tex, or promote it to
+%  its own section before "Methodologies".
+%  ALL CONTENT IN THIS FILE IS NEW -> rendered in green.
+% =====================================================================
+\begingroup\color{revgreen}
+
+\subsection{Convergence Analysis}
+\label{sec:convergence}
+
+The object whose convergence we analyze is the \emph{graph} $\mathcal{G}^{(t)}$, not the
+opinion vector $z^{(t)}$. This is the appropriate target for a coevolutionary model: the
+substantive claim of the framework is that interaction structure settles into a stable
+regime, and the opinion vector can be nearly stationary while the neighborhood
+assignment continues to churn. Establishing graph convergence is what licenses reading
+any metric --- $P_z$, $Q$, PoA --- as a property of an equilibrium rather than of an
+arbitrarily chosen time index.
+
+\subsubsection{Why convergence cannot be defined as ``change goes to zero''}
+\label{sec:conv-motivation}
+
+The natural definition --- the edge set stops changing --- fails empirically on this
+model. In a controlled internal test ($N = 50$, $K = 5$, pure Type-C, 30 seeds, 160
+steps), \textbf{the edge set almost never becomes stationary}: for gun control, 0 of 30
+runs reached a fixed point and only 27--33\% entered a periodic orbit; for abortion,
+60--63\% entered a periodic orbit and 6--13\% reached a fixed point. The majority of runs
+remain in persistent aperiodic churn indefinitely.
+
+The reason is structural. The K-NN rule reconstructs every out-neighborhood at every
+step from a continuous ranking, so an arbitrarily small perturbation of any $z_j$ near a
+cutoff boundary flips an edge. Under a fixed-point definition, such a model would be
+declared non-convergent forever, which tells us nothing about whether its macroscopic
+behavior has stabilized.
+
+We therefore define convergence as \textbf{entry into an attractor}: the \emph{rate} of
+structural change stops decreasing, rather than the change itself reaching zero.
+
+\subsubsection{Structural convergence metrics}
+\label{sec:conv-metrics}
+
+Let $A^{(t)}$ be the directed adjacency matrix at step $t$, $N_i^{\mathrm{out}}(t)$ the
+out-neighborhood of node $i$, and $E(t)$ the edge set. All five metrics below are
+previously published measures; we adopt rather than invent them.
+
+\paragraph{Temporal correlation coefficient $C^{\mathrm{out}}(t)$ --- primary criterion.}
+Following \citet{tang2010small} and its directed extension \citep{buttner2016temporal},
+\[
+C_i^{\mathrm{out}}(t) =
+\frac{\bigl|N_i^{\mathrm{out}}(t) \cap N_i^{\mathrm{out}}(t{+}1)\bigr|}
+     {\sqrt{d_i^{\mathrm{out}}(t)\, d_i^{\mathrm{out}}(t{+}1)}},
+\qquad
+C^{\mathrm{out}}(t) = \frac{1}{A^{\mathrm{out}}}\sum_i C_i^{\mathrm{out}}(t),
+\]
+where $A^{\mathrm{out}}$ counts nodes with non-zero out-degree. Because the K-NN rule
+holds every out-degree at exactly $K$, $C^{\mathrm{out}}$ has a direct reading in this
+model: \emph{it is the fraction of neighbors each agent retains from one step to the
+next}. A plateau at $C^{\mathrm{out}} = 0.98$ means an average agent replaces about
+$0.1$ of its $5$ neighbors per step. We record $C^{\mathrm{in}}$ (substituting $A^\top$)
+in parallel, measuring the persistence of an agent's audience rather than of its sources.
+
+\paragraph{Normalized Hamming distance.}
+$dS(t) = |E(t) \triangle E(t{-}1)| \,/\, \bigl(|E(t)| + |E(t{-}1)|\bigr)$.
+
+\paragraph{Spectral distance.}
+With $L = I - D^{-1/2} A_u D^{-1/2}$ the normalized Laplacian of the undirected
+projection and $\lambda$ its ascending spectrum,
+$d_L(t) = \lVert \lambda(t) - \lambda(t{-}1)\rVert_2$. This complements $dS$: the Hamming
+distance cannot distinguish a genuine structural change from an edge swap between
+equivalent positions, whereas the spectral distance can.
+
+\paragraph{DeltaCon.}
+Following \citet{koutra2013deltacon}, with Fast Belief Propagation
+$S = [\,I + \epsilon^2 D - \epsilon A\,]^{-1}$, $\epsilon = 1/(1 + d_{\max})$, the
+Matusita distance
+$d = \sqrt{\sum_{ij}\bigl(\sqrt{s^{t-1}_{ij}} - \sqrt{s^{t}_{ij}}\bigr)^2}$ gives
+$\mathrm{sim} = 1/(1+d)$.
+
+\paragraph{Partition stability.}
+The Adjusted Rand Index $\mathrm{ARI}\bigl(P(t), P(t{-}1)\bigr)$ between consecutive
+Louvain partitions \citep{hubert1985comparing}. ARI is chance-corrected by construction
+(expectation zero under random labeling), so unlike $Q$ it requires no separate null
+model.
+
+\subsubsection{Attractor classification}
+\label{sec:conv-attractor}
+
+Each run is classified by the long-run behavior of its edge set:
+
+\begin{center}
+\begin{tabular}{ll}
+\toprule
+Type & Criterion \\
+\midrule
+\texttt{fixed\_point}    & $E(t) = E(t{-}1)$ holds persistently \\
+\texttt{limit\_cycle}:$p$ & $E(t) = E(t{-}p)$ holds persistently, $2 \le p \le P_{\max}$ \\
+\texttt{plateau}         & $C^{\mathrm{out}}$ has stopped changing, but no exact period is found \\
+\texttt{none}            & no criterion satisfied by $T_{\max}$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Periodicity is detected by hashing edge sets. We validated this cheap test against the
+state-level recurrence $\min_p \max_t \lVert z(t) - z(t-p)\rVert_\infty$ on 180 Type-C
+runs and found agreement in 29--30 of 30 runs per condition, so the edge-set test is used
+and opinion trajectories need not be stored for this purpose. We set $P_{\max} = 20$;
+periods longer than 20 are classified as aperiodic, which we disclose as a limitation of
+the classification rather than a property of the model.
+
+One implementation hazard is worth recording, because it produces a silent false
+positive. When testing period $p$ near the end of the trajectory, the comparison window
+can be empty, and a universally-quantified test over an empty sequence returns true. An
+early version of this check reported a spurious 30/30 agreement for exactly this reason.
+The window is therefore constructed as $[\,n - 2p,\; n - p\,)$, which is guaranteed
+non-empty.
+
+\subsubsection{Stopping rule}
+\label{sec:stopping}
+
+A run stops at
+\[
+t_{\mathrm{conv}} = \min\Bigl\{ t : \text{(exact recurrence) or (}C\text{ plateau)} \Bigr\},
+\]
+where \emph{exact recurrence} is $E(t) = E(t-p)$ holding persistently for some
+$p \in [1, P_{\max}]$, and the \emph{$C$ plateau} condition is that for
+\texttt{patience} consecutive steps
+\[
+\frac{\bigl|\,\mathrm{mean}(C[t{-}W{:}t]) - \mathrm{mean}(C[t{-}2W{:}t{-}W])\,\bigr|}
+     {\mathrm{mean}(C[t{-}2W{:}t{-}W])} < \varepsilon_C .
+\]
+The simulation then continues for \texttt{post\_window} further steps so that the
+plateau is visible in the recorded trajectory, and stops; $T_{\max}$ is a hard cap.
+
+\begin{center}
+\begin{tabular}{lll}
+\toprule
+Parameter & Value & Basis \\
+\midrule
+$W$                  & 10   & calibration \\
+$\varepsilon_C$      & 0.01 & triggers in 90/90 calibration runs; $t_{\mathrm{conv}}$ p95 $= 28$/$33$ \\
+\texttt{patience}    & 5    & calibration \\
+\texttt{post\_window}& 10   & plateau made visible in output \\
+$T_{\max}$           & 120  & raised from 60 after the Type-L pilot (below) \\
+$P_{\max}$           & 20   & longer periods classified aperiodic \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\paragraph{Why $C^{\mathrm{out}}$ and not $dS$ is the stopping criterion.}
+At $N = 50$ the graph has only 250 directed edges, so per-step churn in $dS$ is a small
+integer and the series is correspondingly noisy; reaching the same trigger rate with
+$dS$ required relaxing the threshold to $\varepsilon = 0.20$. $C^{\mathrm{out}}$ is
+smoother and triggers in 90 of 90 calibration runs at $\varepsilon_C = 0.01$. We also
+note that the plateau height of $dS$ scales with $N$ (roughly three times larger at
+$N = 100$ than at $N = 50$), so these parameters must not be carried across population
+sizes without recalibration.
+
+\paragraph{Calibrating $T_{\max}$ for Type-L agents.}
+The parameters above were calibrated on Type-C runs, whose positions follow the FJ
+closed form. Type-L positions come from scoring generated text and need not behave the
+same way, so we re-measured with a dedicated pilot ($\alpha \in \{0, 0.5\}$, 3 seeds,
+cap 100). All 6 runs converged, all as \texttt{plateau}, none hitting the cap, with zero
+parse failures. The trigger rate and $\varepsilon_C$ required no adjustment. However,
+one $\alpha = 0$ run reached $t_{\mathrm{conv}} = 79$ and consumed 89 steps ---
+comfortably beyond the $T_{\max} = 60$ that Type-C calibration would have suggested.
+Retaining 60 would have truncated low-$\alpha$ runs before convergence, invalidating any
+convergence claim over the grid. We therefore set $T_{\max} = 120$. Because the stopping
+rule is dynamic, raising the cap does not lengthen runs that have already converged; it
+only removes the truncation risk.
+
+\paragraph{A pilot inference that did not survive the full grid.}
+Partway through the pilot, with only two $\alpha = 0$ seeds available (plateau heights
+$0.8716$ and $0.8272$), the plateau height $C_{\mathrm{plateau}}$ appeared to increase
+monotonically with $\alpha$ ($0.87 \to 0.95 \to 0.98$), which would have made it a
+cleaner structural indicator than PoA. The third seed returned $0.9672$, inside the
+$\alpha = 0.5$ range. The spread within $\alpha = 0$ exceeded the between-group
+difference, and $t_{\mathrm{conv}}$ was similarly dispersed ($40$ / $45$ / $79$). We
+report this because the full grid confirms the corrected reading rather than the
+original one (Section~\ref{sec:results}): $C_{\mathrm{plateau}}$ separates $\alpha = 0$
+from everything else, but is not monotone in $\alpha$.
+
+\subsubsection{Cross-run comparability}
+\label{sec:comparability}
+
+Because runs now differ in length, metrics are compared across conditions at
+$t_{\mathrm{conv}} + \texttt{post\_window}$ --- each run's own converged state --- with
+the fixed indices $t = 20$ and $t = 35$ reported for reference. The distribution of
+$t_{\mathrm{conv}}$ is itself evidence of convergence, and its dependence on $\alpha$,
+topology and topic is a substantive finding rather than a nuisance parameter.
+
+\endgroup

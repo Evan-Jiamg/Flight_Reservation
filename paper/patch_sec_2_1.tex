@@ -1,0 +1,37 @@
+% =====================================================================
+%  REPLACEMENT for Sec 2.1 "Agent Population and Opinion Variables"
+%  Changed text is wrapped in \textcolor{revgreen}{...}; unchanged text is
+%  reproduced verbatim in black.
+%
+%  Reason for change: Type-L agents no longer emit a discrete belief
+%  b_i in {-2,...,+2} mapped by z_i = b_i/2. They produce text only, and
+%  their position on [-1,+1] comes from the recalibrated RoBERTa stance
+%  regressor -- the same instrument applied to the Reddit corpus.
+% =====================================================================
+
+Let $\mathcal{V} = \{1, \ldots, N\}$ be a set of $N$ agents. Each agent $i$ is characterized by two opinion values:
+\begin{itemize}
+    \item \textbf{Intrinsic opinion} $s_i \in [-1, +1]$: a fixed internal belief representing the agent's prior stance, initialized from real Reddit data and held constant throughout the simulation.
+    \item \textbf{Expressed opinion} $z_i^{(t)} \in [-1, +1]$: the publicly observable opinion at discrete time step $t$, which evolves as agents respond to their neighbors.
+\end{itemize}
+
+\textcolor{revgreen}{Both quantities are measured on a single continuous scale. The intrinsic
+opinions $s_i$ are drawn from Reddit comments scored by a fine-tuned RoBERTa stance
+regressor (Section~\ref{sec:dataset}), and the expressed opinions $z_i^{(t)}$ of every
+agent---of either type---are placed on that same scale by the same instrument. Agent
+positions and the empirical stance distribution are therefore directly comparable
+rather than related by a convention.}
+
+The population is partitioned into two types governed by the mixing parameter $\alpha \in [0,1]$:
+\begin{itemize}
+    \item \textbf{Type-C} (Cost-minimizing, fraction $\alpha$): Deterministic agents that update $z_i$ by minimizing a local disagreement cost function derived from the Friedkin--Johnsen model~\cite{friedkin1990}. \textcolor{revgreen}{Their expressed opinion is a real number produced directly by the update rule, so no measurement step is required.}
+    \item \textbf{Type-L} (LLM-driven, fraction $1 - \alpha$): Generative agents powered by a locally deployed LLM\textcolor{revgreen}{. A Type-L agent emits only a natural-language opinion $o_i^{(t)}$ and never reports a number about itself; its expressed opinion is obtained by scoring that text with the stance regressor, $z_i^{(t)} = e\bigl(o_i^{(t)}\bigr) \in [-1,+1]$, where $e(\cdot)$ is the semantic embedding mapping formalized in Section~\ref{sec:semantic-mapping}}.
+\end{itemize}
+
+\textcolor{revgreen}{Measuring Type-L position externally, rather than asking the agent for a
+self-reported value, is a deliberate design choice: it avoids the central-tendency and
+round-number biases documented for direct numeric self-rating by language models, and it
+keeps the agent's task purely linguistic. On the Type-C side $e(\cdot)$ acts as the
+identity, so the two types are commensurable by construction.}
+
+The special cases $\alpha = 1$ (purely numerical) and $\alpha = 0$ (purely LLM-driven) serve as the two baselines for comparison.

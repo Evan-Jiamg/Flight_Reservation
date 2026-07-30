@@ -1,0 +1,255 @@
+% =====================================================================
+%  Section 5: Experiments and Numerical Results  --  REVISED for M-1
+%  Grid: 9 alpha x 3 networks x 10 seeds x 2 topics = 540 runs
+%  Supersedes the T=35 / 180-run configuration.
+%  ALL CONTENT IN THIS FILE IS NEW -> rendered in green.
+% =====================================================================
+\begingroup\color{revgreen}
+
+\subsection{Dataset Overview}
+\label{sec:dataset}
+
+We source data from the \texttt{r/politics} subreddit via PushShift's
+\citep{baumgartner2020pushshift} April 2019 dump, containing 138.5 million comments.
+After streaming decompression and filtering (non-deleted, non-removed, body length
+$>$ 20 characters), 122.5 million active comments remain (deletion rate 11.56\%).
+Semantic clustering (Section~\ref{sec:corpus}) identifies 1{,}184 topic clusters; we
+focus on two politically contested topics: \emph{gun control} ($n = 3{,}581$) and
+\emph{abortion} ($n = 1{,}618$).
+
+\paragraph{Recalibration of the stance scale.}
+Our earlier configuration scored comments with a RoBERTa regressor trained directly on
+the IBM Argument Quality 30K corpus \citep{gretz2020argq}. Auditing that regressor
+before the present experiments revealed a defect that invalidates any claim of a
+\emph{continuous} stance scale: the supervising label \texttt{stance\_WA} takes only two
+distinct values in the training split, so the fitted head behaved as a saturating
+classifier rather than a regressor. Empirically, 69.7\% of scored comments fell in
+$|\hat{y}| > 0.9$, and the mapping from human-judged stance strength to $\hat{y}$ was
+non-monotone in the interior of the range. A regressor that places seven of ten comments
+at the endpoints cannot express the gradations the model requires.
+
+We therefore rebuilt the supervision using Best--Worst Scaling to induce a graded target
+from pairwise comparisons, and re-fine-tuned the regression head against it. After
+recalibration, group means are strictly monotone in human-judged stance strength, the
+correlation with the graded target is $+0.926$, and the saturation rate falls from
+69.7\% to 6.5\% (neutral-group mean $-0.020$). All initial beliefs and all simulations
+reported here use the recalibrated scorer; results obtained under the saturating scorer
+are not comparable to them and are not reported.
+
+Figure~\ref{fig:stance-dist} shows the recalibrated stance distributions. Gun control
+exhibits a near-neutral mean with high variance, consistent with a bimodal and divided
+public; abortion displays a more concentrated opposing consensus. The resulting
+initial-stance split among the $N = 50$ sampled agents is 54/46 for gun control and
+68/32 for abortion --- an asymmetry that Section~\ref{sec:results} shows to be
+consequential.
+
+\paragraph{The two topics are not independent replicates.}
+The 50 sampled agents share \emph{identical} personas (name, age, gender, education,
+five personality traits) and \emph{identical} stubbornness coefficients $\rho_i$ across
+the two topics; only the initial stance differs. Measured across the population,
+$\mathrm{corr}(s^{\text{gun}}, s^{\text{abortion}}) = +0.881$. This is a deliberate
+control: it allows any topic effect to be attributed to the stance distribution rather
+than to a different population of agents. It also means the two topics must be compared
+with \emph{paired} tests and must not be pooled as $2\times$ independent samples
+(Section~\ref{sec:stats}). We note as a modeling simplification --- not an empirical
+finding --- that the same individual is assigned the same stubbornness on both issues.
+
+\subsection{Simulation Configuration}
+\label{sec:config}
+
+All simulations use $N = 50$ agents and $K = 5$ out-neighbors per agent. The mixing
+parameter is varied across
+$\alpha \in \{0, 0.125, 0.25, 0.375, 0.5, 0.625, 0.75, 0.875, 1\}$, spanning the full
+range from a purely LLM-driven population ($\alpha = 0$) to a purely cost-minimizing
+population ($\alpha = 1$).
+
+\paragraph{Initial topology as an experimental factor.}
+Rather than fixing a single scale-free initialization, we treat the initial topology as
+a manipulated factor with three levels: Barabasi--Albert (BA, $m=2$)
+\citep{barabasi1999emergence}, Erdos--Renyi (ER), and Watts--Strogatz (WS). This
+directly tests whether echo chambers and efficiency loss depend on pre-existing
+structure or are produced by the K-NN rewiring rule itself. \emph{The three families are
+generated with matched mean degree} --- 3.84 (BA), 3.84 (ER), 4.00 (WS), a maximum
+deviation of 4.17\% --- so that any observed difference is attributable to structure
+rather than to edge count. Their clustering coefficients remain clearly distinct
+(0.179 / 0.079 / 0.390), preserving the contrast of interest. Ten independent
+topologies (seeds 1--10) are generated per family.
+
+\paragraph{Grid.}
+The full design is
+$9\ (\alpha) \times 3\ (\text{network}) \times 10\ (\text{seed}) \times 2\ (\text{topic})
+= \mathbf{540}$ runs, with $n = 60$ runs at every $\alpha$ and $n = 30$ at every
+$(\alpha, \text{topic})$ cell. The completed grid contains no missing cells.
+
+\paragraph{Simulation horizon: dynamic, not fixed.}
+Our earlier configuration ran every simulation for a fixed $T = 35$ steps. That horizon
+is not defensible under the convergence criterion developed in
+Section~\ref{sec:convergence}: measured mean settling time at $\alpha = 0$ is 52.2 steps,
+with individual runs requiring up to 115. A fixed $T = 35$ truncates the majority of
+low-$\alpha$ runs before they reach an attractor, so metrics read at $t = 35$ would
+describe a transient rather than a converged state. We therefore replace the fixed
+horizon with the dynamic stopping rule of Section~\ref{sec:stopping}: each run terminates
+\texttt{post\_window} $= 10$ steps after its own detected convergence time
+$t_{\mathrm{conv}}$, subject to a hard cap $T_{\max} = 120$. Across the grid, 538 of 540
+runs (99.63\%) converged within the cap; the two exceptions are recorded as
+\texttt{attractor} $=$ \texttt{none} and retained rather than discarded.
+
+\paragraph{Belief representation.}
+Type-L agents no longer emit a numeric belief on a five-point scale. They produce text
+only, and their position on $[-1,+1]$ is obtained by scoring that text with the same
+recalibrated RoBERTa regressor used for the Reddit corpus (Section~\ref{sec:dataset}).
+Agent positions and the empirical distribution are therefore measured on one common
+ruler. This change is not cosmetic: under the five-point scale, quantization forced ties
+at the K-NN cutoff for 50 of 50 agents, so neighbor selection was determined almost
+entirely by tie-breaking rather than by opinion. Ties are now broken by seeded random
+choice, reducing the correlation between in-degree and agent index from $-0.22$ to
+$-0.037$.
+
+\paragraph{Determinism.}
+Deterministic decoding (temperature $= 0$) is used throughout and the vLLM server is
+initialized with a fixed seed. The numerical ($\alpha = 1$) path was verified to be
+bit-for-bit reproducible across repeated runs.
+
+\subsection{Evaluation Metrics}
+\label{sec:metrics}
+
+Unless stated otherwise, cross-run comparisons are read at
+$t_{\mathrm{conv}} + \texttt{post\_window}$ --- each run's own converged state --- rather
+than at a common step index, since runs now differ in length. We additionally record
+values at the fixed indices $t = 20$ and $t = 35$ for reference.
+
+\paragraph{Polarization ($P_z$).}
+Following \citet{chitra2020filter}, the variance of expressed opinions,
+$P_z^{(t)} = \frac{1}{N}\sum_i \bigl(z_i^{(t)} - \bar{z}^{(t)}\bigr)^2$.
+
+\paragraph{Modularity: $Q$ and the null-model correction $Q_{\mathrm{norm}}$.}
+Louvain community detection \citep{blondel2008fast} on the undirected projection of
+$\mathcal{G}^{(t)}$ yields a modularity score $Q^{(t)}$ \citep{newman2004finding}.
+Bare $Q$ has no absolute meaning: \citet{guimera2004modularity} showed that random
+graphs exhibit non-zero modularity from fluctuations alone, and our K-NN rule imposes a
+constant out-degree $K$, a structural constraint that itself induces modularity. We
+therefore report $Q$ against a degree-preserving null model:
+\[
+Q_{\mathrm{norm}}(t) = Q_{\mathrm{obs}}(t) - \bar{Q}_{\mathrm{rand}}(t),
+\qquad
+z_Q(t) = \frac{Q_{\mathrm{obs}}(t) - \bar{Q}_{\mathrm{rand}}(t)}{\sigma_{\mathrm{rand}}(t)},
+\]
+where $\bar{Q}_{\mathrm{rand}}$ averages $R = 20$ randomizations of the undirected
+projection by \texttt{double\_edge\_swap} (\texttt{nswap} $= 10|E|$,
+\texttt{max\_tries} $= 1000|E|$), preserving the degree sequence. The null is recomputed
+at every step.
+
+We record a methodological caution. We first implemented the null with directed
+three-cycle swaps; that randomization \emph{does not mix} on this graph family --- edge
+overlap plateaued at 0.35 even at \texttt{nswap} $= 50|E|$, and $\bar{Q}_{\mathrm{rand}}$
+jumped from 0.239 to 0.654 between adjacent steps whose degree sequences were nearly
+identical, while within-step replicate variability remained at $\mathrm{sd} \le 0.015$
+(spurious precision). A null model must not depend that sharply on its input. The
+undirected \texttt{double\_edge\_swap} reduces edge overlap to 0.13 and yields
+$\bar{Q}_{\mathrm{rand}}$ stable to $\pm 0.005$ over the same steps. Swap failures are
+counted and reported; a failed randomization is never silently replaced by a
+configuration-model fallback. Across the grid, \texttt{swap\_fail} $= 0$.
+
+We report bare $Q$ alongside $Q_{\mathrm{norm}}$ for comparability with prior work, but
+all substantive claims use $Q_{\mathrm{norm}}$.
+
+One limitation the null model cannot address must be stated explicitly: it controls for
+the degree sequence but not for the \emph{resolution limit}. The bound of
+\citet{fortunato2007resolution} is approximately $\sqrt{2m} \approx 22$ at $K = 5$,
+$N = 50$, whereas the smallest communities we observe contain 5--7 nodes. Louvain may
+therefore merge communities that should remain separate, and $Q_{\mathrm{norm}}$ does
+not correct for this.
+
+\paragraph{Price of Anarchy and its decomposition.}
+PoA is defined as in Section~\ref{sec:poa}, with both $C(z^{(t)})$ and $C(z^*_t)$
+recomputed on the same post-rewiring graph. Because PoA is an aggregate, it cannot
+distinguish a population that is inefficient because it \emph{disagrees persistently}
+from one that is inefficient because it \emph{abandons its own position}. The social
+cost already separates into exactly these two terms:
+\[
+C(z) = \underbrace{\sum_i \sum_{j \in \mathcal{N}(i)} (z_i - z_j)^2}_{\text{disagreement}}
+     \; + \; \underbrace{\sum_i \rho_i K (z_i - s_i)^2}_{\text{conformity}} .
+\]
+We report both components. The decomposition is recomputed \emph{post hoc} from stored
+per-step agent states and edge sets, leaving the metric schema untouched; every run's
+recomputed PoA is cross-validated against the value logged during simulation (median
+relative error $< 2\%$), and any run failing validation is reported rather than silently
+included. All 540 runs passed.
+
+\paragraph{Structural convergence metrics.}
+$C^{\mathrm{out}}(t)$, $dS(t)$, $d_L(t)$, DeltaCon$(t)$ and partition ARI are defined in
+Section~\ref{sec:convergence} and written at every step.
+
+\subsection{Statistical Analysis}
+\label{sec:stats}
+
+Variances are markedly unequal across $\alpha$ --- the standard deviation of PoA falls by
+two orders of magnitude between $\alpha = 0$ and $\alpha = 1$ --- so comparisons between
+$\alpha$ levels use \textbf{Welch's $t$-test} with Benjamini--Hochberg FDR control over
+the family of adjacent-$\alpha$ comparisons; we report $q$-values.
+
+Claims of \emph{no difference} are not supported by $p > 0.05$. Where we assert
+equivalence --- specifically for the comparison among initial topologies --- we use
+\textbf{two one-sided tests (TOST)} with the equivalence margin fixed in advance at
+$\delta = 0.2$ PoA units. We flag a scale limitation of this choice: $\delta = 0.2$ is a
+17.5\% relative margin at $\alpha = 1$ (PoA $\approx 1.14$) but only 3.6\% at
+$\alpha = 0$ (PoA $\approx 5.56$), so the same absolute margin is five times stricter at
+the low-$\alpha$ end. We report the consequence of this in Section~\ref{sec:results}
+rather than selecting a margin after seeing the data.
+
+Comparisons \emph{between topics} use paired tests, for the reason given in
+Section~\ref{sec:dataset}. All confidence intervals are 95\%.
+
+\subsection{Implementation Details}
+\label{sec:impl}
+
+Type-L agents are powered by Phi-4 (14.7B parameters, AWQ 4-bit quantization)
+\citep{abdin2024phi4}, served locally via vLLM \citep{kwon2023vllm} on a single
+RTX 4090. Type-C agents are closed-form FJ updates requiring no neural inference.
+Network operations use NetworkX and \texttt{python-louvain}. The full simulation
+codebase is available at
+\url{https://github.com/Evan-Jiamg/Echo-Chamber-Simulation}.
+
+\paragraph{One call per agent per step.}
+Each Type-L agent makes exactly one LLM call per step, emitting a structured record with
+fields generated in the order \texttt{(reasoning, opinion, memory)}. The ordering is
+load-bearing: fields are generated in declaration order, so declaring \texttt{reasoning}
+first is what makes the chain of thought precede the stated position rather than
+rationalize it after the fact. The prompt requires the agent to name the specific
+arguments it heard this round, judge which are strong, relate them to its original
+stance, and only then state the resulting belief.
+
+\paragraph{Memory.}
+Memory is maintained by the model itself: at each step the agent rewrites a
+$\le$120-word memory, instructed to carry forward what remains relevant, incorporate what
+is new, and drop what is stale. This replaces a hand-written compression routine that we
+found to be defective --- it retained the \emph{first} $N$ words rather than the most
+recent, with accumulated history placed at the front of the concatenated string, so
+historical memory \emph{froze after step 1} and no later information could enter. We
+verified on the completed grid, not merely by code review, that no agent's memory is
+frozen: 0 of 50 agents in every run. Neighbor opinions are now passed through at up to
+60 words each, replacing a 15-word truncation that discarded roughly 70\% of a typical
+40--60-word opinion.
+
+\paragraph{Throughput and stability.}
+Guided (schema-constrained) decoding is disabled. Its finite-state mask serializes on the
+CPU and costs a factor of ten in throughput, while measured parse success without it is
+200/200; leaving it enabled would have extended the grid from days to more than a month.
+Parse failures are nonetheless counted per run and were zero throughout. Prefix caching
+contributes a further 27\% (hit rate 54--82\%). The complete grid required approximately
+40 GPU-hours. The vLLM engine raised sporadic CUDA illegal-memory-access faults (5
+occurrences over the grid); a supervisor process restarted the server and resumed from
+the last completed run, with 40--68 s of downtime per event and no data loss. Because a
+parse failure would otherwise be indistinguishable from an agent deliberately holding its
+position, a run aborts if two consecutive steps fail to parse entirely.
+
+\paragraph{Data integrity.}
+Every run writes six artifacts: per-step metrics (18 columns), a convergence summary,
+full per-agent belief/opinion/reasoning/memory traces, per-step edge sets, a metrics
+JSON-lines log, and the Type-C/Type-L assignment. An audit over all 540 runs confirmed:
+no missing or zero-byte files; 18-column schema conformance 540/540; CSV row count equal
+to \texttt{steps\_run} in every run (no truncation); reasoning traces retained in full
+(mean 591--848 characters per step); zero frozen memories; zero swap failures; and no
+missing grid cells. The complete output totals 2.34 GB.
+
+\endgroup

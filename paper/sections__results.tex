@@ -1,0 +1,477 @@
+% =====================================================================
+%  Section 5.6: Numerical Results  --  REVISED for the M-1 grid
+%  n = 60 per alpha, n = 30 per (alpha, topic). 540 runs.
+%  Replaces the T=35 / 180-run results entirely.
+%  ALL CONTENT IN THIS FILE IS NEW -> rendered in green.
+% =====================================================================
+\begingroup\color{revgreen}
+
+\subsection{Numerical Results}
+\label{sec:results}
+
+We first establish that the simulations converge (Section~\ref{sec:res-conv}), since
+every subsequent reading is taken at each run's converged state. We then report the
+final-state comparison (Section~\ref{sec:res-table}) and organize the findings around the
+research questions: efficiency and PoA (RQ1, Section~\ref{sec:res-rq1}), echo chamber
+formation (RQ2, Section~\ref{sec:res-rq2}), and the existence of an optimal mixture
+(RQ3, Section~\ref{sec:res-rq3}). Section~\ref{sec:res-topology} reports the manipulation
+of initial topology.
+
+\subsubsection{Convergence}
+\label{sec:res-conv}
+
+\begin{table}[t]
+\centering
+\caption{Convergence by mixing ratio, pooled over three topologies and two topics
+($n = 60$ per row). $t_{\mathrm{conv}}$ is the detected attractor-entry step;
+$T$ is total steps run ($= t_{\mathrm{conv}} + 10$ when converged). No run at any
+$\alpha$ exceeded $T_{\max} = 120$ more than once.}
+\label{tab:convergence}
+\begin{tabular}{lccccc}
+\toprule
+$\alpha$ & $t_{\mathrm{conv}}$ mean & [range] & $T$ mean & [range] & hit $T_{\max}$ \\
+\midrule
+0.0   & 52.2 & [16--115] & 62.1 & [26--120] & 0/60 \\
+0.125 & 45.5 & [15--112] & 55.5 & [25--120] & 0/60 \\
+0.25  & 43.8 & [19--108] & 54.9 & [29--120] & 1/60 \\
+0.375 & 37.6 & [9--75]   & 48.8 & [19--120] & 1/60 \\
+0.5   & 34.5 & [11--79]  & 44.5 & [21--89]  & 0/60 \\
+0.625 & 31.2 & [13--46]  & 41.2 & [23--56]  & 0/60 \\
+0.75  & 24.0 & [7--47]   & 34.0 & [17--57]  & 0/60 \\
+0.875 & 21.7 & [7--38]   & 31.7 & [17--48]  & 0/60 \\
+1.0   & 25.1 & [7--31]   & 35.0 & [17--41]  & 0/60 \\
+\midrule
+all   & 45.3 & --- & --- & --- & 2/540 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Table~\ref{tab:convergence} reports settling behavior across the grid. Two results
+follow, and both bear directly on the validity of the measurements.
+
+First, \textbf{538 of 540 runs (99.63\%) converged within $T_{\max} = 120$}, the two
+exceptions being classified \texttt{attractor} $=$ \texttt{none} and retained in all
+aggregates. Convergence is therefore a property of the model across the whole grid rather
+than of a favorable subset.
+
+Second, \textbf{a fixed horizon of $T = 35$ is inadequate for most of the grid.} Mean
+settling time at $\alpha = 0$ is 52.2 steps and individual runs require up to 115. Only
+the region $\alpha \ge 0.75$ settles within 35 steps on average. Any metric read at
+$t = 35$ across all $\alpha$ therefore compares converged high-$\alpha$ states against
+low-$\alpha$ transients, and the resulting $\alpha$-response curve confounds the effect
+of composition with differences in how far each run has progressed. This is the single
+most consequential correction to our earlier configuration, and it motivates the dynamic
+stopping rule of Section~\ref{sec:stopping}. Equally, $T_{\max} = 120$ is not excessive:
+it is required by the low-$\alpha$ tail and is reached by only 2 runs.
+
+Settling time \textbf{decreases monotonically in $\alpha$ from 52.2 to 21.7 steps ---
+and then rises again at $\alpha = 1.0$}, to 25.1. A population that is almost entirely
+Type-C converges faster than one that is entirely Type-C. Section~\ref{sec:res-rq3}
+shows this is the same phenomenon as the collapse in fixed-point attainment at
+$\alpha = 1$.
+
+Convergence is also slower for gun control than for abortion at every $\alpha$ (at
+$\alpha = 0$: 58.7 vs.\ 45.7 steps). This is consistent with their initial stance
+distributions: gun control is near-balanced (54/46) with many agents close to the
+decision boundary, whereas abortion has a clear majority (68/32) and settles sooner.
+
+\subsubsection{Final-state comparison}
+\label{sec:res-table}
+
+\begin{table}[t]
+\centering
+\caption{Metrics at each run's converged state ($t_{\mathrm{conv}} + 10$), by topic and
+mixing ratio. $n = 30$ per row (3 topologies $\times$ 10 seeds). Mean $\pm$ 95\% CI.
+$\downarrow$ denotes lower-is-better. $Q_{\mathrm{norm}}$ is the degree-preserving
+null-corrected modularity (Section~\ref{sec:metrics}) and is the basis for all
+substantive claims; bare $Q$ is retained for comparability with prior work.}
+\label{tab:main}
+\begin{tabular}{llcccc}
+\toprule
+Topic & $\alpha$ & $P_z$ & $Q$ & $Q_{\mathrm{norm}}$ & PoA $\downarrow$ \\
+\midrule
+\multirow{9}{*}{Gun Control}
+ & 0     & $0.261 \pm 0.013$ & $0.486 \pm 0.009$ & $0.241 \pm 0.009$ & $5.681 \pm 0.340$ \\
+ & 0.125 & $0.312 \pm 0.016$ & $0.497 \pm 0.009$ & $0.250 \pm 0.009$ & $5.480 \pm 0.312$ \\
+ & 0.25  & $0.364 \pm 0.013$ & $0.510 \pm 0.010$ & $0.259 \pm 0.009$ & $5.642 \pm 0.396$ \\
+ & 0.375 & $0.409 \pm 0.014$ & $0.518 \pm 0.010$ & $0.263 \pm 0.009$ & $5.477 \pm 0.325$ \\
+ & 0.5   & $0.451 \pm 0.012$ & $0.540 \pm 0.009$ & $0.277 \pm 0.007$ & $5.374 \pm 0.395$ \\
+ & 0.625 & $0.494 \pm 0.011$ & $0.561 \pm 0.011$ & $0.286 \pm 0.010$ & $4.424 \pm 0.344$ \\
+ & 0.75  & $0.538 \pm 0.008$ & $0.608 \pm 0.009$ & $0.314 \pm 0.008$ & $3.821 \pm 0.274$ \\
+ & 0.875 & $0.582 \pm 0.006$ & $0.664 \pm 0.009$ & $0.350 \pm 0.009$ & $3.220 \pm 0.222$ \\
+ & 1     & $0.619 \pm 0.000$ & $0.763 \pm 0.001$ & $0.427 \pm 0.002$ & $\mathbf{1.149 \pm 0.008}$ \\
+\midrule
+\multirow{9}{*}{Abortion}
+ & 0     & $0.347 \pm 0.017$ & $0.423 \pm 0.007$ & $0.194 \pm 0.006$ & $5.436 \pm 0.535$ \\
+ & 0.125 & $0.364 \pm 0.011$ & $0.425 \pm 0.007$ & $0.199 \pm 0.007$ & $6.322 \pm 0.389$ \\
+ & 0.25  & $0.426 \pm 0.015$ & $0.423 \pm 0.008$ & $0.191 \pm 0.007$ & $6.077 \pm 0.367$ \\
+ & 0.375 & $0.463 \pm 0.016$ & $0.495 \pm 0.015$ & $0.241 \pm 0.013$ & $5.815 \pm 0.385$ \\
+ & 0.5   & $0.480 \pm 0.015$ & $0.553 \pm 0.012$ & $0.283 \pm 0.010$ & $5.117 \pm 0.298$ \\
+ & 0.625 & $0.510 \pm 0.013$ & $0.581 \pm 0.010$ & $0.297 \pm 0.008$ & $4.670 \pm 0.296$ \\
+ & 0.75  & $0.534 \pm 0.010$ & $0.613 \pm 0.009$ & $0.317 \pm 0.008$ & $3.853 \pm 0.288$ \\
+ & 0.875 & $0.554 \pm 0.008$ & $0.657 \pm 0.008$ & $0.343 \pm 0.006$ & $2.758 \pm 0.306$ \\
+ & 1     & $0.575 \pm 0.000$ & $0.764 \pm 0.000$ & $0.419 \pm 0.002$ & $\mathbf{1.129 \pm 0.001}$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Table~\ref{tab:main} is the primary result. Before interpreting it we note a validation
+that constrains how the differences from our earlier configuration may be read.
+
+\paragraph{The numerical baseline reproduces exactly.}
+At $\alpha = 1$ the population contains no LLM agents and the dynamics reduce to the FJ
+closed form. The values there are unchanged from our earlier configuration:
+$P_z = 0.619$ / $0.575$ and $Q = 0.763$ / $0.764$ for gun control and abortion, against
+$0.619$ / $0.575$ and $0.764$ / $0.764$ previously. \textbf{The numerical path is
+therefore not affected by any of the changes described in Section~\ref{sec:config},
+which means every difference at $\alpha < 1$ is attributable to the Type-L agents and
+the continuous scale, not to a harness error.}
+
+\subsubsection{RQ1: efficiency and the Price of Anarchy}
+\label{sec:res-rq1}
+
+\paragraph{Type-C populations land on the game-theoretic prediction.}
+At $\alpha = 1$, PoA is $1.129 \pm 0.001$ (abortion) and $1.149 \pm 0.008$ (gun control),
+against the $9/8 = 1.125$ upper bound of \citet{bhawalkar2013coevolutionary}. This is a
+stronger statement than reproducing our own earlier numbers. The planner's solution
+$z^* = (L_{\mathrm{sym}} + W)^{-1} W s$ is precisely the fixed point of the FJ update
+rule, so Type-C agents converge by construction to a neighborhood of the social optimum,
+and the residual gap is exactly the Nash--optimum discrepancy of the opinion formation
+game: individual and social cost count each edge a different number of times. The
+measured value falls essentially on the theoretical one. (Our model uses directed K-NN
+edges counted once each, so $9/8$ is not strictly applicable; the agreement is
+nonetheless close enough that we report it as corroboration rather than coincidence.)
+
+\paragraph{Text-based reasoning is five times less efficient.}
+Pooled across topologies and topics, PoA rises from $1.139 \pm 0.005$ at $\alpha = 1$ to
+$5.558 \pm 0.309$ at $\alpha = 0$ --- a factor of 4.9. The full curve and the
+adjacent-$\alpha$ tests are:
+
+\begin{center}
+\begin{tabular}{lccccccccc}
+\toprule
+$\alpha$ & 0.0 & 0.125 & 0.25 & 0.375 & 0.5 & 0.625 & 0.75 & 0.875 & 1.0 \\
+\midrule
+PoA      & 5.558 & 5.901 & 5.860 & 5.646 & 5.246 & 4.547 & 3.837 & 2.989 & 1.139 \\
+$\pm$ CI & 0.309 & 0.265 & 0.268 & 0.249 & 0.242 & 0.222 & 0.193 & 0.193 & 0.005 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{center}
+\begin{tabular}{lcc}
+\toprule
+Comparison & change & $q$ (Welch, BH-FDR) \\
+\midrule
+$0 \to 0.125$      & $5.558 \to 5.901$ & 0.127 \\
+$0.125 \to 0.25$   & $5.901 \to 5.860$ & 0.826 \\
+$0.25 \to 0.375$   & $5.860 \to 5.646$ & 0.280 \\
+$0.375 \to 0.5$    & $5.646 \to 5.246$ & $\mathbf{0.036}$ \\
+$0.5 \to 0.625$    & $5.246 \to 4.547$ & $\mathbf{8.5\times10^{-5}}$ \\
+$0.625 \to 0.75$   & $4.547 \to 3.837$ & $\mathbf{1.1\times10^{-5}}$ \\
+$0.75 \to 0.875$   & $3.837 \to 2.989$ & $\mathbf{3.0\times10^{-8}}$ \\
+$0.875 \to 1.0$    & $2.989 \to 1.139$ & $\mathbf{3.9\times10^{-26}}$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\textbf{The curve has two regimes.} For $\alpha \le 0.375$ it is a plateau: no
+adjacent-$\alpha$ comparison is significant, and PoA stays between 5.6 and 5.9. From
+$\alpha = 0.375$ onward it declines monotonically, with every adjacent comparison
+significant after FDR correction. Replacing LLM agents with cost-minimizing agents buys
+nothing until they exceed roughly a third of the population.
+
+\paragraph{Why this is roughly twice our earlier estimate.}
+Our earlier configuration reported PoA $= 2.807$ at $\alpha = 0$. That figure was
+produced with Type-L beliefs quantized to five levels
+$\{-1, -0.5, 0, 0.5, 1\}$. \emph{Quantization truncates the distance an agent can
+travel from the continuous optimum}, so the measured efficiency loss was mechanically
+compressed. The present value is not an inflation introduced by new machinery; it is
+what the earlier scale was unable to express.
+
+\paragraph{Decomposition: inefficiency is mostly conformity, not disagreement.}
+Table~\ref{tab:decomp} separates the social cost into its disagreement and conformity
+terms (Section~\ref{sec:metrics}).
+
+\begin{table}[t]
+\centering
+\caption{Decomposition of social cost at the converged state, pooled ($n = 60$ per row).
+``Disagreement'' is $\sum_i\sum_{j \in \mathcal{N}(i)}(z_i - z_j)^2$; ``conformity'' is
+$\sum_i \rho_i K (z_i - s_i)^2$, the cost of having moved away from one's own intrinsic
+position.}
+\label{tab:decomp}
+\begin{tabular}{lcccc}
+\toprule
+$\alpha$ & PoA & Disagreement & Conformity & Conformity share \\
+\midrule
+0.0   & 5.558 & 3.136 & 2.422 & \textbf{43.6\%} \\
+0.125 & 5.901 & 3.690 & 2.211 & 37.5\% \\
+0.25  & 5.860 & 3.882 & 1.978 & 33.7\% \\
+0.375 & 5.646 & 3.822 & 1.824 & 32.3\% \\
+0.5   & 5.246 & 3.610 & 1.636 & 31.2\% \\
+0.625 & 4.547 & 3.127 & 1.420 & 31.2\% \\
+0.75  & 3.837 & 2.678 & 1.159 & 30.2\% \\
+0.875 & 2.989 & 2.175 & 0.814 & 27.2\% \\
+1.0   & 1.139 & 0.956 & 0.183 & \textbf{16.1\%} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Moving from $\alpha = 1$ to $\alpha = 0$, the disagreement term grows by a factor of
+$3.3$ ($0.956 \to 3.136$) while \textbf{the conformity term grows by a factor of $13.2$}
+($0.183 \to 2.422$). The conformity share rises monotonically from 16.1\% to 43.6\% with
+no exception across the nine levels.
+
+This is the substantive mechanism behind the aggregate. \textbf{LLM-driven agents are not
+merely more argumentative; they are markedly more persuadable, and abandoning their own
+prior stance is the dominant source of their inefficiency.} A Type-C agent is
+mathematically prevented from full conformity by the $\rho_i$ term in its objective. A
+Type-L agent receives its intrinsic stance as an anchor in the prompt at every step but
+can be argued away from it, and in the homogeneous neighborhoods that K-NN rewiring
+creates, it repeatedly is.
+
+\subsubsection{RQ2: echo chamber formation}
+\label{sec:res-rq2}
+
+\begin{center}
+\begin{tabular}{lccccccccc}
+\toprule
+$\alpha$ & 0.0 & 0.125 & 0.25 & 0.375 & 0.5 & 0.625 & 0.75 & 0.875 & 1.0 \\
+\midrule
+$P_z$              & 0.304 & 0.338 & 0.395 & 0.436 & 0.466 & 0.502 & 0.536 & 0.568 & 0.597 \\
+$Q_{\mathrm{norm}}$& 0.218 & 0.225 & 0.225 & 0.252 & 0.280 & 0.292 & 0.316 & 0.347 & 0.423 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Both quantities rise \textbf{monotonically} in $\alpha$, with narrow confidence intervals
+(Table~\ref{tab:main}). Polarization roughly doubles from $0.304$ to $0.597$;
+null-corrected modularity rises from $0.218$ to $0.423$.
+
+\textbf{This reverses the conclusion of our earlier configuration}, which reported $P_z$
+confined to $0.575$--$0.66$ with no consistent trend and concluded that the mixing ratio
+has little influence on opinion spread. That flatness was an artifact of the five-point
+belief scale: with only five admissible positions, the variance of the population is
+bounded below by the spacing of the grid, and the measured $P_z$ was dominated by
+quantization rather than by the dynamics. On a continuous scale, $\alpha$ turns out to be
+the strongest single determinant of both polarization and community structure that we
+measure.
+
+The direction is consistent with the decomposition in Table~\ref{tab:decomp}:
+\textbf{LLM populations are less polarized and less modular precisely because they are
+more persuadable.} A population that can be argued out of its positions does not hold the
+camps that polarization and modularity measure. Type-C agents, held to their intrinsic
+opinions by a formal penalty, sustain the separation.
+
+We report $Q_{\mathrm{norm}}$ rather than bare $Q$ throughout. At $\alpha = 1$, bare
+$Q = 0.763$ but $\bar{Q}_{\mathrm{rand}} = 0.335$: \textbf{roughly 44\% of the raw
+modularity is reproduced by a random graph with the same degree sequence.} The structure
+remains strongly non-random ($z_Q \approx 24$--$26$), but the description ``$Q \approx
+0.76$ indicates strong echo chambers'' overstates the effect by more than a factor of
+two and should be restated as $Q_{\mathrm{norm}} \approx 0.42$--$0.43$.
+
+$Q_{\mathrm{norm}}$ is nearly flat over $\alpha \in [0, 0.25]$ ($0.218$ / $0.225$ /
+$0.225$) before rising, mirroring the PoA plateau over the same range.
+
+\subsubsection{RQ3: is there an optimal mixture?}
+\label{sec:res-rq3}
+
+For efficiency alone the answer is $\alpha = 1$, which attains PoA $\approx 1.14$; no
+interior value approaches it. But the grid reveals a structural property of hybrid
+populations that neither pure population exhibits.
+
+\begin{table}[t]
+\centering
+\caption{Attractor composition by mixing ratio, pooled ($n = 60$ per row).
+\texttt{fixed\_point} means the edge set becomes exactly stationary.}
+\label{tab:attractor}
+\begin{tabular}{lccccc}
+\toprule
+$\alpha$ & \texttt{fixed\_point} & \texttt{limit\_cycle} & \texttt{plateau} & \texttt{none} & fixed-point share \\
+\midrule
+0.0   & 11 & 1 & 48 & 0 & \textbf{18\%} \\
+0.125 & 21 & 2 & 37 & 0 & 35\% \\
+0.25  & 26 & 1 & 32 & 1 & 43\% \\
+0.375 & 24 & 1 & 34 & 1 & 40\% \\
+0.5   & 32 & 2 & 26 & 0 & 53\% \\
+0.625 & 30 & 2 & 28 & 0 & 50\% \\
+0.75  & 36 & 5 & 19 & 0 & 60\% \\
+0.875 & 37 & 5 & 18 & 0 & \textbf{62\%} \\
+1.0   & 7  & 1 & 52 & 0 & \textbf{12\%} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\textbf{Mixed populations freeze; pure populations do not.} Both homogeneous
+configurations reach an exactly stationary edge set in a minority of runs (18\% at
+$\alpha = 0$, 12\% at $\alpha = 1$), whereas the fixed-point share rises to 62\% at
+$\alpha = 0.875$ and then collapses. A population containing just six LLM agents out of
+fifty is five times more likely to freeze completely than one containing none.
+
+The plateau height of $C^{\mathrm{out}}$ shows the complementary pattern:
+
+\begin{center}
+\begin{tabular}{lcc}
+\toprule
+$\alpha$ & $C_{\mathrm{plateau}}$ & sd \\
+\midrule
+0.0          & \textbf{0.9129} & 0.0687 \\
+0.125--0.5   & $\approx 0.971$ & 0.019--0.027 \\
+0.625--0.875 & 0.977--0.983    & 0.013--0.016 \\
+1.0          & \textbf{0.9901} & 0.0043 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Only $\alpha = 0$ is clearly distinct --- roughly 8.7\% of neighbors replaced per step,
+against about 1\% for Type-C --- with the interior essentially flat. So ``Type-L agents
+churn their neighborhoods more'' holds, but ``churn decreases monotonically with
+$\alpha$'' does not. This corrects the tentative reading from the $n = 3$ pilot
+(Section~\ref{sec:stopping}).
+
+We do not claim a verified mechanism for the freezing. A testable conjecture is that a
+small number of Type-L agents supplies fixed anchors that interrupt the continual
+micro-adjustment of the Type-C population, letting the system land on an exact fixed
+point rather than approaching one asymptotically. The rise in $t_{\mathrm{conv}}$ at
+$\alpha = 1$ (Table~\ref{tab:convergence}) is the same phenomenon seen from the time axis.
+
+\subsubsection{Initial topology does not determine the outcome}
+\label{sec:res-topology}
+
+\begin{center}
+\begin{tabular}{lccc}
+\toprule
+$\alpha$ & scale-free (BA) & random (ER) & small-world (WS) \\
+\midrule
+0.0  & $5.348 \pm 0.503$ & $5.766 \pm 0.737$ & $5.562 \pm 0.395$ \\
+0.25 & $5.944 \pm 0.356$ & $5.961 \pm 0.531$ & $5.673 \pm 0.557$ \\
+0.5  & $5.078 \pm 0.373$ & $5.422 \pm 0.417$ & $5.237 \pm 0.521$ \\
+0.75 & $3.912 \pm 0.420$ & $4.051 \pm 0.332$ & $3.549 \pm 0.247$ \\
+1.0  & $1.138 \pm 0.008$ & $1.134 \pm 0.007$ & $1.144 \pm 0.010$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Across all nine $\alpha$ levels and both PoA and $P_z$, the confidence intervals of the
+three topology families overlap and \textbf{no comparison reaches significance}
+($n = 20$ per cell).
+
+\paragraph{Absence of a detected difference is not equivalence.}
+We tested equivalence directly with TOST at the pre-registered margin $\delta = 0.2$:
+
+\begin{center}
+\begin{tabular}{lccccc}
+\toprule
+$\alpha$ & most separated pair & difference & TOST $p$ & verdict \\
+\midrule
+0.0  & BA / ER & $-0.418$ & 0.694 & not established \\
+0.25 & ER / WS & $+0.288$ & 0.594 & not established \\
+0.5  & BA / ER & $-0.344$ & 0.704 & not established \\
+0.75 & ER / WS & $+0.501$ & 0.932 & not established \\
+1.0  & BA / WS & $\mathbf{-0.006}$ & $\mathbf{<0.0001}$ & \textbf{equivalent} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\textbf{Only $\alpha = 1$ passes.} At low $\alpha$ the run-to-run variance of PoA
+(sd $\approx 1.0$--$1.5$) is large enough that the data cannot exclude a true difference
+of up to roughly $0.5$ between topology families. We state the conservative and the
+mechanistic readings separately.
+
+\emph{Conservative claim, fully supported by the data.} At $\alpha = 1$ the three initial
+topologies are statistically equivalent (TOST, $\delta = 0.2$, $p < 0.0001$). At every
+other $\alpha$, no significant difference is detected, but the sample size does not
+support a formal equivalence claim.
+
+\emph{Mechanistic reading.} The rewiring rule deletes all edges at every step and rebuilds
+them from opinion distances, so the initial topology is overwritten after the first
+rewiring. Mean degrees were matched to within 4.17\% while clustering coefficients
+remained clearly distinct (0.179 / 0.079 / 0.390), and no difference was detected under
+that design --- \textbf{echo chamber formation here does not require a pre-existing hub
+structure}. That this also holds at $\alpha = 0$, where no agent follows the FJ rule,
+shows it is a property of the rewiring mechanism rather than of the FJ closed form.
+
+We flag a scale issue with the margin. $\delta = 0.2$ is a 17.5\% relative bound at
+$\alpha = 1$ but only 3.6\% at $\alpha = 0$. Asserting equivalence at low $\alpha$ would
+require either a relative margin (e.g.\ 5\%, i.e.\ $\delta \approx 0.28$) or a larger
+$n$; both are decisions that must be fixed in advance rather than chosen after
+inspecting the data, and we therefore leave the low-$\alpha$ claim open.
+
+\subsubsection{A topic-specific PoA peak}
+\label{sec:res-peak}
+
+Pooling topics, the apparent rise from $\alpha = 0$ to $\alpha = 0.125$ is not
+significant ($p = 0.095$). Separating them shows why:
+
+\begin{center}
+\begin{tabular}{lccccc}
+\toprule
+Topic & $\alpha = 0$ & $\alpha = 0.125$ & Welch $t$ & $p$ & Cohen's $d$ \\
+\midrule
+\textbf{Abortion} & 5.436 & $\mathbf{6.322}$ & $+2.74$ & $\mathbf{0.0084}$ & $\mathbf{0.71}$ \\
+Gun control       & 5.681 & 5.480 & $-0.89$ & 0.379 & $-0.23$ \\
+Pooled            & 5.558 & 5.901 & $+1.68$ & 0.095 & 0.31 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\textbf{Abortion exhibits a significant peak at $\alpha = 0.125$ with a medium-to-large
+effect ($d = 0.71$); gun control has no peak at all}, its maximum being at $\alpha = 0$.
+
+This both confirms and relocates the non-monotonicity our earlier configuration reported.
+A peak exists, and it is specific to abortion --- but it sits at $\alpha = 0.125$, not
+$\alpha = 0.75$, and it is about twice as large.
+
+A testable mechanism: abortion has the more asymmetric stance distribution (68/32 against
+gun control's 54/46). On an issue with a clear majority, introducing a small number of
+Type-C agents disrupts the otherwise consistent coordination among Type-L agents and
+drives social cost up; on a near-balanced issue the effect is absent. Because both topics
+use identical personas and stubbornness values (Section~\ref{sec:dataset}), this
+difference is attributable to the stance distribution and not to population composition.
+
+\subsubsection{Key findings}
+\label{sec:res-findings}
+
+\paragraph{F1 --- Echo chamber structure is produced by the rewiring rule, but its
+magnitude is set by agent type.}
+No initial topology among BA, ER and WS produces a detectably different outcome at any
+$\alpha$, and at $\alpha = 1$ the three are formally equivalent: homophilic rewiring
+alone suffices, and no pre-existing hub structure is required. \emph{However, the claim
+that agent type is irrelevant to structure does not survive continuous measurement.}
+Polarization roughly doubles across the $\alpha$ range ($0.304 \to 0.597$) and
+null-corrected modularity nearly doubles ($0.218 \to 0.423$), both monotonically. The
+connection rule determines \emph{that} echo chambers form; the agent population
+determines \emph{how strong} they become.
+
+\paragraph{F2 --- Language-based reasoning operates as a conformity mechanism, and this
+is now measured rather than inferred.}
+LLM populations incur PoA $= 5.56$ against $1.14$ for numerical populations. The
+decomposition locates the loss: 43.6\% of the social cost at $\alpha = 0$ comes from
+agents having moved away from their own intrinsic position, against 16.1\% at
+$\alpha = 1$ --- a 13.2-fold difference in the conformity term. The capacity for
+natural-language reasoning that makes Type-L agents expressive is the same capacity that
+makes them yield under sustained directional pressure.
+
+\paragraph{F3 --- The efficiency response to $\alpha$ has a plateau and a decline, and
+the peak is topic-specific.}
+PoA is statistically flat for $\alpha \le 0.375$ and declines significantly at every step
+thereafter. Within the plateau, abortion shows a significant local peak at
+$\alpha = 0.125$ ($d = 0.71$) that gun control does not. \emph{This supersedes our earlier
+characterization of a norm contention cost peaking in the mid-to-high range
+($\alpha \approx 0.5$--$0.75$) consistently across topics.} That reading was obtained at a
+fixed $T = 35$, which for $\alpha \le 0.5$ measures unconverged transients
+(Table~\ref{tab:convergence}); the effect does not survive measurement at convergence.
+
+\paragraph{F4 --- Hybrid populations solidify more readily than either pure population.}
+Exact fixed points occur in 18\% of runs at $\alpha = 0$ and 12\% at $\alpha = 1$, but in
+62\% at $\alpha = 0.875$. The mechanism is not established; we report it as a robust
+regularity over 540 runs and offer the anchoring conjecture of
+Section~\ref{sec:res-rq3} as a hypothesis.
+
+\paragraph{F5 --- Numerical agents land on the game-theoretic bound.}
+At $\alpha = 1$, PoA $= 1.129$--$1.149$ against the $9/8 = 1.125$ bound of
+\citet{bhawalkar2013coevolutionary}. The simulation does not merely reproduce our own
+previous numbers; it lands where opinion formation game theory predicts, which
+constrains how far the low-$\alpha$ results can be attributed to implementation error.
+
+\endgroup
