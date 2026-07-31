@@ -56,9 +56,9 @@ python3 make_official_figs.py --legacy-scores
 ### Helpers
 
 ```bash
-./eps_from_pdf.sh figures/official_paper   # rebuild every EPS from its PDF
-./crop_pdf.sh Pipeline.pdf                 # trim a PDF to its ink, re-emit EPS+PNG
-python3 validate_eps.py figures/official_paper
+tools/eps_from_pdf.sh figures/official_paper   # rebuild every EPS from its PDF
+tools/crop_pdf.sh Pipeline.pdf                 # trim a PDF to its ink, re-emit EPS+PNG
+python3 tools/validate_eps.py figures/official_paper
 ```
 
 `validate_eps.py` checks the EPSF header, a clean Ghostscript render, absence of
@@ -123,9 +123,20 @@ Already gone before this cleanup.
 
 ```bash
 cd Hybrid-Network/plots && python3 plot_paper_figures.py   # cross_topic/
-python3 analysis/make_figures.py                           # paper/ (superseded
+python3 analysis/legacy/make_figures.py                    # paper/ (superseded
                                                            # by make_official_figs.py)
 ```
+
+---
+
+## Where the data comes from
+
+The figure scripts read `results/M-1_main-grid/phi4`, the ~10 MB extract of the
+2.6 GB raw grid, so a fresh clone rebuilds every figure with no access to the
+data disk. They fall back to the raw grid if `results/` is absent, and
+`$HCOG_GRID` overrides both. `analysis/build_results_bundle.py` regenerates the
+extract after a new sweep; `analysis/verify_bundle.py` checks it against the
+raw grid.
 
 ---
 

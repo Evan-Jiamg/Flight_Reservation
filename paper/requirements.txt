@@ -1,0 +1,31 @@
+# Versions as installed in the environment that produced the M-1 grid
+# (/opt/anaconda3/envs/test_env on the lab machine).
+#
+# vllm is listed separately below: it is only needed to SERVE Phi-4 for the
+# Type-L agents, not to run the analysis. The figures need nothing beyond
+# numpy / scipy / pandas / matplotlib.
+
+# ── simulation ────────────────────────────────────────────────────────
+mesa==2.4.0
+networkx==3.2.1
+python-louvain==0.16
+pydantic==2.10.6
+names-dataset==3.3.1
+tqdm==4.67.1
+
+# ── stance scoring ────────────────────────────────────────────────────
+torch==2.5.1
+transformers==4.49.0
+
+# ── the model client (talks to a local vLLM server) ───────────────────
+openai==1.63.2
+
+# ── analysis and figures ──────────────────────────────────────────────
+numpy==1.26.4
+scipy==1.13.1
+pandas==2.2.3
+matplotlib==3.9.4
+seaborn==0.13.2
+
+# ── serving Phi-4; install only if running Type-L agents ──────────────
+# pip install vllm==0.7.2
