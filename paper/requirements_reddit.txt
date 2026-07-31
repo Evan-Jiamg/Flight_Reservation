@@ -1,0 +1,35 @@
+# Versions as installed in the environment that produced the corpus
+# (/opt/anaconda3/envs/test_env on the lab machine).
+#
+# Only Stage 4 needs a GPU. Inspecting the scored corpus needs nothing beyond
+# pandas, pyarrow and matplotlib.
+
+# ── reading the dump ──────────────────────────────────────────────────
+zstandard==0.25.0
+pandas==2.2.3
+pyarrow==21.0.0
+numpy==1.26.4
+scipy==1.13.1
+
+# ── Stage 3: clustering ───────────────────────────────────────────────
+sentence-transformers==5.1.2
+scikit-learn==1.6.1
+hdbscan==0.8.40
+umap-learn==0.5.7
+
+# ── Stage 4: the stance regressor ─────────────────────────────────────
+torch==2.5.1
+transformers==4.49.0
+datasets==3.6.0
+
+# ── figures ───────────────────────────────────────────────────────────
+matplotlib==3.9.4
+seaborn==0.13.2
+
+# ── Stage 0 only, to pull the dump from Kaggle ────────────────────────
+kagglehub==0.3.12
+
+# ── optional: RAPIDS accelerates Stage 3's UMAP and HDBSCAN ───────────
+# Both fall back to CPU when absent. Install per the RAPIDS instructions
+# for your CUDA version, then point CUML_PATH at its site-packages:
+#   pip install cuml-cu12 cupy-cuda12x
