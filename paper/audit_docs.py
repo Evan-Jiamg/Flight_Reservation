@@ -59,11 +59,25 @@ def audit_paths(text):
         if not os.path.exists(os.path.join(ROOT, rel)):
             bad.append(("layout", rel))
 
-    # python3 <path> and bash <path> inside fenced blocks
-    for m in re.finditer(r"^(?:python3|bash)\s+([\w./\-]+)", text, re.M):
+    # python3 <path> and bash <path> inside fenced blocks. A preceding `cd`
+    # changes what the following paths are relative to; without tracking it,
+    # every command in a block that starts "cd Hybrid-Network" reads as missing.
+    cwd = ""
+    for line in text.splitlines():
+        t = line.strip()
+        m = re.match(r"^cd\s+([\w./\-]+)", t)
+        if m:
+            cwd = os.path.normpath(os.path.join(cwd, m.group(1)))
+            continue
+        if t.startswith("```"):
+            cwd = ""
+            continue
+        m = re.match(r"^(?:python3|bash|\./)?\s*([\w./\-]+\.(?:py|sh))", t)
+        if not m:
+            continue
         p = m.group(1)
-        if not os.path.exists(os.path.join(ROOT, p)):
-            bad.append(("command", p))
+        if not os.path.exists(os.path.join(ROOT, cwd, p)):
+            bad.append(("command", os.path.join(cwd, p)))
 
     # --out / --grid style arguments that name a directory in the tree
     for m in re.finditer(r"--(?:out|outdir|grid)\s+([\w./\-]+)", text):
@@ -161,6 +175,10 @@ def main():
 
     print()
     print("== requirements coverage ==")
+    if not os.path.exists(os.path.join(ROOT, "requirements.txt")):
+        # The root pins nothing itself; each stage carries its own.
+        print("  no requirements.txt at this level (each stage pins its own)")
+        return 1 if (bad or miss) else 0
     uncovered, listed, optional, unused = audit_requirements()
     if uncovered:
         for n, f in uncovered:
