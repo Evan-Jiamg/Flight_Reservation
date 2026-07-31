@@ -1,6 +1,6 @@
 # Regenerating figures
 
-Only `analysis/figures/official_paper/` is kept in the tree. Every other figure
+Only `analysis/figures/` is kept in the tree. Every other figure
 was deleted on 2026-07-31 because all of them are derived artefacts: the data
 they are drawn from is kept, so they can be rebuilt on demand.
 
@@ -11,8 +11,8 @@ a figure, add its command here.
 
 ## What the paper uses
 
-`analysis/figures/official_paper/` — the only figure directory under version
-control. Eight generated figures plus the hand-drawn pipeline diagram.
+`analysis/figures/` — the only figure directory under version control. Eight
+generated figures plus the externally drawn pipeline diagram.
 
 ```bash
 cd Hybrid-Network/analysis
@@ -22,7 +22,7 @@ cd Hybrid-Network/analysis
 python3 make_official_figs.py
 
 # three convergence figures into the same directory
-python3 make_convergence_figs.py --outdir figures/official_paper
+python3 make_convergence_figs.py
 ```
 
 Each writes `.png` + `.pdf`, then converts the PDF to `.eps` with `pdftops`.
@@ -45,8 +45,8 @@ KDE washes are composited by hand into three regions. Do not reintroduce
 ```bash
 # review copies with in-figure titles (submission copies carry the title in the
 # caption instead)
-python3 make_official_figs.py --titles --outdir figures/official_paper_titled
-python3 make_convergence_figs.py --outdir figures/official_paper_titled
+python3 make_official_figs.py --titles --outdir figures_titled
+python3 make_convergence_figs.py --outdir figures_titled
 
 # stance distribution from the PRE-recalibration scores, written as
 # chart1_distribution so it cannot overwrite the BWS version
@@ -56,9 +56,9 @@ python3 make_official_figs.py --legacy-scores
 ### Helpers
 
 ```bash
-tools/eps_from_pdf.sh figures/official_paper   # rebuild every EPS from its PDF
-tools/crop_pdf.sh Pipeline.pdf                 # trim a PDF to its ink, re-emit EPS+PNG
-python3 tools/validate_eps.py figures/official_paper
+tools/eps_from_pdf.sh figures      # rebuild every EPS from its PDF
+tools/crop_pdf.sh figures/Pipeline.pdf   # trim a PDF to its ink, re-emit EPS+PNG
+python3 tools/validate_eps.py figures
 ```
 
 `validate_eps.py` checks the EPSF header, a clean Ghostscript render, absence of
@@ -84,8 +84,8 @@ They reappear on their own the next time a simulation runs.
 
 ### `analysis/figures/convergence_*.{png,pdf,eps}` (9 files)
 
-Byte-for-byte the same three figures as in `official_paper/`, written there
-because `make_convergence_figs.py` defaults to `--outdir figures`.
+Byte-for-byte duplicates of three figures that now live in `analysis/figures/`
+itself. The nesting is gone, so this class of duplicate cannot recur.
 
 ```bash
 python3 analysis/make_convergence_figs.py --outdir analysis/figures
@@ -123,9 +123,13 @@ Already gone before this cleanup.
 
 ```bash
 cd Hybrid-Network/plots && python3 plot_paper_figures.py   # cross_topic/
-python3 analysis/legacy/make_figures.py                    # paper/ (superseded
-                                                           # by make_official_figs.py)
 ```
+
+`analysis/legacy/make_figures.py`, which produced `paper/` along with
+`fig_opinion_drift`, `fig_convergence_cout` and `fig_tconv`, was removed: it
+duplicated `make_official_figs.py` for every figure the paper actually uses, and
+shipping two scripts that both emit `fig_neighbor_gap` invites the wrong one
+being cited. It remains in git history if those three are ever wanted.
 
 ---
 

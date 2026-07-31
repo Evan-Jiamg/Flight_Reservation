@@ -1,169 +1,220 @@
-# H-COG Hybrid Network Simulation
+# H-COG: Hybrid Coevolutionary Opinion Games
 
-Simulation engine for the **Hybrid Coevolutionary Opinion Game (H-COG)**.
-Agents are split into **Type-C** (Friedkin–Johnsen cost-minimising) and
-**Type-L** (Phi-4 LLM-driven) by the mixing parameter `α`, placed on one of
-three topologies, and evolved with K-NN (K=5) opinion-similarity rewiring until
-a structural convergence criterion fires.
+Simulation and analysis code for the H-COG framework. A population of `N = 50`
+agents is partitioned by a mixing parameter `α` into **Type-C** agents, which
+minimise a Friedkin–Johnsen cost in closed form, and **Type-L** agents, whose
+opinions are produced by a local Phi-4 model. The population is embedded in one
+of three topologies and evolved under K-NN (`K = 5`) opinion-similarity
+rewiring until a structural convergence criterion fires.
 
-**Topics:** `gun_control`, `abortion`, initialised from empirical Reddit
-r/politics stance distributions (see `../Reddit-Dataset/`).
+Agent priors are drawn from empirically scored Reddit r/politics comments on two
+topics, `gun_control` and `abortion` (see `../Reddit-Dataset/`).
 
-**Main grid (M-1):** 2 topics × 3 topologies × 9 α values × 10 seeds =
+**Main grid (M-1).** 2 topics × 3 topologies × 9 values of `α` × 10 seeds =
 **540 runs**.
 
-Results and their interpretation live in the paper, not here — this README
-deliberately carries no results table, because the one it used to carry
-described a superseded 180-run pilot and drifted out of step with the data.
+This README documents the code and data. Results and their interpretation
+belong to the paper and are deliberately not duplicated here.
 
 ---
 
-## Layout
+## Repository layout
 
 ```
 Hybrid-Network/
-├── core/                    the agents themselves
-│   ├── agent.py               Type-L: Phi-4 with the 3-stage memory mechanism
-│   ├── numeric_agent.py       Type-C: Friedkin–Johnsen update
-│   ├── prompt.py              Type-L prompt templates
-│   ├── scorer.py              stance regressor wrapper
-│   ├── convergence.py         C_out, dS, d_L, DeltaCon, ARI, the stopping rule
-│   └── utils.py               vLLM client
+├── core/                         agent behaviour and convergence machinery
+│   ├── agent.py                    Type-L: Phi-4 with a three-stage memory
+│   ├── numeric_agent.py            Type-C: Friedkin–Johnsen update
+│   ├── prompt.py                   Type-L prompt templates
+│   ├── scorer.py                   stance regressor wrapper
+│   ├── convergence.py              C_out, dS, d_L, DeltaCon, ARI, stopping rule
+│   └── utils.py                    vLLM client
 │
-├── simulation/              running the model
-│   ├── model.py               the model: rewiring, metrics, per-run output
-│   ├── run_hybrid.py          single run
-│   ├── run_all_parallel.py    the sweep that produced M-1
-│   └── recompute_poa.py       recompute PoA with the dynamic denominator
+├── simulation/                   running the model
+│   ├── model.py                    rewiring, metrics, per-run output
+│   ├── run_hybrid.py               a single run
+│   ├── run_all_parallel.py         the sweep that produced M-1
+│   └── recompute_poa.py            recompute PoA with the dynamic denominator
 │
-├── data/                    inputs, grouped by kind
-│   ├── networks/              93 seeded topologies (3 kinds, seeds 1-30 + a legacy seed_50)
-│   │   └── _superseded_pre_rerun/   scale-free graphs as they were before the
-│   │                                07-25 regeneration; the June runs used them
-│   ├── agents/                backgrounds, intrinsic opinions, stubbornness
-│   ├── lexicons/              belief keywords, topic questions, perspectives
-│   └── gen_networks.py        regenerates data/networks/
+├── data/                         inputs, and the scripts that generate them
+│   ├── init_agents.py              Reddit scores -> agent priors (data/agents/)
+│   ├── gen_networks.py             degree-aligned topologies (data/networks/)
+│   ├── networks/                   93 graphs: 3 families x seeds 1-30, plus a
+│   │   │                           legacy seed_50 from the first pilot
+│   │   └── _superseded_pre_rerun/  10 scale-free graphs as they stood before
+│   │                               the 2026-07-25 regeneration
+│   ├── agents/                     backgrounds, intrinsic opinions, stubbornness
+│   └── lexicons/                   belief keywords, topic questions, perspectives
 │
-├── analysis/                figures and tables for the paper
-│   ├── make_official_figs.py      the five main figures
-│   ├── make_convergence_figs.py   the three convergence figures
-│   ├── build_results_bundle.py    raw grid -> results/ (see "Data" below)
-│   ├── verify_bundle.py           hashes results/ against the raw grid
-│   ├── export_converged_table.py  one row per run at its converged state
-│   ├── decompose_poa.py           disagreement / conformity split
-│   ├── summaries/                 pre-aggregated JSON
-│   ├── tools/                     EPS validation, PDF->EPS, cropping, cleanup
-│   ├── legacy/                    make_figures.py, superseded by the above
-│   ├── figures/official_paper/    the figures the paper uses
-│   └── REGENERATING_FIGURES.md    how to rebuild any figure
+├── analysis/                     everything the paper is built from
+│   ├── make_official_figs.py       five main figures
+│   ├── make_convergence_figs.py    three convergence figures
+│   ├── build_results_bundle.py     raw grid -> results/
+│   ├── verify_bundle.py            hashes results/ against the raw grid
+│   ├── export_converged_table.py   one row per run at its converged state
+│   ├── decompose_poa.py            disagreement / conformity split
+│   ├── figures/                    the figures used in the paper
+│   ├── summaries/                  pre-aggregated JSON
+│   ├── tools/                      EPS validation, PDF->EPS, cropping
+│   └── REGENERATING_FIGURES.md     how to rebuild any figure
 │
-├── plots/                   June-era plotting, still the source of the
-│                            timeseries and reddit-only figures
+├── plots/                        earlier plotting layer, still the source of
+│                                 the timeseries and Reddit-only figures
 │
-├── reddit/                  stance scoring and agent initialisation
-├── scripts/                 serving Phi-4, tmux, monitoring, sweeps
-│
-├── results/                 committed run data (~10 MB) — see "Data"
-├── experiments/             symlink to the raw grid on the data disk, ignored
-└── logs/                    run logs, ignored
+├── scripts/                      serving Phi-4, tmux orchestration, monitoring
+├── results/                      committed run data, 10.3 MB (see Data)
+├── experiments/                  symlink to the raw grid on the data disk
+└── logs/                         run logs
 ```
+
+`experiments/`, `logs/` and the operational scratch in `ops/` are not tracked.
+
+---
+
+## Requirements
+
+```bash
+pip install -r requirements.txt
+```
+
+Versions are pinned to the environment that produced M-1. Only the simulation
+needs a GPU and a model server; **the analysis and every figure need nothing
+beyond numpy, scipy, pandas and matplotlib.**
+
+`pdftops` (Poppler) and Ghostscript are required to produce and validate EPS.
 
 ---
 
 ## Data
 
-The raw grid is **2.6 GB** and is not in the repository. 98% of it is LLM prose
-— `opinions`, `reasonings`, `long_memory`, `short_memory` inside
+The raw grid is **2.6 GB** and is not in this repository. 98% of it is LLM prose
+— `opinions`, `reasonings`, `long_memory` and `short_memory` inside
 `agents_data.json`, plus `agents_interaction_data.json` — which no figure or
 table reads.
 
-`results/` carries the analysis-ready extract instead, at **10.3 MB**:
+`results/` carries a **10.3 MB** analysis-ready extract instead.
 
-| Kept per run | Why |
+| Retained per run | Purpose |
 |---|---|
 | `metrics.csv` | the 18 per-step metrics; the source of most figures |
 | `convergence.json` | `t_conv`, attractor class, plateau height |
-| `poa_components.csv` | disagreement / conformity split |
+| `poa_components.csv` | disagreement / conformity decomposition |
 | `agent_assignment.json` | which agents are Type-L |
-| `neighbor_gap.csv` (derived, per grid) | the entire input to `fig_neighbor_gap`, 1.8 MB in place of the 2.3 GB it was computed from |
 
-Dropped, with the reason:
+| Retained per grid | Purpose |
+|---|---|
+| `neighbor_gap.csv` | the complete input to `fig_neighbor_gap`: 1.8 MB in place of the 2.3 GB it was computed from |
+| `manifest.json` | sweep configuration |
 
-| Dropped | Size | Reason |
+| Excluded | Size | Reason |
 |---|---|---|
-| `model_overview.json` | 10.6 MB | byte-equivalent to `metrics.csv`, verified on 25 sampled runs — the same table in JSONL form |
-| `edges_per_step.json` | 56.4 MB | every graph metric derived from it is already in `metrics.csv`, and the one figure needing the final graph is served by `neighbor_gap.csv` |
-| `agents_data.json` | 2204 MB | only `beliefs` is read, and only its last entry |
+| `model_overview.json` | 10.6 MB | byte-equivalent to `metrics.csv`, verified on 25 sampled runs; the same table in JSONL form |
+| `edges_per_step.json` | 56.4 MB | every graph metric derived from it is already in `metrics.csv`, and the one figure requiring the final graph is served by `neighbor_gap.csv` |
+| `agents_data.json` | 2204 MB | only `beliefs` is read, and only its final entry |
 | `agents_interaction_data.json` | 342 MB | not read by any analysis |
 
-`analysis/verify_bundle.py` hashes every file in `results/` against its source;
-all 2160 are byte-identical. Rebuilding the figures from `results/` instead of
-the raw grid reproduces them exactly — six of eight are byte-identical PNGs and
-the other two differ by 1/255 from rounding in the derived table.
+`neighbor_gap.csv` is derived once rather than recomputed on demand: a full
+re-run is roughly 40 GPU-hours, and although decoding is configured with
+`temperature = 0` and a fixed seed, vLLM's continuous batching can perturb the
+numerics for an identical prompt depending on what else is in the batch.
 
-The analysis scripts find the grid automatically: `results/` if present, the raw
-grid otherwise, or `$HCOG_GRID` if set.
+**Integrity.** `analysis/verify_bundle.py` hashes all 2160 retained files
+against their sources; every one is byte-identical. Rebuilding the figures from
+`results/` rather than the raw grid yields six byte-identical PNGs out of eight;
+the remaining two differ by 1/255, from rounding in the derived table.
+
+Analysis scripts locate the grid automatically: `results/` when present, the raw
+grid otherwise, and `$HCOG_GRID` overrides both.
 
 ---
 
-## Setup
-
-```bash
-pip install -r requirements.txt
-bash scripts/start_vllm.sh               # serve Phi-4 locally; needed for α < 1
-```
-
-The grid was produced with `/opt/anaconda3/envs/test_env` on the lab machine;
-`requirements.txt` pins what was in it. The analysis and figure scripts need
-only numpy, scipy, pandas and matplotlib — no GPU, no model server.
-
-## Running
-
-```bash
-# one run
-python3 simulation/run_hybrid.py --topic gun_control --network_type random \
-        --alpha 0.5 --seed 1
-
-# the M-1 sweep
-python3 simulation/run_all_parallel.py
-```
-
-Output lands in `experiments/`, which is a symlink to the data disk. After a
-sweep, refresh the committed extract:
-
-```bash
-python3 analysis/build_results_bundle.py \
-        --grid experiments/M-1_main-grid/phi4 \
-        --out  results/M-1_main-grid/phi4
-```
-
-## Figures
+## Reproducing the paper figures
 
 ```bash
 python3 analysis/make_official_figs.py
-python3 analysis/make_convergence_figs.py --outdir analysis/figures/official_paper
-python3 analysis/tools/validate_eps.py analysis/figures/official_paper
+python3 analysis/make_convergence_figs.py
+python3 analysis/tools/validate_eps.py analysis/figures
 ```
 
-`analysis/REGENERATING_FIGURES.md` covers every figure, including the ones not
-kept in the tree, and explains why EPS is produced by `pdftops` rather than by
-matplotlib.
+Both scripts write PNG (300 dpi), PDF and EPS into `analysis/figures/`.
+
+| Figure | Produced by |
+|---|---|
+| `fig_poa_decomposition` | `make_official_figs.py` |
+| `fig_neighbor_gap` | `make_official_figs.py` |
+| `fig_metric_trajectories` | `make_official_figs.py` |
+| `fig_attractor` | `make_official_figs.py` |
+| `fig_stance_distribution` | `make_official_figs.py` |
+| `convergence_tconv_ecdf` | `make_convergence_figs.py` |
+| `convergence_cout_trajectory` | `make_convergence_figs.py` |
+| `convergence_metric_agreement` | `make_convergence_figs.py` |
+| `Pipeline` | drawn externally; the draw.io source is embedded in the PDF metadata |
+
+`--titles` produces review copies carrying the title inside the artwork;
+submission copies leave it to the caption. `--legacy-scores` redraws the stance
+distribution from the pre-recalibration scores as `chart1_distribution`.
+
+**EPS is produced by `pdftops`, not by matplotlib.** Nimbus Roman ships as an
+OTF with CFF outlines, and matplotlib's PostScript backend can only wrap a
+glyf-based TrueType font as Type 42, so a direct `savefig(".eps")` embeds an
+invalid font that Ghostscript rejects outright. The PDF backend embeds the same
+face correctly as CID Type 0C, so the PDF is the master. PostScript also has no
+alpha channel: translucent fills are pre-blended onto white, and the two
+overlapping stance densities are composited by hand into three regions. Read the
+comments in `make_official_figs.py` before reintroducing `alpha=` on a filled
+artist.
+
+`analysis/REGENERATING_FIGURES.md` covers every figure, including those not kept
+in the tree.
+
+---
+
+## End-to-end pipeline
+
+```bash
+# 1. agent priors from the scored Reddit corpus
+python3 data/init_agents.py --topic gun_control
+python3 data/init_agents.py --topic abortion
+
+# 2. topologies, matched on mean degree across families
+python3 data/gen_networks.py --out data/networks
+
+# 3. serve Phi-4 (needed only for α < 1)
+bash scripts/start_vllm.sh
+
+# 4. a single run
+python3 simulation/run_hybrid.py --topic gun_control \
+        --network_type random --alpha 0.5 --seed 1
+
+# 5. the full grid
+python3 simulation/run_all_parallel.py
+
+# 6. refresh the committed extract
+python3 analysis/build_results_bundle.py \
+        --grid experiments/M-1_main-grid/phi4 \
+        --out  results/M-1_main-grid/phi4
+python3 analysis/verify_bundle.py
+```
+
+`PYTHON=/path/to/python` overrides the interpreter used by the shell entry
+points and by `run_all_parallel.py`.
 
 ---
 
 ## Metrics
 
-| Metric | Definition | Meaning |
+| Metric | Definition | Interpretation |
 |---|---|---|
-| **Polarization** `Pz` | (1/N) Σ(z_i − z̄)² | variance of expressed beliefs; higher = more divided |
-| **Modularity** `Q` | Louvain on the K-NN graph | community structure |
-| **Q_norm**, `z_Q` | Q against a degree-preserving null model | modularity above what the degree sequence alone forces |
-| **PoA** | C(z_t, G_t) / C*(G_t) | actual over socially optimal cost; ≥ 1 by construction |
-| **C_out**, `dS`, `d_L`, DeltaCon, ARI | successive graphs compared | structural convergence; `C_out` is the primary criterion |
+| Polarization `Pz` | `(1/N) Σ(z_i − z̄)²` | variance of expressed opinions |
+| Modularity `Q` | Louvain on the K-NN graph | community structure |
+| `Q_norm`, `z_Q` | `Q` against a degree-preserving null model | structure beyond what the degree sequence alone forces |
+| PoA | `C(z_t, G_t) / C*(G_t)` | equilibrium inefficiency; `≥ 1` by construction |
+| `C_out` | correlation between consecutive out-neighbourhoods | primary convergence criterion |
+| `dS`, `d_L`, DeltaCon, ARI | successive graphs compared | corroborating structural measures |
 
-`C(z_t)` and `C*(G_t)` are both evaluated on the same post-rewiring graph `G_t`,
-so PoA reflects inefficiency relative to the best achievable outcome on the
-current topology rather than on a stale one.
+`C(z_t)` and `C*(G_t)` are evaluated on the same post-rewiring graph `G_t`, so
+PoA measures inefficiency against the best achievable outcome on the current
+topology rather than on a stale one.
 
 ---
 
@@ -177,43 +228,36 @@ Minimises
 C_i = Σ_{j∈N_i}(z_i − z_j)² + ρ_i · K · (z_i − s_i)²
 ```
 
-with the closed-form update
+giving the closed-form update
 
 ```
 z_i ← (Σ_{j∈N_i} z_j + ρ_i · K · s_i) / (|N_i| + ρ_i · K)
 ```
 
-`s_i` is the fixed intrinsic opinion, `ρ_i` the stubbornness coefficient,
-beliefs in [−1, +1].
+where `s_i` is the fixed intrinsic opinion and `ρ_i` the stubbornness
+coefficient. Opinions lie in `[−1, +1]`.
 
 ### Type-L — Phi-4 (`core/agent.py`)
 
 Three stages per step, only the last of which calls the model:
 
-1. **Short-term memory** — concatenates up to 80 words of neighbour opinions
-   heard this step.
-2. **History compression** — sliding window over past summaries, truncated to
+1. **Short-term memory** — up to 80 words of neighbour opinions heard this step.
+2. **History compression** — a sliding window over past summaries, truncated to
    60 words.
 3. **Opinion update** — the prompt carries the intrinsic opinion as a fixed
-   anchor plus both memories, and returns a new expressed opinion.
-
-Decoding uses `temperature=0` with a fixed seed. That makes a re-run
-*intended* to be reproducible, but it is not a substitute for keeping the
-data: vLLM's continuous batching can change the numerics for the same prompt
-depending on what else is in the batch, and a full re-run is roughly 40 GPU
-hours. This is why `neighbor_gap.csv` is derived once and committed rather
-than recomputed on demand.
+   anchor alongside both memories, and returns a new expressed opinion.
 
 ---
 
 ## K-NN rewiring
 
-Each step every agent re-links to the K=5 agents minimising
+At each step every agent re-links to the `K = 5` agents minimising
 
 ```
 |s_i − z_j^(t)|
 ```
 
-its own **intrinsic** opinion against the neighbour's **expressed** one. The
-asymmetry is deliberate: a stable preference seeking out whoever currently
-sounds compatible. It applies identically to both agent types.
+that is, its own **intrinsic** opinion against each neighbour's **expressed**
+opinion. The asymmetry is deliberate: a stable underlying preference seeking out
+whoever currently sounds compatible. The rule applies identically to both agent
+types.

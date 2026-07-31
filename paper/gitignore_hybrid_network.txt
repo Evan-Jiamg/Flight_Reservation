@@ -1,0 +1,23 @@
+# ── build artefacts ──────────────────────────────────────────────────
+__pycache__/
+*.pyc
+.env
+
+# ── operational scratch ──────────────────────────────────────────────
+# Session transcripts, supervisor logs, ad-hoc patches and .bak files kept
+# while the grid was running. Useful on disk, not part of the paper.
+ops/
+
+# ── raw run output ───────────────────────────────────────────────────
+# experiments/ is a symlink to the data disk: 2.6 GB, 98% of it LLM prose
+# that no figure reads. results/ carries the ~10 MB analysis-ready extract
+# instead. See README "Data" and analysis/build_results_bundle.py.
+experiments/
+
+# ── logs ─────────────────────────────────────────────────────────────
+logs/
+*.log
+
+# analysis/figures/ is tracked in full: it holds the paper figures and
+# nothing else. Per-run charts are written beside their own metrics.csv
+# (simulation/model.py), so nothing transient lands there.

@@ -28,4 +28,6 @@ matplotlib==3.9.4
 seaborn==0.13.2
 
 # ── serving Phi-4; install only if running Type-L agents ──────────────
-# pip install vllm==0.7.2
+# vllm pulls a large CUDA stack, so it is not installed by default.
+#   pip install vllm==0.7.2 uvloop==0.21.0
+# uvloop is used by scripts/vllm_server_patched.py.
