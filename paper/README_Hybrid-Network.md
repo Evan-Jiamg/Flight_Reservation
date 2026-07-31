@@ -53,13 +53,14 @@ Hybrid-Network/
 │   ├── verify_bundle.py            hashes results/ against the raw grid
 │   ├── export_converged_table.py   one row per run at its converged state
 │   ├── decompose_poa.py            disagreement / conformity split
-│   ├── figures/                    the figures used in the paper
-│   ├── summaries/                  pre-aggregated JSON
+│   ├── build_summary.py            per-condition summary tables
+│   ├── hcog_paths.py               resolves where the run grid is
+│   ├── stats/                      the statistics the paper reports, with the
+│   │                               table each one emits
+│   ├── figures/                    the figures the paper uses
+│   ├── summaries/                  generated aggregate tables
 │   ├── tools/                      EPS validation, PDF->EPS, cropping
 │   └── REGENERATING_FIGURES.md     how to rebuild any figure
-│
-├── plots/                        earlier plotting layer, still the source of
-│                                 the timeseries and Reddit-only figures
 │
 ├── scripts/                      serving Phi-4, tmux orchestration, monitoring
 ├── results/                      committed run data, 10.3 MB (see Data)
@@ -123,8 +124,19 @@ against their sources; every one is byte-identical. Rebuilding the figures from
 `results/` rather than the raw grid yields six byte-identical PNGs out of eight;
 the remaining two differ by 1/255, from rounding in the derived table.
 
+`results/` also carries **W-5_typeL-pilot**, six runs at α ∈ {0, 0.5} on
+`gun_control`/`scale_free`. It is deliberately not a grid: it is the pilot that
+established `T_max = 120`, the Type-C calibration of 60 having proved too short
+for Type-L. The paper cites it in the convergence section, so it ships alongside
+the main grid rather than being reconstructed from prose.
+
 Analysis scripts locate the grid automatically: `results/` when present, the raw
-grid otherwise, and `$HCOG_GRID` overrides both.
+grid otherwise, and `$HCOG_GRID` overrides both. `analysis/hcog_paths.py` owns
+that resolution; no script hardcodes a grid location.
+
+`data/` holds inputs and `results/` holds outputs, kept apart so that what was
+measured is never confused with what was fed in. Neither is merged into
+`analysis/`, which contains the code that reads them.
 
 ---
 
@@ -166,6 +178,35 @@ artist.
 
 `analysis/REGENERATING_FIGURES.md` covers every figure, including those not kept
 in the tree.
+
+---
+
+## Reproducing the reported statistics
+
+Each script writes the table beside it, so a reviewer can compare what the code
+produces against what was recorded.
+
+```bash
+python3 analysis/stats/stopping_cost.py   # -> tstats.txt
+python3 analysis/stats/alpha_curves.py    # -> alpha_curves.txt
+python3 analysis/stats/peak_test.py       # -> peak_test.txt
+python3 analysis/stats/integrity_audit.py # -> integrity.txt (needs the raw grid)
+```
+
+| Script | Reports |
+|---|---|
+| `stopping_cost.py` | `t_conv` and `steps_run` per α: what dynamic stopping costs |
+| `alpha_curves.py` | PoA, `Pz`, `Q_norm`, `C_out` pooled over networks and topics, with 95% CIs |
+| `peak_test.py` | Welch's t-test for the PoA rise from α=0 to α=0.125, per topic |
+| `integrity_audit.py` | file presence and column completeness across the campaign |
+
+The first three run against the committed extract and reproduce their stored
+tables byte for byte. `integrity_audit.py` inspects `agents_data.json` and
+`edges_per_step.json`, which the extract omits, so it requires the raw grid.
+
+`peak_test.py` tests the two topics separately rather than pooling them: they
+share agent personas and stubbornness, and their stance scores correlate at
++0.881, so pooling would treat dependent samples as twice the evidence.
 
 ---
 

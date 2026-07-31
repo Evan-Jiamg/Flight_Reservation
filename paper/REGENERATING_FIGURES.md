@@ -97,39 +97,26 @@ A stale copy of the same three figures from 07-29, predating the EPS and
 colour-system work. The whole directory was removed; `analysis/figures` is the
 only figure root. Regenerate with the command above if you really want them.
 
-### `analysis/figures/timeseries/` (6 files)
+### `timeseries/`, `reddit_only/`, `cross_topic/`, `paper/`
 
-```bash
-cd Hybrid-Network/plots && python3 plot_convergence_multiples.py
-```
+Not regenerable in place, and deliberately so. Every script that drew them has
+been removed:
 
-Reads `analysis/timeseries_per_alpha_{gun_control,abortion}.json` and
-`analysis/summary_final_step_*.json`, all four of which are kept. Those JSONs
-are themselves rebuilt by `plots/build_summary.py`.
+* `plots/plot_convergence_multiples.py` and `plots/plot_paper_figures.py` read
+  `timeseries_per_alpha_*.json` and `summary_final_step_*.json`, which are dated
+  2026-06-21 and describe the superseded 180-run pilot. The current
+  `build_summary.py` does not produce those filenames at all, so running either
+  script plotted June data while appearing to plot the current grid.
+* `plots/plot_stance_distribution.py` is superseded by
+  `make_official_figs.py`'s `fig_stance_distribution`, which reads the
+  recalibrated scores rather than the pre-recalibration set.
+* `analysis/legacy/make_figures.py` duplicated `make_official_figs.py` for every
+  figure the paper uses. Two scripts both emitting `fig_neighbor_gap` invites
+  citing the wrong one. The three figures only it produced —
+  `fig_opinion_drift`, `fig_convergence_cout`, `fig_tconv` — are in git history.
 
-### `analysis/figures/reddit_only/` (4 files)
-
-```bash
-cd Hybrid-Network/plots && python3 plot_stance_distribution.py
-```
-
-Reads the stance parquet files under `Reddit-Dataset/stance_scores/`. Note that
-`plots/config.py` points `REDDIT_DIR` at `stance_scores`, the pre-recalibration
-scores — the BWS scores live in `stance_scores_bws/`.
-
-### `analysis/figures/cross_topic/` and `analysis/figures/paper/`
-
-Already gone before this cleanup.
-
-```bash
-cd Hybrid-Network/plots && python3 plot_paper_figures.py   # cross_topic/
-```
-
-`analysis/legacy/make_figures.py`, which produced `paper/` along with
-`fig_opinion_drift`, `fig_convergence_cout` and `fig_tconv`, was removed: it
-duplicated `make_official_figs.py` for every figure the paper actually uses, and
-shipping two scripts that both emit `fig_neighbor_gap` invites the wrong one
-being cited. It remains in git history if those three are ever wanted.
+All four are recoverable from history if wanted, but nothing in the paper
+depends on them.
 
 ---
 
@@ -146,10 +133,9 @@ raw grid.
 
 ## The rule
 
-Figures are build output. Keep the inputs — `metrics.csv`, `convergence.json`,
-`agents_data.json`, `edges_per_step.json`, `poa_components.csv`, the aggregated
-JSONs in `analysis/`, and the stance parquets — and let the scripts above
-produce everything else.
+Figures are build output. Keep the inputs — the per-run files in `results/`,
+the derived `neighbor_gap.csv`, and the stance parquets — and let the scripts
+above produce everything else.
 
-Scripts in `plots/` must be run from `plots/`; they do `from config import ...`.
-Scripts in `analysis/` carry absolute paths and run from anywhere.
+Every script under `analysis/` resolves its own paths and runs from anywhere;
+`analysis/hcog_paths.py` decides where the grid is.

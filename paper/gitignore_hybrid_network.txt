@@ -4,8 +4,12 @@ __pycache__/
 .env
 
 # ── operational scratch ──────────────────────────────────────────────
-# Session transcripts, supervisor logs, ad-hoc patches and .bak files kept
-# while the grid was running. Useful on disk, not part of the paper.
+# Session transcripts, supervisor logs, .bak files and ad-hoc status scripts
+# kept while the grid was running. Useful on disk, not part of the paper.
+#
+# The statistics that ops/scripts/analysis/ used to hold are NOT here any
+# more: they compute the numbers the paper reports, so they live in
+# analysis/stats/ alongside the tables they emit.
 ops/
 
 # ── raw run output ───────────────────────────────────────────────────

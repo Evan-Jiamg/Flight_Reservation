@@ -19,8 +19,8 @@ ROOT = ("/home/neil/Information_Management_Project/Echo-Chamber-Simulation/"
 README = os.path.join(ROOT, "README.md")
 
 STDLIB = set(sys.stdlib_module_names) | {"__future__"}
-LOCAL = {"core", "config", "style", "agent", "numeric_agent", "prompt",
-         "scorer", "utils", "model", "convergence", "make_official_figs"}
+LOCAL = {"core", "agent", "numeric_agent", "prompt", "scorer", "utils",
+         "model", "convergence", "make_official_figs", "hcog_paths"}
 # import name -> distribution name
 DIST = {"sklearn": "scikit-learn", "community": "python-louvain",
         "names_dataset": "names-dataset", "PIL": "pillow", "yaml": "pyyaml",
@@ -98,9 +98,12 @@ def audit_requirements():
 
     used = {}
     for dp, dns, fns in os.walk(ROOT):
+        # data/ holds two generator scripts as well as the inputs, so it is
+        # walked; only its pure-data subdirectories are skipped.
         dns[:] = [d for d in dns
                   if d not in ("ops", "__pycache__", ".git", "results",
-                               "experiments", "logs", "data")]
+                               "experiments", "logs", "networks", "agents",
+                               "lexicons", "figures", "summaries")]
         for fn in fns:
             if not fn.endswith(".py"):
                 continue
@@ -122,7 +125,10 @@ def audit_requirements():
                                         os.path.relpath(p, ROOT))
     missing = sorted((n, f) for n, f in used.items()
                      if n not in listed and n not in optional)
-    return missing, sorted(listed), sorted(optional)
+    # A pin nothing imports is dead weight, and dead weight in a dependency
+    # list is the kind a reviewer installs and then wonders about.
+    unused = sorted(n for n in listed if n not in used)
+    return missing, sorted(listed), sorted(optional), unused
 
 
 def main():
@@ -143,16 +149,19 @@ def main():
 
     print()
     print("== requirements coverage ==")
-    uncovered, listed, optional = audit_requirements()
+    uncovered, listed, optional, unused = audit_requirements()
     if uncovered:
         for n, f in uncovered:
             print("  NOT LISTED: %-18s (imported by %s)" % (n, f))
     else:
         print("  every third-party import is pinned")
+    if unused:
+        for n in unused:
+            print("  PINNED BUT UNUSED: %s" % n)
     print("  required: " + ", ".join(sorted(listed)))
     print("  optional: " + ", ".join(sorted(optional)))
 
-    return 1 if (bad or miss or uncovered) else 0
+    return 1 if (bad or miss or uncovered or unused) else 0
 
 
 if __name__ == "__main__":
