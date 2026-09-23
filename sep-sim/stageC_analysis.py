@@ -80,8 +80,12 @@ def main():
     os.makedirs(rep, exist_ok=True)
     nog = os.path.join(rep, "nogate.jsonl")
     if not os.path.exists(nog):
-        eps = rows(os.path.join(args.stage, "rep%d_half_a" % args.replicate, "nogate.jsonl")) + \
-              rows(os.path.join(args.stage, "rep%d_half_b" % args.replicate, "nogate.jsonl"))
+        import glob
+        parts = sorted(glob.glob(os.path.join(args.stage, "rep%d_shard*" % args.replicate, "nogate.jsonl")))
+        eps = [e for p in parts for e in rows(p)]
+        expect = 2 * len(json.load(open(os.path.join(args.stage, "scenarios_union.json")))["scenarios"])
+        if len(eps) != expect or len({(e["conversation_id"], e["seed"]) for e in eps}) != expect:
+            raise SystemExit("replicate %d incomplete: %d/%d episodes" % (args.replicate, len(eps), expect))
         with open(nog, "w", encoding="utf-8") as f:
             for e in eps:
                 f.write(json.dumps(e, ensure_ascii=False) + "\n")
