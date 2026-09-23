@@ -36,7 +36,7 @@ def main():
                                           rng.random() < .2)) + "\n")
     o = run("analyze_task2.py", "--base", os.path.join(d, "a.jsonl"), "--new", os.path.join(d, "b.jsonl"))
     assert o["paired"]["n_scenarios"] == 6 and o["base"]["episodes"] == 12
-    assert abs(sum(o["base"]["end_kind_rate"].values()) - 1) < 1e-9
+    assert abs(sum(v for k, v in o["base"].items() if k.startswith("end_")) - 1) < 1e-9
     # identical arms => zero difference
     z = run("analyze_task2.py", "--base", os.path.join(d, "a.jsonl"), "--new", os.path.join(d, "a.jsonl"))
     assert all(v["mean_difference_new_minus_base"] == 0 for k, v in z["paired"].items() if isinstance(v, dict))

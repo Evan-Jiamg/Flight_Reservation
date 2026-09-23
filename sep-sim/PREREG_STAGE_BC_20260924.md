@@ -29,3 +29,19 @@ Seen at time of writing: Stage A metrics (all epochs); fold0 Stage B epoch-0 inn
   never as "improvement" because turns fell.
 - Inner-validation scenarios are used only to choose among arms/checkpoints; nothing from them or from
   outer test is shown to any reward editor. Outer test stays unread.
+
+## Addendum A (2026-09-24, after Stage B gold-prefix metrics, BEFORE any Stage C Task 2 episode exists)
+Observed: all folds select epoch 2; pooled inner-val AUC 0.681 (flag passes) but max p_stop 0.36, so the
+0.5 gate never fires (K+1 0/12). This is the plan's "low recall" branch. Chosen v2 = **session-level hazard
+decision rule**, no retraining: at each step the simulator stops with probability p_stop (Bernoulli).
+Rationale: min-NLL selection optimises calibration, which is exactly what a sampled hazard needs; class-
+balanced SFT would break calibration and is deferred unless the hazard rule fails.
+- Gold prefix: per session, P(early)=1-Π_{s≤K}(1-h_s), P(exact)=h_{K+1}Π_{s≤K}(1-h_s),
+  P(not by K+1, censored)=Π_{s≤K+1}(1-h_s); averaged over sessions, session bootstrap.
+- Task 2: exact expectations over the logged no-gate trajectory (emitted turns, coverage, complete,
+  end-kind probabilities); paired with no-gate at scenario level.
+- New primary timing metric in Task 2 (all arms): signed and absolute error of emitted user turns vs the
+  human session's user-turn count K for the same conversation_id (inner train/val only).
+- Arms reported for Stage C: nogate; sft@0.5 (primary per original prereg); sft-hazard (v2);
+  prism@0.5 and prism-hazard (Stage B epoch 0) for attribution; threshold grid descriptive only.
+- Same quality guard as above applies to every arm. GRPO still not started before this readout.

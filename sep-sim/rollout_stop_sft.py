@@ -91,13 +91,20 @@ def arm_order(arms, cid, seed, replicate):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--scenarios", required=True, help="t2_scenarios-format JSON (ID-only)")
-    ap.add_argument("--fold", type=int, required=True)
-    ap.add_argument("--side", choices=("inner_train", "inner_validation"), required=True)
+    ap.add_argument("--fold", type=int, required=True,
+                    help="-1 = no-gate union run (no trained component touches any scenario)")
+    ap.add_argument("--side", choices=("inner_train", "inner_validation", "inner_union"),
+                    required=True)
     ap.add_argument("--arm", action="append", required=True)
     ap.add_argument("--out-dir", required=True)
     ap.add_argument("--replicate", type=int, default=0)
     ap.add_argument("--gpu", type=int, default=0)
     ap.add_argument("--limit", type=int, default=0, help="episodes per arm (smoke)")
+    ap.add_argument("--r0-crn", action="store_true",
+                    help="common random numbers: arms of the same (seed, replicate) share R0 "
+                         "replies for identical histories (per-seed cache under out-dir)")
+    ap.add_argument("--log-prompts", action="store_true",
+                    help="store the exact gate prompt (PP.user_prompt) of every step")
     args = ap.parse_args()
 
     arms = [parse_arm(s) for s in args.arm]
@@ -109,8 +116,20 @@ def main():
 
     # ---- leakage gate: scenario IDs must be on the declared nested side --------
     manifest = json.load(open(os.path.join(G, "nested/nested_manifest.json")))
-    fold = [f for f in manifest["folds"] if f["fold"] == args.fold][0]
-    allowed = set(fold["%s_ids" % args.side])
+    if args.fold < 0:
+        # A no-gate run has no trained component; any scenario that is inner train or
+        # inner validation in SOME fold may be generated. Fold-specific adapters are
+        # applied later, offline, only to that fold's own inner scenarios.
+        if any(a["adapter"] for a in arms) or args.side != "inner_union":
+            raise SystemExit("fold -1 is only for no-gate inner_union runs")
+        allowed = set()
+        for f in manifest["folds"]:
+            allowed |= set(f["inner_train_ids"]) | set(f["inner_validation_ids"])
+    else:
+        if args.side == "inner_union":
+            raise SystemExit("inner_union requires --fold -1")
+        fold = [f for f in manifest["folds"] if f["fold"] == args.fold][0]
+        allowed = set(fold["%s_ids" % args.side])
     sc_file = json.load(open(args.scenarios))
     assert sc_file["t_max"] == T_MAX and sc_file["seeds"] == [0, 1]
     cids = [s["conversation_id"] for s in sc_file["scenarios"]]
@@ -155,7 +174,19 @@ def main():
 
     judge = Judge(reasoning_effort="minimal", verbose=False,
                   cache_dir=os.path.join(WORK, "judge_cache"))
-    r0 = R0Client()
+    r0 = R0Client()   # cache OFF (faithful setting) unless --r0-crn
+    r0_by_seed = {}
+
+    def r0_for(seed):
+        if not args.r0_crn:
+            return r0
+        if seed not in r0_by_seed:
+            r0_by_seed[seed] = R0Client(cache_dir=os.path.join(
+                args.out_dir, "r0_crn", "rep%d" % args.replicate, "s%d" % seed))
+        return r0_by_seed[seed]
+
+    def r0_calls():
+        return r0.n_calls + sum(c.n_calls for c in r0_by_seed.values())
     import torch
     from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
     from peft import PeftModel
@@ -194,7 +225,9 @@ def main():
             "planner": planner.path, "speaker": speaker.path,
             "r0_model": r0.model, "r0_effort": r0.reasoning_effort,
             "judge_model": judge.model, "judge_effort": judge.reasoning_effort,
-            "v2fix": V2FIX, "planner_end": False, "r0_cache": "off",
+            "v2fix": V2FIX, "planner_end": False,
+            "r0_cache": "per-(replicate,seed) CRN cache shared by arms" if args.r0_crn else "off",
+            "log_prompts": args.log_prompts,
             "started": time.strftime("%Y-%m-%d %H:%M:%S")}
     with open(os.path.join(args.out_dir, "run_meta_rep%d.json" % args.replicate), "w") as f:
         json.dump(meta, f, indent=1)
@@ -290,7 +323,8 @@ def main():
                     "guard_reasons": reasons, "guard_extra": n_extra, "no_survivor": no_surv,
                     "selected_index": idx, "n_candidates": len(cands),
                     "candidate_end_flags": [bool(x) for x in flags],
-                    "ledger_before": S["led_before"], "gate_encoding": S.get("gate_info")}
+                    "ledger_before": S["led_before"], "gate_encoding": S.get("gate_info"),
+                    **({"gate_prompt": up} if args.log_prompts else {})}
 
         def respond(t, text):
             S["hist_u"].append(text)
@@ -299,7 +333,7 @@ def main():
                 msgs.append({"role": "user", "content": u})
                 if i < len(S["hist_a"]):
                     msgs.append({"role": "assistant", "content": S["hist_a"][i]})
-            reply = r0.reply(msgs)
+            reply = r0_for(seed).reply(msgs)
             prev_reply = S["hist_a"][-1] if S["hist_a"] else ""
             S["hist_a"].append(reply)
             ledger.update(t, text, reply)
@@ -308,15 +342,19 @@ def main():
             if AG.looks_like_new_offer(reply, prev_reply):
                 ag.reset_on_new_offer()
             S["prev_block"] = S["block"]
-            S["coverage_trace"].append((t, round(ledger.coverage(), 4)))
+            S["coverage_trace"].append((t, (round(ledger.coverage(), 4), bool(ledger.complete()))))
             return reply
 
         g = gate if arm["adapter"] else None
         ep = run_episode(T_MAX, g, speak, respond,
                          threshold=arm["threshold"] if arm["adapter"] else 0.5)
-        cov_after = dict(S["coverage_trace"])
+        # Coverage/complete are latched, so a step without an exchange (gate stop,
+        # empty, terminal utterance) carries the value after the last exchange.
+        after = dict(S["coverage_trace"])
+        last = (0.0, False)
         for step in ep["trace"]:
-            step["coverage_after"] = cov_after.get(step["t"], round(ledger.coverage(), 4))
+            last = after.get(step["t"], last)
+            step["coverage_after"], step["complete_after"] = last
         return {"conversation_id": cid, "record_id": rid, "seed": seed, "arm": arm["name"],
                 "replicate": args.replicate, "adapter": arm["adapter"],
                 "adapter_sha256": arm.get("adapter_sha256"), "threshold": arm["threshold"],
@@ -342,8 +380,9 @@ def main():
             log("  [%d] %s %s s%d emitted=%d steps=%d end=%s cov=%.3f complete=%s (%.0fs r0=%d)"
                 % (n_done, arm["name"], sc["conversation_id"][:8], seed, row["emitted_user_turns"],
                    row["decision_steps"], row["end_kind"], row["coverage"], row["complete"],
-                   time.time() - t0, r0.n_calls))
-    stats = {"r0": r0.stats(), "judge_calls": judge.n_calls, "judge_cached": judge.n_cached,
+                   time.time() - t0, r0_calls()))
+    stats = {"r0": r0.stats(), "r0_crn": {s: c.stats() for s, c in r0_by_seed.items()},
+             "judge_calls": judge.n_calls, "judge_cached": judge.n_cached,
              "speaker_rejects": {"template": speaker.n_reject_template,
                                  "reuse": speaker.n_reject_reuse, "regen": speaker.n_regen},
              "episodes_written": n_done, "seconds": round(time.time() - t0)}

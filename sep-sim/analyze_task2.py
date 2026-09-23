@@ -6,6 +6,13 @@ a gate stop or an empty draw. end_kind is reported as separate rates
 (stop_gate / empty / speaker_end / planner_end / t_max) instead of one merged
 "ended_by_token".
 
+Rows may carry an exact outcome distribution ("outcomes", from the hazard rule in
+derive_gate_arms.py); every metric is then its expectation over that distribution.
+
+With --corpus, each episode is compared with the human session of the same
+conversation_id: turn_error = emitted - K_human, abs_turn_error = |emitted - K_human|
+(K_human = number of user messages in the human session).
+
 Paired inference: for every scenario, average the arm difference over the seeds
 present in both arms; the scenario means are the independent units for the SE
 (n_scenarios - 1 denominator) and for the cluster bootstrap. If R0/judge are
@@ -18,11 +25,12 @@ and the legacy runner (turns = decision steps; recomputed from the trace).
 import argparse
 import json
 import random
-from collections import Counter, defaultdict
+from collections import defaultdict
 from math import sqrt
 
 END_KINDS = ("stop_gate", "empty", "speaker_end", "planner_end", "t_max")
 LEGACY_KIND = {"end_token": "speaker_end", "planner": "planner_end"}
+HUMAN = {}
 
 
 def read(path):
@@ -32,7 +40,9 @@ def read(path):
         if "trace" not in row:
             raise ValueError("episode trace required to count emitted user turns")
         emitted = sum(bool((t.get("user") or "").strip()) for t in row["trace"])
-        if "emitted_user_turns" in row:
+        if "outcomes" in row:
+            row["corrected_runner"] = True
+        elif "emitted_user_turns" in row:
             if row["emitted_user_turns"] != emitted:
                 raise ValueError("emitted_user_turns disagrees with trace")
             row["corrected_runner"] = True
@@ -41,7 +51,7 @@ def read(path):
             kind = row.get("stop_kind", "unknown")
             row["end_kind"] = LEGACY_KIND.get(kind, kind)
             row["corrected_runner"] = False
-        row["emitted_user_turns"] = emitted
+            row["emitted_user_turns"] = emitted
         key = (row["conversation_id"], int(row["seed"]))
         if key in out:
             raise ValueError("duplicate episode %s" % (key,))
@@ -49,48 +59,62 @@ def read(path):
     return out
 
 
+def outcomes(row):
+    if "outcomes" in row:
+        return row["outcomes"]
+    return [{"prob": 1.0, "emitted_user_turns": row["emitted_user_turns"],
+             "decision_steps": row["decision_steps"], "coverage": row["coverage"],
+             "complete": bool(row["complete"]), "end_kind": row["end_kind"]}]
+
+
 def value(row, name):
-    if name.startswith("end_"):
-        return float(row["end_kind"] == name[4:])
-    if name == "complete":
-        return float(bool(row["complete"]))
-    return float(row[name])
+    total = 0.0
+    for o in outcomes(row):
+        if name.startswith("end_"):
+            v = float(o["end_kind"] == name[4:])
+        elif name == "complete":
+            v = float(bool(o["complete"]))
+        elif name in ("turn_error", "abs_turn_error"):
+            k = HUMAN[row["conversation_id"]]
+            v = o["emitted_user_turns"] - k
+            v = abs(v) if name == "abs_turn_error" else v
+        else:
+            v = float(o[name])
+        total += o["prob"] * v
+    return total
 
 
-METRICS = ("emitted_user_turns", "decision_steps", "coverage", "complete") + \
-          tuple("end_" + k for k in END_KINDS)
+def metrics():
+    base = ("emitted_user_turns", "decision_steps", "coverage", "complete")
+    human = ("turn_error", "abs_turn_error") if HUMAN else ()
+    return base + human + tuple("end_" + k for k in END_KINDS)
 
 
 def summary(rows):
     values = list(rows.values())
     n = len(values)
-    kinds = Counter(r["end_kind"] for r in values)
-    return {"episodes": n, "scenarios": len({k[0] for k in rows}),
-            "corrected_runner": all(r["corrected_runner"] for r in values),
-            "turns_definition": "non-empty emitted user utterances",
-            "emitted_user_turns_mean": sum(r["emitted_user_turns"] for r in values) / n,
-            "decision_steps_mean": sum(r["decision_steps"] for r in values) / n,
-            "end_kind_rate": {k: kinds.get(k, 0) / n for k in END_KINDS},
-            "end_kind_count": dict(kinds),
-            "coverage_mean": sum(r["coverage"] for r in values) / n,
-            "complete_rate": sum(bool(r["complete"]) for r in values) / n,
-            "complete_count": sum(bool(r["complete"]) for r in values)}
+    s = {"episodes": n, "scenarios": len({k[0] for k in rows}),
+         "corrected_runner": all(r["corrected_runner"] for r in values),
+         "turns_definition": "non-empty emitted user utterances"}
+    for name in metrics():
+        s[name + "_mean"] = sum(value(r, name) for r in values) / n
+    if HUMAN:
+        s["human_turns_mean"] = sum(HUMAN[r["conversation_id"]] for r in values) / n
+    return s
 
 
 def paired(a, b, n_boot=4000, seed=20260924):
-    common = sorted(set(a) & set(b))
     if set(a) != set(b):
-        raise ValueError("paired episode ids differ: %d vs %d (common %d)"
-                         % (len(a), len(b), len(common)))
+        raise ValueError("paired episode ids differ: %d vs %d" % (len(a), len(b)))
     by_scenario = defaultdict(list)
-    for key in common:
+    for key in sorted(a):
         by_scenario[key[0]].append(key)
     scen = sorted(by_scenario)
     m = len(scen)
-    result = {"n_scenarios": m, "n_episodes": len(common), "unit": "scenario (seed-averaged)"}
+    result = {"n_scenarios": m, "n_episodes": len(a), "unit": "scenario (seed-averaged)"}
     rng = random.Random(seed)
     boot_idx = [[rng.randrange(m) for _ in range(m)] for _ in range(n_boot)]
-    for name in METRICS:
+    for name in metrics():
         d = [sum(value(b[k], name) - value(a[k], name) for k in by_scenario[s]) /
              len(by_scenario[s]) for s in scen]
         mean = sum(d) / m
@@ -106,7 +130,14 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--base", required=True)
     ap.add_argument("--new")
+    ap.add_argument("--corpus", help="human corpus JSONL to compare emitted turns with K_human")
     args = ap.parse_args()
+    if args.corpus:
+        for line in open(args.corpus, encoding="utf-8"):
+            if line.strip():
+                r = json.loads(line)
+                msgs = r.get("messages") or r.get("conversation") or []
+                HUMAN[r["conversation_id"]] = sum(1 for m in msgs if m.get("role") == "user")
     a = read(args.base)
     result = {"base": summary(a)}
     if args.new:

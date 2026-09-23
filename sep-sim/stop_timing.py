@@ -66,6 +66,22 @@ def session_metrics(sessions, ids, thr):
             "mean_turns_early": sum(lead) / len(lead) if lead else None}
 
 
+def hazard_metrics(sessions, ids):
+    """Sampled stop with probability p_stop at each position (session-level hazard)."""
+    early = exact = censored = 0.0
+    for s in ids:
+        rs = sessions[s]
+        survive = 1.0
+        for r in rs[:-1]:
+            survive *= 1 - r["p_stop"]
+        h = rs[-1]["p_stop"]
+        early += 1 - survive
+        exact += survive * h
+        censored += survive * (1 - h)
+    n = len(ids)
+    return {"early": early / n, "exact": exact / n, "not_by_k1_censored": censored / n}
+
+
 def auc_nll(sessions, ids):
     rows = [r for s in ids for r in sessions[s]]
     cont = [r["p_stop"] for r in rows if not r["target_stop"]]
@@ -104,6 +120,12 @@ def main():
             draws.sort()
             ci[key] = [draws[int(.025 * len(draws))], draws[int(.975 * len(draws)) - 1]]
         out["by_threshold"][str(thr)] = {"point": point, "session_bootstrap_95": ci}
+    hz = hazard_metrics(sessions, ids)
+    hz_ci = {}
+    for key in hz:
+        draws = sorted(hazard_metrics(sessions, b)[key] for b in boots)
+        hz_ci[key] = [draws[int(.025 * len(draws))], draws[int(.975 * len(draws)) - 1]]
+    out["hazard"] = {"point": hz, "session_bootstrap_95": hz_ci}
     print(json.dumps(out, indent=2))
 
 
