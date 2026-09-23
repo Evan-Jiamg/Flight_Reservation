@@ -136,8 +136,10 @@ def main():
         for line in open(args.corpus, encoding="utf-8"):
             if line.strip():
                 r = json.loads(line)
-                msgs = r.get("messages") or r.get("conversation") or []
-                HUMAN[r["conversation_id"]] = sum(1 for m in msgs if m.get("role") == "user")
+                # same rule as sepsim.pipeline.split_messages
+                msgs = r.get("chat_messages") or []
+                HUMAN[r["conversation_id"]] = sum(
+                    1 for m in msgs if m["participant_name"].lower() == "user")
     a = read(args.base)
     result = {"base": summary(a)}
     if args.new:
