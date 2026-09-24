@@ -68,3 +68,39 @@ Controllers (same budget of N=8 configuration updates, same epochs, same data, s
       5e-6, beta in [0.01,1], w_len in [0.1,10]; clipped, versioned, hashed).
 Selection: inner-validation (gold-prefix NLL + Task 2 hazard metrics on inner-val scenarios); no editor access.
 Outer test untouched until method freeze.
+
+## Addendum C — Stage D split into D1/D2/D3 (written before any Stage D training; supersedes the
+## "all controllers train LoRA" part of Addendum B for compute reasons: one full-batch exact-gradient LoRA
+## step ≈ 340 prompts × fwd+bwd ≈ 30 min on the idle P40; 245 GPUs are busy with rollouts)
+D1 (GPU, host 221 P40, consistent env, fp16 NF4): one forward per prompt with each fold's selected Stage B
+   adapter -> YES log-odds z_B and last hidden state φ. Items: all steps of logged no-gate episodes on that
+   fold's inner train/val scenarios + that fold's nested gold-prefix rows. Same 221 stack for train and eval.
+D2 (CPU): residual head z = z_B + w·std(φ) + b, w=b=0 at start (= Stage B exactly). Exact-gradient loss of
+   Addendum B (len-distribution term, coverage/complete constraints with multipliers, gold-prefix NLL, KL to
+   Stage B, fixed weight decay 1e-4), full batch, Adam. Budget per controller: N=8 rounds × 50 steps.
+   Bounds: lr ∈ [1e-4, 1e-1] (log), beta ∈ [0.01, 1], w_len ∈ [0.1, 10]; per-round change ≤ ×3.
+   Controllers: stageB (no training); fixed (lr 1e-2, beta .1, w_len 1, lambdas fixed 1); dual (fixed config,
+   lambdas by dual ascent η=.5); random (log-uniform in bounds each round, seed 20260924, dual lambdas);
+   llm (gpt-5-mini, sees ONLY inner-train aggregates of the previous round, proposes lr/beta/w_len as JSON;
+   clipped; every request/response hashed and logged; dual lambdas).
+   Checkpoint per controller = round with lowest inner-val V = len_val + 10·relu(-gap_cov_val)
+   + 10·relu(-gap_comp_val) + NLL_gold_val. Reported per fold: V parts, E[emitted] vs mean K, E|emitted−K|,
+   coverage, complete, gold-prefix AUC/NLL, hazard first-stop timing on gold val.
+D3: the winning configuration (by pooled inner-val V) is re-run as LoRA exact-gradient on 245 when GPUs free.
+
+## Addendum D (2026-09-24 ~11:40) — position shortcut found; D2 cancelled before any training
+Shortcut audit (shortcut_audit.py, existing predictions): PRISM val Stage A ep2 gate AUC .814 < turn-index-only
+AUC .849; within-same-turn AUC .451 (4149 pairs); Spearman(p_stop, turn) on continuations .95. TREC inner val:
+turn-only .81–.86 > gate .60–.77. The gate is essentially a position counter; position priors are dataset-
+specific, which defeats cross-dataset generalization (user requirement). Therefore:
+- D2's length-distribution term (fits TREC's mean length) is dropped from any training objective; length vs
+  human is evaluation-only, per dataset.
+- Stage A′/B′: position-offset ("Cox") SFT. YES log-odds = content(x) + b[turn_index] with a learned per-turn
+  offset vector b (turn index capped at 12); only content(x) is the transferable gate. TREC prompts: lines that
+  state turn counts or rule-based stopping outputs are masked (ablation reported both ways).
+- Primary gold-prefix metric: within-same-turn AUC of content(x) (pooled over turn indices, pair-weighted),
+  with session bootstrap; secondary: full AUC/NLL with the dataset's own offsets.
+- Cross-dataset: train PRISM → evaluate TREC inner val and vice versa; PRISM 60-user holdout and MultiWOZ test
+  (eval-only) only after method freeze.
+- Same hyperparameters as Stage A (lr 2e-5, 2 epochs, micro 2 × accum 8, max 1536, seed 20260923), run on
+  221 P40 (fp16, consistent env); the original Stage A ep2 is re-scored on the same 221 stack as baseline.
