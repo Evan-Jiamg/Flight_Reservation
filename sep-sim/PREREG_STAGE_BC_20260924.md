@@ -45,3 +45,26 @@ balanced SFT would break calibration and is deferred unless the hazard rule fail
 - Arms reported for Stage C: nogate; sft@0.5 (primary per original prereg); sft-hazard (v2);
   prism@0.5 and prism-hazard (Stage B epoch 0) for attribution; threshold grid descriptive only.
 - Same quality guard as above applies to every arm. GRPO still not started before this readout.
+
+## Readout C0 (2026-09-24 ~11:10, UserLM replicate 0, one environment realisation)
+nogate 68 episodes: emitted 8.71, t_max 57 / speaker_end 10 / empty 1, coverage .192, complete 5/68.
+Coverage gained after the human stop turn K: mean .012 (2/68 episodes gain). Hazard arms of the
+selected Stage B adapters cut turns by 1.5–3.0 (inner train/val) with coverage −.006 or smaller, complete
+−.003 or smaller: quality guard passes. Online/offline smoke equivalence exact (max |Δp| 3.7e-7).
+GRPO entry conditions judged met; Stage D proceeds with the formulation below.
+
+## Addendum B — Stage D design (written before any Stage D training)
+Formulation: exact expected-return policy gradient for the hazard gate over LOGGED no-gate trajectories
+(truncation property; no new rollouts, no sampling variance). Continue the fold's selected Stage B LoRA.
+Loss per fold (inner train scenarios / inner train gold prefixes only):
+  L = w_gold * NLL_goldprefix  +  w_len * (E[emitted] - mean K_human)^2 / Kvar   [batch-level, distributional]
+      - lambda_cov * E[coverage]  - lambda_comp * E[complete]  +  beta * KL(h || h_stageB)
+Coverage/complete act as constraints: E-values must stay >= nogate value - delta (delta_cov .02, delta_comp .02);
+lambdas by dual ascent. gamma fixed = 1 (no discount); no exploration knob (expectation is exact).
+Per-scenario K_human is NOT used as a per-episode target (plan §5); only the pooled length distribution.
+Controllers (same budget of N=8 configuration updates, same epochs, same data, same seed):
+  (1) Stage B only; (2) fixed config; (3) random search in bounds; (4) non-LLM dual ascent + fixed LR;
+  (5) LLM controller (local/API LLM sees only inner-train aggregates; proposes log-LR within ±0.5 decade of
+      5e-6, beta in [0.01,1], w_len in [0.1,10]; clipped, versioned, hashed).
+Selection: inner-validation (gold-prefix NLL + Task 2 hazard metrics on inner-val scenarios); no editor access.
+Outer test untouched until method freeze.
