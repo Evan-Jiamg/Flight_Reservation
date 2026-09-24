@@ -103,6 +103,9 @@ def main():
     ap.add_argument("--r0-crn", action="store_true",
                     help="common random numbers: arms of the same (seed, replicate) share R0 "
                          "replies for identical histories (per-seed cache under out-dir)")
+    ap.add_argument("--speaker", choices=("userlm", "ditto"), default="userlm",
+                    help="frozen Speaker; ditto signals its end with a blank message")
+    ap.add_argument("--ditto-path", default="/tmp2/mzjiang_usersim/models/Ditto-8B")
     ap.add_argument("--log-prompts", action="store_true",
                     help="store the exact gate prompt (PP.user_prompt) of every step")
     args = ap.parse_args()
@@ -198,7 +201,8 @@ def main():
     planner._tok = AutoTokenizer.from_pretrained(planner.path)
     planner._model = AutoModelForCausalLM.from_pretrained(planner.path,
         quantization_config=quant, device_map={"": gpu}, low_cpu_mem_usage=True).eval()
-    speaker = models.Speaker(gpu=gpu, position=POSITION).load()
+    speaker = (models.DittoSpeaker(path=args.ditto_path, gpu=gpu, position=POSITION).load()
+               if args.speaker == "ditto" else models.Speaker(gpu=gpu, position=POSITION).load())
 
     gate_model, gtok = None, None
     gated = [a for a in arms if a["adapter"]]
@@ -222,7 +226,7 @@ def main():
             "scenarios_sha256": sha_file(args.scenarios), "fold": args.fold, "side": args.side,
             "replicate": args.replicate, "arms": arms, "t_max": T_MAX,
             "gate_base": GATE_BASE, "gate_max_length": GATE_MAX_LENGTH,
-            "planner": planner.path, "speaker": speaker.path,
+            "planner": planner.path, "speaker": speaker.path, "speaker_kind": args.speaker,
             "r0_model": r0.model, "r0_effort": r0.reasoning_effort,
             "judge_model": judge.model, "judge_effort": judge.reasoning_effort,
             "v2fix": V2FIX, "planner_end": False,
@@ -356,6 +360,7 @@ def main():
             last = after.get(step["t"], last)
             step["coverage_after"], step["complete_after"] = last
         return {"conversation_id": cid, "record_id": rid, "seed": seed, "arm": arm["name"],
+                "speaker_kind": args.speaker,
                 "replicate": args.replicate, "adapter": arm["adapter"],
                 "adapter_sha256": arm.get("adapter_sha256"), "threshold": arm["threshold"],
                 "fold": args.fold, "side": args.side,
