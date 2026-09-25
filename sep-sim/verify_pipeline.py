@@ -513,6 +513,16 @@ def check_pend(rows, rep, arm="pend"):
             rep.ok("pend.no_stop_override", d.get("stop_override") is not True, w, "stop override applied")
             n_end += ended
     rep.note("pend.end_session", "Planner ends %d; unparsed plans %d" % (n_end, n_unparsed))
+    # a ledger that never credits anything means its judge is answering empty (seen with a reasoning
+    # model under max_tokens=200): coverage would be 0 everywhere, silently
+    led = [r.get("ledger") or {} for r in rows if r.get("emitted_user_turns", 0) >= 2]
+    if led:
+        rep.ok("pend.ledger_alive", any(l.get("revealed_at") for l in led), "episodes",
+               "no requirement was ever revealed in %d episodes: ledger judge broken?" % len(led))
+    empt = max([r.get("ledger_judge_empty_total") or 0 for r in rows] or [0])
+    name = "pend.ledger_judge_empty"
+    rep._c(name)
+    (rep.warn if empt else rep.note)(name, "empty ledger-judge answers (running total) %d" % empt)
 
 
 def check_a0(rows, rep, arm="a0"):

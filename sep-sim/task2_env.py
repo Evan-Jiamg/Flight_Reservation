@@ -67,9 +67,34 @@ def tree_of(arm):
 WORK = "/tmp2/mzjiang_usersim/task2"
 DITTO = "/tmp2/mzjiang_usersim/models/Ditto-8B"
 T_MAX = 10
-PLANNER_MAX_NEW = 600
+PLANNER_MAX_NEW = 1536   # Qwen3-4B writes the ACT_FULL JSON in ~700-900 tokens; 600 cut it (smoke 2026-09-25)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+# The benchmark Ledger asks its judge with max_tokens=200. That is enough for gpt-5-mini at minimal
+# effort, but a model that reasons before answering (gpt-oss-120b on vLLM) spends all 200 tokens on
+# reasoning and returns an EMPTY answer, which the Ledger reads as "nothing revealed" -> coverage 0,
+# silently (measured 2026-09-25: 200 -> finish=length, content None; 4000 -> 284 tokens, correct verdict).
+# Outside the gpt-5 dialect the request budget is raised to this floor -- the same rule the benchmark
+# applies to gpt-5 with MIN_COMPLETION_TOKENS -- and every empty answer is counted, never hidden.
+JUDGE_MIN_TOKENS = int(os.environ.get("JUDGE_MIN_TOKENS", "4000"))
+
+
+def make_floor_judge(Judge):
+    class FloorJudge(Judge):
+        def __init__(self, *a, **kw):
+            super().__init__(*a, **kw)
+            self.gpt5 = str(self.model).startswith("gpt-5")
+            self.floor = None if self.gpt5 else JUDGE_MIN_TOKENS
+            self.n_empty = 0
+            self._lock = threading.Lock()
+
+        def chat(self, system, user, max_tokens=400):
+            out = super().chat(system, user, max(max_tokens, self.floor) if self.floor else max_tokens)
+            if not (out or "").strip():
+                with self._lock:
+                    self.n_empty += 1
+            return out
+    return FloorJudge
 
 
 def setup_environment(arm):
@@ -203,8 +228,8 @@ class Task2Env:
         # effort is set with R0_REASONING_EFFORT / JUDGE_REASONING_EFFORT. All of it is in describe().
         self.r0_effort = os.environ.get("R0_REASONING_EFFORT", "minimal")
         self.judge_effort = os.environ.get("JUDGE_REASONING_EFFORT", "minimal")
-        self.ledger_judge = Judge(reasoning_effort=self.judge_effort, verbose=False,
-                                  cache_dir=os.path.join(WORK, "judge_cache"))
+        self.ledger_judge = make_floor_judge(Judge)(reasoning_effort=self.judge_effort, verbose=False,
+                                                    cache_dir=os.path.join(WORK, "judge_cache"))
         self.r0 = R0Client(reasoning_effort=self.r0_effort)
         if self.e16:
             import ditto_e16
@@ -225,7 +250,11 @@ class Task2Env:
                 "r0_model": self.r0.model, "ledger_judge_model": self.ledger_judge.model,
                 "r0_base_url": os.environ.get("R0_BASE_URL", "default(api.openai.com)"),
                 "judge_base_url": os.environ.get("JUDGE_BASE_URL", "default(api.openai.com)"),
-                "r0_reasoning_effort": self.r0_effort, "judge_reasoning_effort": self.judge_effort,
+                # what is actually SENT: the benchmark clients only send reasoning_effort in the gpt-5
+                # dialect; for other models (gpt-oss on vLLM) the server's default effort applies
+                "r0_reasoning_effort": self.r0_effort if getattr(self.r0, "gpt5_dialect", True) else "server default (not sent)",
+                "judge_reasoning_effort": self.judge_effort if self.ledger_judge.gpt5 else "server default (not sent)",
+                "ledger_judge_min_tokens": self.ledger_judge.floor, "ledger_judge_empty": self.ledger_judge.n_empty,
                 "act_prior": os.environ["SEPSIM_ACT_PRIOR"], "v2fix": V2FIX, "t_max": T_MAX,
                 "tree": tree_of(self.arm), "arm_env": ARM_ENV[self.arm], "t1_sampling": self.t1_sampling}
 
@@ -397,6 +426,8 @@ class Task2Env:
                 "ended_by_token": ep["end_kind"] != "t_max",
                 "coverage": round(ledger.coverage(), 4), "complete": ledger.complete(),
                 "n_req": len(self.reqs[conversation_id]["req"]), "ledger": ledger.as_dict(), "trace": ep["trace"],
+                "ledger_judge_empty_total": self.ledger_judge.n_empty,
+                "r0_empty_retries_total": getattr(self.r0, "n_empty_retries", None),
                 "human_turns": self.human_turns(conversation_id)}
 
     def human_turns(self, conversation_id):
