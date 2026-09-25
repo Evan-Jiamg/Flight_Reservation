@@ -103,7 +103,7 @@ class DittoSpeaker(models.Speaker):
         batch; the rest go to the next attempt together. Only the random stream differs from calling
         say() one by one (one manual_seed per generate call instead of per request).
         reqs: dicts scenario_text, block, hist_u, hist_a, turn, seed, temperature, top_p, avoid,
-        reject_template, reject_reuse. -> list of (text, ended(blank), fit)."""
+        reject_template, reject_reuse. -> list of (text, ended(blank), fit, hit_max_new)."""
         import re
         import torch
         M = models
@@ -122,7 +122,7 @@ class DittoSpeaker(models.Speaker):
             sampled = bool(r["temperature"] and r["temperature"] > 0)
             extra = bool(r["reject_template"] or r["reject_reuse"])
             avoid = r.get("avoid") or []
-            st.append({"ids": ids, "fit": fit, "sampled": sampled, "k": 0, "txt": "", "done": False,
+            st.append({"ids": ids, "fit": fit, "sampled": sampled, "k": 0, "txt": "", "done": False, "hit": False,
                        "tries": M.MAX_REGEN if (self.guardrails and (sampled or extra)) else 1,
                        "seen": [(x or "").strip().lower() for x in avoid if (x or "").strip()],
                        "prior": [x for x in avoid if (x or "").strip()], "r": r})
@@ -148,10 +148,11 @@ class DittoSpeaker(models.Speaker):
                 for i, s in enumerate(grp):
                     row = out[i][L:].tolist()
                     cut = next((j for j, v in enumerate(row) if v in eos), None)
-                    row = row[: cut + 1] if cut is not None else row
+                    hit = cut is None and len(row) >= self.max_new     # stopped by the cap, not by an end token
+                    row = row[: cut + 1] if cut is not None else [v for v in row if v != pad]
                     raw = self._tok.decode(row, skip_special_tokens=False)
                     txt = re.sub(r"\s+", " ", M.TAG_RE.sub(" ", raw)).strip()
-                    s["txt"], s["k"] = txt, s["k"] + 1
+                    s["txt"], s["k"], s["hit"] = txt, s["k"] + 1, hit
                     if not self.guardrails:
                         s["done"] = True
                         continue
@@ -169,7 +170,7 @@ class DittoSpeaker(models.Speaker):
                         self.n_regen += 1
                         continue
                     s["done"] = True
-        return [(s["txt"], not bool(s["txt"].strip()), s["fit"]) for s in st]
+        return [(s["txt"], not bool(s["txt"].strip()), s["fit"], s["hit"]) for s in st]
 
     def card_sampling(self):
         """(temperature, top_p) from the checkpoint's generation_config.json."""

@@ -23,8 +23,11 @@ from __future__ import annotations
 
 MARKER = "THE CONVERSATION SO FAR\n"
 OMITTED = "\n[Earlier dialogue omitted; latest context follows]\n"
-PLANNER_CONTEXT, PLANNER_MAX_NEW = 32768, 600
-SPEAKER_CONTEXT, SPEAKER_MAX_NEW = 32768, 200
+# Generation caps (2026-09-25): the Planner's ACT_FULL JSON takes ~700-900 tokens (600 cut it); the
+# longest real user message is 174 words (p99 150) ~ 260 Ditto tokens, so the E1.6 Speaker cap of 200
+# could cut the longest messages -> 512 (~340 words). Budgets follow from these.
+PLANNER_CONTEXT, PLANNER_MAX_NEW = 32768, 1536
+SPEAKER_CONTEXT, SPEAKER_MAX_NEW = 32768, 512
 MARGIN = 64
 PLANNER_BUDGET = PLANNER_CONTEXT - PLANNER_MAX_NEW - MARGIN
 SPEAKER_BUDGET = SPEAKER_CONTEXT - SPEAKER_MAX_NEW - MARGIN

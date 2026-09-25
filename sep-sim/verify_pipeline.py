@@ -513,6 +513,43 @@ def check_pend(rows, rep, arm="pend"):
             rep.ok("pend.no_stop_override", d.get("stop_override") is not True, w, "stop override applied")
             n_end += ended
     rep.note("pend.end_session", "Planner ends %d; unparsed plans %d" % (n_end, n_unparsed))
+    # generation-stage checks (fields written by Task2Env._pend_generate)
+    import implicit_profile as IP
+    n_hit_sel = n_hit_any = n_cand = n_dup_left = 0
+    for r in rows:
+        for s in r.get("trace") or []:
+            if "candidates" not in s:
+                continue
+            w = "%s s%s t%s" % (str(r.get("conversation_id"))[:12], r.get("seed"), s.get("t"))
+            cands, reasons = s["candidates"], s.get("guard_reasons") or [""] * len(s["candidates"])
+            hits = s.get("speaker_hit_max_new")
+            rep.ok("trunc.speaker_max_new_recorded", isinstance(hits, list) and len(hits) == len(cands), w,
+                   "speaker_hit_max_new missing")
+            if isinstance(hits, list) and len(hits) == len(cands):
+                n_cand += len(cands)
+                n_hit_any += sum(bool(h) for h in hits)
+                n_hit_sel += bool(hits[s["selected_index"]])
+                rep.ok("trunc.speaker_selected", not hits[s["selected_index"]], w,
+                       "the emitted message was cut by the Speaker's token cap")
+            for i, c in enumerate(cands):
+                if IP.duplicate_of(c, cands[:i]):
+                    rep.ok("pend.duplicates_flagged", bool(reasons[i]), w, "candidate %d duplicates an earlier one unflagged" % i)
+                    n_dup_left += 1
+            rep.ok("pend.state_clean", not IP.leaks_scaffold(s.get("block") or ""), w,
+                   "Speaker-only lines (notes / examples) leaked into the Planner's state")
+            elig = [i for i, x in enumerate(reasons) if not x]
+            if elig:
+                rep.ok("pend.selected_eligible", s["selected_index"] in elig, w,
+                       "selected candidate %d failed a guard while %s passed" % (s["selected_index"], elig))
+    name = "trunc.speaker_max_new"
+    rep._c(name)
+    (rep.warn if n_hit_any else rep.note)(name, "Speaker cap hits: %d of %d candidates, %d selected" % (n_hit_any, n_cand, n_hit_sel))
+    name = "pend.duplicates_left"
+    rep._c(name)
+    (rep.warn if n_dup_left else rep.note)(name, "duplicate candidates left after redraws: %d" % n_dup_left)
+    r0t = max([r.get("r0_len_truncated_total") or 0 for r in rows] or [0])
+    rep.ok("trunc.r0_reply", r0t == 0, "episodes", "%d R0 replies still cut by the token budget" % r0t)
+    rep.note("trunc.r0_reply", "R0 length retries (running total) %d" % max([r.get("r0_len_retries_total") or 0 for r in rows] or [0]))
     # a ledger that never credits anything means its judge is answering empty (seen with a reasoning
     # model under max_tokens=200): coverage would be 0 everywhere, silently
     led = [r.get("ledger") or {} for r in rows if r.get("emitted_user_turns", 0) >= 2]

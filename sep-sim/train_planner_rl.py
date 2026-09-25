@@ -47,7 +47,7 @@ import task1_stop as T1  # noqa: E402
 
 CODE_FILES = ("train_planner_rl.py", "rl_reward.py", "rl_controllers.py", "rl_algos.py", "task2_env.py",
               "task2_episode.py", "goal_judge.py", "planner_prompt_v3.py", "fit_prompts.py", "ditto_e16.py",
-              "task1_stop.py", "batching.py")
+              "task1_stop.py", "batching.py", "implicit_profile.py", "style_select.py")
 TIME_KEYS = ("time", "wall_s", "rollout_s", "update_s")
 
 
@@ -381,7 +381,13 @@ class Trainer:
         model = RA.setup_policy(planner, init_adapter=a.init_adapter)
         planner.adapter = "rl:%s" % a.out
         judge = GoalJudge(a.judge_base, adapter=a.judge_adapter, gpu=a.gpu) if a.arm != "pend" else None
-        self.env = Task2Env(arm=a.arm, gpu=a.gpu, planner=planner, judge=judge, batch=bool(a.batch), max_batch=a.max_batch)
+        self.env = Task2Env(arm=a.arm, gpu=a.gpu, planner=planner, judge=judge, batch=bool(a.batch), max_batch=a.max_batch,
+                            implicit_profile=bool(a.implicit_profile), selector=a.selector)
+        if a.fewshot == "fold":
+            from task2_env import make_fewshot_pool
+            pool_ids = list(self.split["train_all"])
+            assert not set(pool_ids) & self.split["forbidden"], "few-shot pool intersects validation/test"
+            self.env.fewshot = make_fewshot_pool(self.env.recs, pool_ids)
         self.learner = RA.TorchLearner(model, a.algo, self.acfg, lr=self.cfg["lr"], seed=a.seed)
         self.config_record["env"] = self.env.describe()
         self.config_record["trainable_params"] = self.learner.trainable_names()[:8] + ["..."]
@@ -769,6 +775,9 @@ def parse_args(argv=None):
     ap.add_argument("--arm", choices=("pend", "final", "a2"), default="pend",
                     help="policy env: pend = E1.6 base + fixes, Planner judges the goal and ends (no goal judge)")
     ap.add_argument("--batch", type=int, choices=(0, 1), default=1, help="cross-episode dynamic batching of Planner / Ditto generation")
+    ap.add_argument("--implicit-profile", type=int, choices=(0, 1), default=0)
+    ap.add_argument("--fewshot", choices=("off", "fold"), default="off", help="fold: examples from splits[fold].train_all only")
+    ap.add_argument("--selector", choices=("length", "borda"), default="length")
     ap.add_argument("--max-batch", type=int, default=8)
     ap.add_argument("--rollout-workers", type=int, default=1,
                     help="episodes run in threads; GPU calls are serialised inside Task2Env, R0/ledger calls overlap")

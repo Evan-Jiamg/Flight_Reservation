@@ -62,6 +62,13 @@ def main():
     ap.add_argument("--out-dir", required=True)
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--final", action="store_true", help="required for the test split")
+    ap.add_argument("--implicit-profile", type=int, choices=(0, 1), default=0)
+    ap.add_argument("--fewshot", choices=("off", "fold"), default="off",
+                    help="fold: Speaker few-shot examples from splits[fold].train_all only (pend arm)")
+    ap.add_argument("--selector", choices=("length", "borda"), default="length")
+    ap.add_argument("--batch", type=int, choices=(0, 1), default=0)
+    ap.add_argument("--max-batch", type=int, default=8)
+    ap.add_argument("--workers", type=int, default=1, help="episodes in threads (useful with --batch 1)")
     ap.add_argument("--smoke", action="store_true",
                     help="pipeline smoke only: judge may be the untrained base (no adapter); never on test; "
                          "out-dir must contain 'smoke'; rows are not results")
@@ -94,20 +101,28 @@ def main():
         gate["planner_adapter"] = found
     print("leak gate OK", json.dumps(gate), flush=True)
 
-    from task2_env import Task2Env, PlannerLM, setup_environment
+    from task2_env import Task2Env, PlannerLM, setup_environment, make_fewshot_pool
     setup_environment(args.arm)
     import goal_judge as GJ
     planner = PlannerLM(args.planner_path, args.gpu, nf4=args.planner_nf4, dtype=args.planner_dtype,
                         adapter=args.planner_adapter or None)
     judge = GJ.GoalJudge(args.judge_base, adapter=args.judge_adapter or None, gpu=args.gpu).load() if args.arm in ("a2", "final") else None
-    env = Task2Env(args.arm, args.gpu, planner, judge=judge)
+    env = Task2Env(args.arm, args.gpu, planner, judge=judge, batch=bool(args.batch), max_batch=args.max_batch,
+                   implicit_profile=bool(args.implicit_profile), selector=args.selector)
+    if args.fewshot == "fold":
+        pool_ids = list(sf["train_all"])
+        assert not set(pool_ids) & set(sf["forbidden_for_training"]), "few-shot pool intersects validation/test"
+        assert not set(pool_ids) & set(scen) or args.split == "train", "few-shot pool contains scored scenarios"
+        env.fewshot = make_fewshot_pool(env.recs, pool_ids)
+        gate["fewshot_pool"] = {"source": "train_all", "n": len(pool_ids)}
     os.makedirs(args.out_dir, exist_ok=True)
     out = os.path.join(args.out_dir, "%s.jsonl" % args.arm)
     done = set()
     if os.path.exists(out):
         done = {(json.loads(l)["conversation_id"], json.loads(l)["seed"]) for l in open(out)}
     code = {n: sha_file(os.path.join(HERE, n)) for n in ("rollout_v4.py", "task2_env.py", "task2_episode.py", "ditto_e16.py", "task1_stop.py",
-                                                         "fit_prompts.py", "planner_prompt_v3.py", "goal_judge.py")}
+                                                         "fit_prompts.py", "planner_prompt_v3.py", "goal_judge.py",
+                                                         "implicit_profile.py", "style_select.py", "batching.py")}
     meta = {"env": env.describe(), "gate": gate, "code_sha256": code, "replicate": args.replicate, "smoke": args.smoke,
             "planner_nf4": args.planner_nf4, "planner_dtype": args.planner_dtype,
             "goal_judge_system_sha256": hashlib.sha256(GJ.SYSTEM.encode()).hexdigest() if judge else None,
@@ -117,17 +132,25 @@ def main():
     if args.limit:
         jobs = jobs[: args.limit]
     t0 = time.time()
-    for cid, seed in jobs:
-        if (cid, seed) in done:
-            continue
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+    lock = threading.Lock()
+
+    def one(job):
+        cid, seed = job
         te = time.time()
         row = env.run_episode(cid, seed, replicate=args.replicate)
         row.update(fold=args.fold, split=args.split, wall_seconds=round(time.time() - te, 1))
-        with open(out, "a", encoding="utf-8") as f:
-            f.write(json.dumps(row, ensure_ascii=False) + "\n")
-        print("  %s %s s%d emitted=%d end=%s cov=%.3f (%.0fs)" % (args.arm, cid[:8], seed, row["emitted_user_turns"],
-                                                                 row["end_kind"], row["coverage"], time.time() - t0),
-              flush=True)
+        with lock:
+            with open(out, "a", encoding="utf-8") as f:
+                f.write(json.dumps(row, ensure_ascii=False) + "\n")
+            print("  %s %s s%d emitted=%d human=%s end=%s cov=%.3f (%.0fs)" % (
+                args.arm, cid[:8], seed, row["emitted_user_turns"], row.get("human_turns"), row["end_kind"],
+                row["coverage"], time.time() - t0), flush=True)
+
+    todo = [j for j in jobs if j not in done]
+    with ThreadPoolExecutor(max_workers=max(1, args.workers)) as ex:
+        list(ex.map(one, todo))
     print("DONE", json.dumps({"episodes": len(jobs), "planner_calls": planner.n_calls,
                               "judge_unparsed": judge.n_unparsed if judge else 0,
                               "speaker_regen": env.speaker.n_regen}), flush=True)

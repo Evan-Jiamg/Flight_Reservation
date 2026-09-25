@@ -91,6 +91,84 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 JUDGE_MIN_TOKENS = int(os.environ.get("JUDGE_MIN_TOKENS", "4000"))
 
 
+R0_CONTEXT = int(os.environ.get("R0_CONTEXT", "12288"))     # gpt-oss-120b on the vLLM server: max_model_len
+
+
+def prompt_tokens_from_error(msg):
+    """Prompt token count from a vLLM / OpenAI 'maximum context length' refusal, in any of the known
+    wordings: '(10500 in the messages, 3000 in the completion)', 'your request has 10500 input tokens',
+    'you requested 13500 tokens ... 10500 of input'. -> [n] or []."""
+    import re
+    for pat in (r"(\d+)\s+in the messages", r"has\s+(\d+)\s+input tokens", r"(\d+)\s+input tokens",
+                r"(\d+)\s+tokens?\s+(?:of|from the)\s+input", r"prompt\s+(?:has|of|contains)\s+(\d+)\s+tokens"):
+        m = re.search(pat, msg, re.I)
+        if m:
+            return [int(m.group(1))]
+    return []
+
+
+def make_tracking_r0(R0Client):
+    """The benchmark R0 client raises its budget only when a reply comes back EMPTY; a reply cut by the
+    token budget (finish_reason 'length', non-empty) was accepted silently. Here such a reply is
+    re-requested with a larger budget (bounded by the server's context minus the prompt); a reply that
+    still cannot finish is counted in n_len_truncated (verify fails on it), never hidden."""
+    class TrackingR0(R0Client):
+        def __init__(self, *a, **kw):
+            super().__init__(*a, **kw)
+            self.gpt5 = bool(getattr(self, "gpt5_dialect", False))
+            self.ctx = None if self.gpt5 else R0_CONTEXT
+            self.n_len_retries = self.n_len_truncated = self.n_ctx_fit = 0
+            self._tlock = threading.Lock()
+
+
+        def _post_fit(self, body):
+            """super()._post, but when the server refuses the request for exceeding its context (prompt +
+            completion budget), lower the completion budget to what the context leaves. A budget below 512
+            tokens would risk a cut reply: that raises instead of degrading silently."""
+            import re
+            try:
+                return super()._post(body), body
+            except RuntimeError as e:
+                msg = str(e)
+                if "context length" not in msg and "maximum context" not in msg:
+                    raise
+                nums = prompt_tokens_from_error(msg)
+                if not nums or not self.ctx:
+                    raise
+                room = self.ctx - nums[0] - 16
+                if room < 512:
+                    raise RuntimeError("R0 prompt of %d tokens leaves %d for the reply (< 512): %s" % (nums[0], room, msg[:200]))
+                key = "max_completion_tokens" if "max_completion_tokens" in body else "max_tokens"
+                body = dict(body, **{key: room})
+                with self._tlock:
+                    self.n_ctx_fit += 1
+                return super()._post(body), body
+
+        def _post(self, body):
+            data, body = self._post_fit(body)
+            tries = 0
+            while True:
+                ch = data["choices"][0]
+                content = ((ch.get("message") or {}).get("content") or "").strip()
+                if ch.get("finish_reason") != "length" or not content:
+                    return data          # finished, or empty (the client's own budget ladder handles it)
+                key = "max_completion_tokens" if "max_completion_tokens" in body else "max_tokens"
+                cur = int(body.get(key) or 0)
+                pt = (data.get("usage") or {}).get("prompt_tokens")
+                cap = (self.ctx - int(pt) - 16) if (self.ctx and pt) else max(2 * cur, 8000)
+                new = min(2 * cur, cap) if cur else cap
+                if tries >= 3 or new <= cur:
+                    with self._tlock:
+                        self.n_len_truncated += 1
+                    return data
+                body = dict(body, **{key: new})
+                tries += 1
+                with self._tlock:
+                    self.n_len_retries += 1
+                data, body = self._post_fit(body)
+    return TrackingR0
+
+
 def make_floor_judge(Judge):
     class FloorJudge(Judge):
         def __init__(self, *a, **kw):
@@ -292,7 +370,7 @@ class PlannerLM:
 
 class Task2Env:
     def __init__(self, arm, gpu, planner, judge=None, ditto_path=DITTO, corpus="/home/mzjiang/v5-latency/data.jsonl",
-                 batch=False, max_batch=8, implicit_profile=False, fewshot_pool=None):
+                 batch=False, max_batch=8, implicit_profile=False, fewshot_pool=None, selector="length"):
         if arm not in ARM_ENV:
             raise ValueError(arm)
         if arm in V3_ARMS and judge is None:
@@ -323,6 +401,15 @@ class Task2Env:
         if (implicit_profile or fewshot_pool is not None) and arm != "pend":
             raise ValueError("the Implicit Profile is implemented for the pend arm")
         self.ip, self.fewshot = bool(implicit_profile), fewshot_pool
+        if selector not in ("length", "borda"):
+            raise ValueError(selector)
+        if selector == "borda" and arm != "pend":
+            raise ValueError("the length+style selector is implemented for the pend arm")
+        self.selector = selector
+        self.style_scorer = None
+        if selector == "borda":
+            import style_select
+            self.style_scorer = style_select.StyleScorer()
         if arm == "pend":
             self.system = V3.system_prompt_pend(implicit_profile=self.ip)
             assert '"goal_met"' in self.system and '"last_reply_helpful"' not in self.system
@@ -349,14 +436,15 @@ class Task2Env:
         self.judge_effort = os.environ.get("JUDGE_REASONING_EFFORT", "minimal")
         self.ledger_judge = make_floor_judge(Judge)(reasoning_effort=self.judge_effort, verbose=False,
                                                     cache_dir=os.path.join(WORK, "judge_cache"))
-        self.r0 = R0Client(reasoning_effort=self.r0_effort)
+        self.r0 = make_tracking_r0(R0Client)(reasoning_effort=self.r0_effort)
         if self.e16:
             import ditto_e16
             base_cls = ditto_e16.DittoSpeaker
         else:
             base_cls = models.DittoSpeaker
         FitDitto = F.make_fit_ditto_speaker(base_cls)
-        self.speaker = FitDitto(path=ditto_path, gpu=gpu, position=run_v2.POSITION).load()
+        self.speaker = FitDitto(path=ditto_path, gpu=gpu, position=run_v2.POSITION, max_new=F.SPEAKER_MAX_NEW).load()
+        assert self.speaker.max_new == F.SPEAKER_MAX_NEW and PLANNER_MAX_NEW == F.PLANNER_MAX_NEW, "generation caps disagree"
         # E1.6 Z1 (T1_SAMPLE): turn 1 is sampled at the speaker checkpoint's own card values
         self.t1_sampling = self.speaker.card_sampling() if self.e16 else None
         # cross-episode dynamic batching (threads submit, one GPU call per batch); off = one by one
@@ -395,7 +483,7 @@ class Task2Env:
                                           avoid=r["avoid"], reject_template=r["reject_template"],
                                           reject_reuse=r["reject_reuse"])
                 fit = self.speaker.last_fit
-            out.append((txt, e, fit))
+            out.append((txt, e, fit, None))
         return out
 
     def describe(self):
@@ -415,6 +503,7 @@ class Task2Env:
                 "act_prior": os.environ["SEPSIM_ACT_PRIOR"], "v2fix": V2FIX, "t_max": T_MAX,
                 "tree": tree_of(self.arm), "arm_env": ARM_ENV[self.arm], "t1_sampling": self.t1_sampling,
                 "implicit_profile": self.ip, "fewshot": self.fewshot.describe() if self.fewshot else None,
+                "selector": self.selector, "speaker_max_new": self.speaker.max_new, "planner_max_new": self.planner.max_new,
                 "batching": None if self.planner_batcher is None else {
                     "planner": self.planner_batcher.max_batch, "speaker": self.speaker_batcher.max_batch}}
 
@@ -496,7 +585,6 @@ class Task2Env:
                 note = IP.clean_note(fields.get("profile_note"))
                 if note:
                     S["ip_notes"].append(note)
-            examples = self.fewshot.select(conversation_id, scenario.get("persona"), t) if self.fewshot else []
             base = {"planner_prompt": g["prompt_text"], "planner_fit": g["fit"], "planner_raw": raw,
                     "planner_hit_max_new": g["hit_max_new"], "planner_diag": diag,
                     "planner_unparsed": unparsed, "ended_planner": ended,
@@ -504,7 +592,6 @@ class Task2Env:
                     "stop_rule": fields.get("stop_rule", "none"), "goal_status": gs, "self_judge": self_judge,
                     "goal_met": fields.get("goal_met"), "still_wanted": fields.get("still_wanted"),
                     "profile_note": note if self.ip else None, "ip_notes_n": len(S["ip_notes"]) if self.ip else None,
-                    "fewshot": [[e["cid"], e["t"]] for e in examples] if self.fewshot else None,
                     "ledger_before": {"turns": led.turns, "gain_trace": list(led.gain_trace)}}
             if record_generation:
                 base["planner_gen"] = {"prompt_ids": g["prompt_ids"], "gen_ids": g["gen_ids"], "stop_mask": planner.stop_mask(g["gen_ids"]),
@@ -517,11 +604,14 @@ class Task2Env:
                 block = V3.speaker_block_v3(fields, gs)
             elif arm == "pend":
                 block = V3.speaker_block_pend(fields)
-                if self.ip or examples:
-                    block += IP.speaker_lines(S["ip_notes"] if self.ip else [], examples)
             else:
                 block = PP.render_block(fields, ag.render())
+            # S["block"] is the Planner's own state for the next turn: never the Speaker-only additions
             S["block"] = block
+            if arm == "pend":
+                return self._pend_generate(base, block, fields, S, t, sid, sc_text, hist_u, hist_a,
+                                           conversation_id, scenario, unparsed)
+            examples = []
             # ---- generation block: line for line the same as rollout_stop_sft.py / run_v2 ----
             ANTILEAK, NEARCOPY = run_v2.ANTILEAK, run_v2.NEARCOPY
             avoid = hist_u if run_v2.GUARDRAILS else None
@@ -553,7 +643,7 @@ class Task2Env:
                 reasons = [reason_of(c) for c in cands]
                 while all(reasons) and n_extra < run_v2.REDRAW:
                     k = run_v2.NSAMP + n_extra
-                    sx, ex, _ = self._say_many([req(pipeline.seed_for(sid, t, k + 1), T_S, P_S)])[0]
+                    sx, ex, _, _ = self._say_many([req(pipeline.seed_for(sid, t, k + 1), T_S, P_S)])[0]
                     cands.append(sx)
                     flags.append(ex)
                     reasons.append(reason_of(sx))
@@ -591,6 +681,131 @@ class Task2Env:
         return {"S": S, "speak": speak, "respond": respond, "ledger": ledger, "led": led, "ag": ag,
                 "rid": rid, "scenario": scenario}
 
+    DUP_REDRAW = 4
+
+    def _pend_generate(self, base, block, fields, S, t, sid, sc_text, hist_u, hist_a, cid, scenario, unparsed):
+        """pend generation stage. Same guards and schedule as the other arms (greedy + NSAMP samples at
+        (0.7, 0.9); on turn 1 all sampled at the Ditto card, E1.6 Z1; up to REDRAW extra draws when every
+        candidate fails), plus (user design, 2026-09-25):
+          * each candidate slot gets its OWN few-shot examples (variant = slot), so the Speaker prompts differ;
+          * a candidate whose text equals an earlier candidate of the turn is 'duplicate' and that slot alone
+            is redrawn (new seed, new examples) up to DUP_REDRAW times (exact identity; no threshold);
+          * copying >= COPY_NGRAM words of an example is 'fewshot_copy'; our block headers in the text is
+            'template';
+          * selection: length + style Borda (selector='borda') or the E1.6 rule (selector='length').
+        The Planner's state (S['block']) is `block`; the Speaker-only lines go to the Speaker prompts only."""
+        import implicit_profile as IP
+        import style_select as SS
+        from sepsim import pipeline
+        import run_v2
+        assert run_v2.GUARDS_ON, "v2fix guards must be on"
+        ANTILEAK, NEARCOPY = run_v2.ANTILEAK, run_v2.NEARCOPY
+        prior = list(hist_u) + (list(hist_a) if run_v2.COPY_SCOPE == "both" else [])
+        avoid = prior
+        z1 = t == 1
+        T_G, P_G = self.t1_sampling if z1 else (0.0, 1.0)
+        T_S, P_S = self.t1_sampling if z1 else (0.7, 0.9)
+        notes = list(S["ip_notes"]) if self.ip else []
+        persona = scenario.get("persona")
+
+        def examples_for(variant):
+            return self.fewshot.select(cid, persona, t, variant=variant) if self.fewshot else []
+
+        def block_for(ex):
+            if unparsed or not (notes or ex):
+                return block
+            return block + IP.speaker_lines(notes, ex)
+
+        def req(seed, temp, top_p, blk):
+            return {"scenario_text": sc_text, "block": blk, "hist_u": list(hist_u), "hist_a": list(hist_a),
+                    "turn": t, "seed": seed, "temperature": temp, "top_p": top_p, "avoid": avoid,
+                    "reject_template": ANTILEAK, "reject_reuse": NEARCOPY}
+
+        n0 = 1 + run_v2.NSAMP
+        slot_ex = [examples_for(j) for j in range(n0)]
+        slot_blk = [block_for(e) for e in slot_ex]
+        outs = self._say_many([req(pipeline.seed_for(sid, t), T_G, P_G, slot_blk[0])] +
+                              [req(pipeline.seed_for(sid, t, j), T_S, P_S, slot_blk[j]) for j in range(1, n0)])
+        cands = [o[0] for o in outs]
+        flags = [o[1] for o in outs]
+        fits = [o[2] for o in outs]
+        hits = [o[3] for o in outs]
+
+        def all_examples():
+            seen, out = set(), []
+            for ex in slot_ex:
+                for e in ex:
+                    if e["text"] not in seen:
+                        seen.add(e["text"])
+                        out.append(e)
+            return out
+
+        def reason_of(i):
+            c = cands[i]
+            r = run_v2.guard_reason(c, prior)
+            exs = all_examples()
+            if not r and exs and IP.copies_example(c, exs):
+                r = "fewshot_copy"
+            if not r and (self.ip or self.fewshot) and IP.leaks_scaffold(c):
+                r = "template"
+            if not r and IP.duplicate_of(c, cands[:i]):
+                r = "duplicate"
+            return r
+
+        reasons = [reason_of(i) for i in range(len(cands))]
+        dup_redraws = 0
+        for rnd in range(1, self.DUP_REDRAW + 1):
+            dups = [i for i, x in enumerate(reasons) if x == "duplicate"]
+            if not dups:
+                break
+            for i in dups:
+                slot_ex[i] = examples_for(i + n0 * rnd)
+                slot_blk[i] = block_for(slot_ex[i])
+            new = self._say_many([req(pipeline.seed_for(sid, t, 100 + 10 * rnd + i), T_S, P_S, slot_blk[i]) for i in dups])
+            for i, o in zip(dups, new):
+                cands[i], flags[i], fits[i], hits[i] = o[0], o[1], o[2], o[3]
+            dup_redraws += len(dups)
+            reasons = [reason_of(i) for i in range(len(cands))]
+        n_extra = 0
+        while all(reasons) and n_extra < run_v2.REDRAW:
+            j = n0 + n_extra
+            ex = examples_for(1000 + j)
+            blk = block_for(ex)
+            o = self._say_many([req(pipeline.seed_for(sid, t, j + 1), T_S, P_S, blk)])[0]
+            cands.append(o[0])
+            flags.append(o[1])
+            fits.append(o[2])
+            hits.append(o[3])
+            slot_ex.append(ex)
+            slot_blk.append(blk)
+            reasons.append(reason_of(len(cands) - 1))
+            n_extra += 1
+        eligible = [i for i, x in enumerate(reasons) if not x] or None
+        sel = None
+        if self.selector == "borda":
+            own = S["mode"] == "task1" and t >= 2
+            refs = list(hist_u) if own else [e["text"] for e in all_examples()]
+            idx, sel = SS.select(cands, eligible, fields.get("length_words"), refs, self.style_scorer)
+            sel["refs"] = "own_real_messages" if own else ("fewshot" if refs else "none")
+        else:
+            idx = run_v2.choose(cands, fields.get("length_words"), None, eligible)
+            if z1:
+                pool = eligible if eligible else list(range(len(cands)))
+                idx = random.Random(pipeline.seed_for(sid, t, 97)).choice(pool)
+
+        def fit_tokens(f):
+            if not isinstance(f, dict):
+                return -1
+            return f.get("final_tokens") if f.get("compacted") else f.get("original_tokens", -1)
+        worst = max(range(len(fits)), key=lambda i: fit_tokens(fits[i]))
+        return {**base, "user": cands[idx], "ended_speaker": bool(flags[idx]), "block": block, "t1_sampled": z1,
+                "guard_reasons": reasons, "guard_extra": n_extra, "dup_redraws": dup_redraws,
+                "no_survivor": eligible is None, "selected_index": idx, "n_candidates": len(cands),
+                "speaker_fit": fits[worst], "speaker_hit_max_new": hits, "selection": sel,
+                "candidates": list(cands), "candidates_ended": [bool(f) for f in flags],
+                "fewshot": [[[e["cid"], e["t"]] for e in ex] for ex in slot_ex] if self.fewshot else None,
+                "speaker_block_selected": slot_blk[idx] if slot_blk[idx] != block else None}
+
     def run_episode(self, conversation_id, seed, replicate=0, planner_temperature=0.0, planner_top_p=1.0,
                     record_generation=False):
         from task2_episode import run_episode
@@ -614,9 +829,11 @@ class Task2Env:
                 "n_req": len(self.reqs[conversation_id]["req"]), "ledger": ledger.as_dict(), "trace": ep["trace"],
                 "ledger_judge_empty_total": self.ledger_judge.n_empty,
                 "r0_empty_retries_total": getattr(self.r0, "n_empty_retries", None),
+                "r0_len_retries_total": self.r0.n_len_retries, "r0_len_truncated_total": self.r0.n_len_truncated,
+                "r0_ctx_fit_total": self.r0.n_ctx_fit,
                 "human_turns": self.human_turns(conversation_id)}
 
-    def task1_generate(self, conversation_id, seed=0):
+    def task1_generate(self, conversation_id, seed=0, keep_prompts=False):
         """Task 1 (teacher-forced) generations for one REAL conversation, in the benchmark's generations
         schema (tools/score_method.py): one row per real user turn with greedy (the selected candidate),
         samples (the other candidates), greedy_ended (Speaker end OR the Planner's end, as E1.6's
@@ -653,7 +870,12 @@ class Task2Env:
                          "planner_fit": st.get("planner_fit"), "speaker_fit": st.get("speaker_fit"),
                          "guard_no_survivor": st.get("no_survivor"), "planner_adapter": self.planner.adapter,
                          "profile_note": st.get("profile_note"), "ip_notes_n": st.get("ip_notes_n"),
-                         "fewshot": st.get("fewshot")})
+                         "fewshot": st.get("fewshot"), "speaker_hit_max_new": st.get("speaker_hit_max_new"),
+                         "guard_reasons": st.get("guard_reasons"), "dup_redraws": st.get("dup_redraws"),
+                         "selected_index": st.get("selected_index"), "selection": st.get("selection"),
+                         "planner_prompt_tokens": (st.get("planner_fit") or {}).get("prompt_tokens")})
+            if keep_prompts:
+                rows[-1]["planner_prompt"] = st["planner_prompt"]
             preds.append(st["user"])
             # teacher forcing: the REAL message and the REAL assistant reply enter the history
             S["hist_u"].append(users[t - 1]["text"])
@@ -690,7 +912,14 @@ class Task2Env:
 
     def task1_prompts(self, conversation_id):
         """Greedy teacher-forced pass (current policy) -> per turn the exact Planner user prompt, so a
-        Task 1 training group can sample G decisions from the same state the Planner would be in."""
+        Task 1 training group can sample G decisions from the same state the Planner would be in.
+        With the Implicit Profile / few-shot on, the pass is the full Task 1 generation (the notes need the
+        Speaker's predictions), i.e. exactly what the Task 1 evaluation runs."""
+        if self.ip or self.fewshot:
+            rows, _ = self.task1_generate(conversation_id, keep_prompts=True)
+            n = len(rows)
+            return [{"t": r["turn_index"], "n_real": n, "real_final": r["turn_index"] == n, "user_prompt": r["planner_prompt"]}
+                    for r in rows]
         res = self.run_task1(conversation_id, keep_prompts=True)
         return [{"t": r["t"], "n_real": r["n_real"], "real_final": r["real_final"], "user_prompt": r["user_prompt"]}
                 for r in res["turns"]]
@@ -736,8 +965,19 @@ class Task2Env:
         if self.arm != "pend":
             raise ValueError("run_task1 is implemented for the pend arm")
         if self.ip or self.fewshot:
-            raise NotImplementedError("Planner-only Task 1 has no predictions for the Implicit Profile; "
-                                      "use task1_generate")
+            # the notes need the Speaker's predictions: run the full Task 1 generation (same code as the
+            # evaluation) and read the Planner's decisions off it
+            rows, _ = self.task1_generate(conversation_id, seed=seed)
+            n = len(rows)
+            return {"conversation_id": conversation_id, "record_id": self.recs[conversation_id]["record_id"],
+                    "arm": self.arm, "n_real": n, "planner_path": self.planner.path,
+                    "planner_adapter": self.planner.adapter,
+                    "turns": [{"t": r["turn_index"], "n_real": n, "real_final": r["turn_index"] == n,
+                               "ended_planner": bool(r["planner_ends_session"]),
+                               "planner_unparsed": bool(r.get("planner_unparsed")),
+                               "planner_hit_max_new": bool(r.get("planner_hit_max_new")),
+                               "goal_met": r.get("goal_met"), "planner_diag": None,
+                               "planner_fit": r.get("planner_fit")} for r in rows]}
         from sepsim import persona as P, pipeline, state, stopping
         import planner_prompt_v3 as V3
         rec = self.recs[conversation_id]

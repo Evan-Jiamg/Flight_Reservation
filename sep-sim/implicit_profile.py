@@ -102,6 +102,17 @@ def speaker_lines(notes, examples):
     return ("\n" + "\n".join(out)) if out else ""
 
 
+def norm_text(text):
+    return " ".join((text or "").lower().split())
+
+
+def duplicate_of(text, earlier):
+    """True when the candidate's text is exactly one of the earlier candidates of the same turn
+    (case/whitespace-insensitive). Exact identity only: no similarity threshold."""
+    n = norm_text(text)
+    return bool(n) and any(n == norm_text(e) for e in earlier)
+
+
 def leaks_scaffold(text):
     """The Speaker wrote our block headers (the E1.6 template guard only knows the older field names)."""
     low = (text or "").lower()
@@ -146,15 +157,21 @@ class FewShotPool:
     def describe(self):
         return {"n_conversations": len(self.allowed), "n_messages": len(self.items)}
 
-    def select(self, cid, persona, turn, k=3):
+    def select(self, cid, persona, turn, k=3, variant=0):
         """k examples of the same style, never from this conversation or one sharing its goal/persona;
-        the first-message examples are preferred for turn 1, later messages otherwise. Deterministic."""
+        the first-message examples are preferred for turn 1, later messages otherwise. Deterministic per
+        (conversation, turn, variant); each candidate of a turn uses its own variant, so the Speaker
+        prompts of the candidates differ."""
         key = style_key(persona)
         g, p = self.goal_of.get(cid), self.persona_of.get(cid)
-        ok = [x for x in self.items if x["key"] == key and x["cid"] != cid
-              and (g is None or self.goal_of.get(x["cid"]) != g)
-              and (p is None or self.persona_of.get(x["cid"]) != p)]
+        allowed = [x for x in self.items if x["cid"] != cid
+                   and (g is None or self.goal_of.get(x["cid"]) != g)
+                   and (p is None or self.persona_of.get(x["cid"]) != p)]
+        ok = [x for x in allowed if x["key"] == key]
+        if len(ok) < k:
+            # too few people of the same style AND proficiency: back off to the same interaction style
+            ok = [x for x in allowed if x["key"][0] == key[0]]
         first = [x for x in ok if (x["t"] == 1) == (turn == 1)]
         cands = first if len(first) >= k else ok
-        rng = random.Random(int(hashlib.sha256(("fs|%s|%d" % (cid, turn)).encode()).hexdigest()[:8], 16))
+        rng = random.Random(int(hashlib.sha256(("fs|%s|%d|%d" % (cid, turn, variant)).encode()).hexdigest()[:8], 16))
         return rng.sample(cands, min(k, len(cands)))
