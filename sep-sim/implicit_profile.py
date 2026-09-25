@@ -2,8 +2,8 @@
 """Implicit Profile + few-shot style examples (user design, 2026-09-25). Pure python.
 
 Both tasks run from the first message on. After every message the Planner writes a `profile_note`:
-how THIS person's writing differs from the message the simulator last produced for them and what to
-do differently. The notes accumulate into the Implicit Profile, which goes back into the Planner's
+how THIS person's writing differs from the message the simulator last produced for them (a description
+of their writing, not advice). The notes accumulate into the Implicit Profile, which goes back into the Planner's
 input and into the Speaker block on every later turn.
 
   Task 1 (teacher-forced, gold available): the note compares the simulator's PREDICTION for message
@@ -130,7 +130,7 @@ def leaks_scaffold(text):
     """The Speaker wrote our block headers (the E1.6 template guard only knows the older field names)."""
     low = (text or "").lower()
     return any(h.strip().lstrip("- ").rstrip(": ").lower() in low for h in (SPK_NOTES, SPK_EXAMPLES)) \
-        or "profile_note" in low
+        or "profile_note" in low or "this is their last message" in low
 
 
 def copies_example(text, examples, n=COPY_NGRAM):

@@ -342,8 +342,9 @@ def check_structure(rows, arm, rep):
             # E1.6 PLANNER_END: the first step whose plan ends the session is emitted and is the last step
             first = next((s for s in tr if s.get("ended_planner")), None)
             if first is not None:
-                rep.ok("e16.planner_end", first is tr[-1] and first.get("emitted") and
-                       r.get("end_kind") in ("planner_end", "speaker_end"), where,
+                ok_emit = first.get("emitted") and r.get("end_kind") in ("planner_end", "speaker_end")
+                ok_blank = (not first.get("emitted")) and r.get("end_kind") == "empty"      # blank close = END
+                rep.ok("e16.planner_end", first is tr[-1] and (ok_emit or ok_blank), where,
                        "Planner ended at t%s but episode went on / end_kind %r" % (first.get("t"), r.get("end_kind")))
         if arm in E16_ARMS:
             for s in tr:
@@ -753,13 +754,63 @@ def verify(episodes, meta_path, splits_path, fold, split, arm=None, training=Fal
         check_rl_selection(rl_dir, splits, fold, rep)
         vp = os.path.join(rl_dir, "validation.jsonl")
         if os.path.exists(vp):
-            # the episodes that drive best.json get the same structure / truncation / pend checks
+            # the episodes that drive best.json get the same structure / truncation / pend / few-shot checks
             vrows = load_jsonl(vp, rep)
             if vrows:
                 check_structure(vrows, arm, rep)
                 check_truncation(vrows, arm, meta, sb, judge_budget, max_new_warn, rep)
                 {"a2": check_a2, "pend": check_pend, "a0": check_a0}[check_family(arm)](vrows, rep, arm)
+                if arm == "pend":
+                    check_fewshot_leak(vrows, splits, fold, rep)
+            check_selection(vp, rl_dir, rep)
+    if arm == "pend":
+        check_endpoints(meta, rep)
+        n_reuse = sum(1 for r in all_rows for s in (r.get("trace") or []) if s.get("ended_planner")
+                      and s.get("guard_reasons") and "reuse" in [x for x in s["guard_reasons"] if x])
+        name = "pend.close_rejected_as_reuse"
+        rep._c(name)
+        (rep.warn if n_reuse else rep.note)(name, "closing turns with a candidate rejected as verbatim reuse: %d" % n_reuse)
     return rep
+
+
+def check_endpoints(meta, rep):
+    """pend: R0 and the ledger judge are our gpt-oss-120b (option A); a bypass is recorded, never silent."""
+    if not meta.get("arm"):
+        return
+    for k in ("r0_model", "ledger_judge_model"):
+        rep.ok("pend.endpoints", meta.get(k) == "gpt-oss-120b" or meta.get("task1_only"), "meta",
+               "%s = %r (spec: gpt-oss-120b)" % (k, meta.get(k)))
+    for k in ("r0_base_url", "judge_base_url"):
+        u = str(meta.get(k) or "")
+        rep.ok("pend.endpoints", ("127.0.0.1:8029" in u or "localhost:8029" in u) or meta.get("task1_only"), "meta",
+               "%s = %r (spec: the local gpt-oss server on port 8029)" % (k, u))
+    rep.ok("pend.endpoints", not meta.get("endpoint_bypass"), "meta", "PEND_ALLOW_OTHER_ENDPOINTS was set")
+
+
+def check_selection(vp, rl_dir, rep):
+    """validation summaries: D5 settings, the selection score recomputed from its logged parts, best = argmax."""
+    summ = [json.loads(l) for l in open(vp, encoding="utf-8") if l.strip() and json.loads(l).get("kind") == "summary"]
+    scored = {}
+    for v in summ:
+        w = "validation u%s" % v.get("update")
+        rep.ok("rl.validation_d5", v.get("val_temperature") == 0.7 and sorted(v.get("val_seeds") or []) == [0, 1], w,
+               "validation temperature %r / seeds %r (spec D5: 0.7, seeds 0 and 1)" % (v.get("val_temperature"), v.get("val_seeds")))
+        if v.get("selection_withheld"):
+            rep.warn("rl.validation_withheld", "%s: %s" % (w, v["selection_withheld"]))
+            continue
+        ts, t1 = v.get("turn_stats") or {}, v.get("task1")
+        if v.get("selection_score") is None:
+            continue
+        want = (v["w_sel_cov"] * ts["coverage_mean"] - v["w_sel_w1"] * ts["turn_w1"]
+                + v["w_sel_task1"] * (t1["term_f1"] if t1 else 0.0))
+        rep.ok("rl.selection", abs(v["selection_score"] - want) < 1e-9, w,
+               "selection_score %r != recomputed %r" % (v["selection_score"], want))
+        scored[v["update"]] = v["selection_score"]
+    bp = os.path.join(rl_dir, "best.json")
+    if scored and os.path.exists(bp):
+        best = json.load(open(bp, encoding="utf-8"))
+        rep.ok("rl.selection", best.get("selection_score") == max(scored.values()) and best.get("update") in scored,
+               bp, "best.json is not the argmax of the validation selection scores")
 
 
 FOLDS_GP = "/tmp2/hchsu/trec2026-usersim-benchmark/domains/main_dataset_search/folds3_goal_persona_v1.json"

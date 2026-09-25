@@ -342,8 +342,40 @@ class TorchLearner:
               "n_tokens": 0, "grad_norm": [], "value_mse": 0.0, "ratio_init_maxdev": None, "optimizer_steps": 0}
         params = [p for g in self.optimizer.param_groups for p in g["params"]]
         tok_seen = 0
-        for ep in range(int(self.acfg["epochs"])):
-            for mb in minibatches(len(samples), int(self.acfg["minibatches"]), seed * 1000 + ep):
+        if aux and any("gen_len" not in x for x in aux):
+            raise ValueError("aux example without gen_len: cannot normalise like the GRPO loss")
+
+        def aux_backward():
+            """Auxiliary stop-token supervision: -w * log p(the human's end_session value | prompt + the policy's
+            own prefix), normalised like the GRPO loss by the GENERATED tokens of the generations the values
+            belong to. Its gradient is ADDED to the current .grad (the RL gradient of the last minibatch), so
+            RL and aux share one clipped optimizer step; its own norm is measured for the controller."""
+            before = [p.grad.detach().clone() if p.grad is not None else None for p in params]
+            n_t = sum(int(x["gen_len"]) for x in aux)
+            p_before = []
+            for x in aux:
+                lp, _ = token_logprobs(self.model, list(x["prompt_ids"]) + list(x["prefix_ids"]),
+                                       x["target_ids"], 1.0)
+                p_before.append(float(lp.detach().sum().exp()))
+                loss = -float(x["weight"]) * lp.sum() / n_t
+                loss.backward()
+                st["aux_loss"] = st.get("aux_loss", 0.0) + float(loss.detach())
+            sq = 0.0
+            for p, b in zip(params, before):
+                if p.grad is not None:
+                    d = p.grad.detach().float() - (b.float() if b is not None else 0.0)
+                    sq += float((d ** 2).sum())
+            st["aux_grad_norm"] = sq ** 0.5
+            st["aux_n"] = len(aux)
+            st["aux_p_correct_before"] = sum(p_before) / len(p_before)
+            st["aux_p_correct_end"] = (sum(p for p, x in zip(p_before, aux) if x["want_end"]) /
+                                       max(1, sum(1 for x in aux if x["want_end"])))
+
+        n_ep = int(self.acfg["epochs"])
+        for ep in range(n_ep):
+            mbs = list(minibatches(len(samples), int(self.acfg["minibatches"]), seed * 1000 + ep))
+            for k_mb, mb in enumerate(mbs):
+                last_mb = ep == n_ep - 1 and k_mb == len(mbs) - 1
                 n_tok = sum(len(samples[i]["gen_ids"]) for i in mb)
                 self.optimizer.zero_grad(set_to_none=True)
                 first = ep == 0 and st["optimizer_steps"] == 0
@@ -394,38 +426,26 @@ class TorchLearner:
                     if maxdev > self.acfg["ratio_init_tol"]:
                         raise AssertionError("off-policy start: max |ratio-1| = %.3g > %.3g"
                                              % (maxdev, self.acfg["ratio_init_tol"]))
+                if last_mb:
+                    st["rl_grad_norm"] = sum(float((p.grad.detach().float() ** 2).sum())
+                                             for p in params if p.grad is not None) ** 0.5
+                    if aux:
+                        aux_backward()        # same backward pass, same clip, same optimizer step
                 gn = torch.nn.utils.clip_grad_norm_(params, self.acfg["max_grad_norm"])
                 st["grad_norm"].append(float(gn))
                 self.optimizer.step()
                 st["optimizer_steps"] += 1
         self.optimizer.zero_grad(set_to_none=True)
-        if aux:
-            # auxiliary stop-token supervision (after the on-policy GRPO steps, so it never touches the
-            # ratio check): -log p(the human's end_session value | prompt + the policy's own prefix)
+        if aux and not samples:
+            # an update with supervision only (no RL sample survived): one step for the aux loss alone
             _set_mode(self.model, self.acfg["forward_mode"])
-            # normalised like the GRPO loss: by the number of GENERATED tokens of the generations these values
-            # belong to (not by the 1-2 target tokens, which made the aux gradient ~1400x the RL gradient in the
-            # v8 smoke); w_aux is then a relative weight, tuned by the LLM controller
-            if any("gen_len" not in x for x in aux):
-                raise ValueError("aux example without gen_len: cannot normalise like the GRPO loss")
-            n_t = sum(int(x["gen_len"]) for x in aux)
-            p_before = []
-            for x in aux:
-                lp, _ = token_logprobs(self.model, list(x["prompt_ids"]) + list(x["prefix_ids"]),
-                                       x["target_ids"], 1.0)
-                p_before.append(float(lp.detach().sum().exp()))
-                loss = -float(x["weight"]) * lp.sum() / n_t
-                loss.backward()
-                st["aux_loss"] = st.get("aux_loss", 0.0) + float(loss.detach())
+            st["rl_grad_norm"] = 0.0
+            aux_backward()
             gn = torch.nn.utils.clip_grad_norm_(params, self.acfg["max_grad_norm"])
-            st["aux_grad_norm"] = float(gn)
+            st["grad_norm"].append(float(gn))
             self.optimizer.step()
             self.optimizer.zero_grad(set_to_none=True)
             st["optimizer_steps"] += 1
-            st["aux_n"] = len(aux)
-            st["aux_p_correct_before"] = sum(p_before) / len(p_before)
-            st["aux_p_correct_end"] = (sum(p for p, x in zip(p_before, aux) if x["want_end"]) /
-                                       max(1, sum(1 for x in aux if x["want_end"])))
         self.model.eval()
         n_mb = max(1, st["optimizer_steps"])
         tok_div = max(1, tok_seen)          # 0 only for an aux-only update

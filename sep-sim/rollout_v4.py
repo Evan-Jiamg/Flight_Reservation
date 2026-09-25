@@ -64,11 +64,12 @@ def check_rl_settings(adapter, settings):
             m = json.load(open(p, encoding="utf-8"))
             if m.get("init_adapter"):
                 raise SystemExit("adapter was trained on top of init adapter %s: evaluating it on the plain base is wrong" % m["init_adapter"])
-            diff = {k: (m.get(k), v) for k, v in settings.items() if k in m and m.get(k) != v}
+            norm = lambda k, x: os.path.normpath(str(x)) if (k == "planner_path" and x) else x
+            diff = {k: (m.get(k), v) for k, v in settings.items() if k in m and norm(k, m.get(k)) != norm(k, v)}
             if diff:
                 raise SystemExit("adapter trained with other settings than this evaluation: %r" % diff)
             return m
-    return None
+    raise SystemExit("LEAK GATE: RL adapter without rl_manifest.json (next to it or in its directory)")
 
 
 def main():
@@ -109,6 +110,8 @@ def main():
         if getattr(args, k) is None:
             setattr(args, k, v)
     off = {k: getattr(args, k) for k in spec if getattr(args, k) != spec[k]}
+    if args.arm == "pend" and "Qwen3-4B-Instruct-2507" not in args.planner_path:
+        off["planner_path"] = args.planner_path          # the spec's Planner
     if off and not args.ablation:
         raise SystemExit("settings %r differ from the %s spec; name the ablation with --ablation" % (off, args.arm))
     if args.arm != "pend" and (args.implicit_profile or args.fewshot != "off" or args.selector != "length"):
@@ -142,8 +145,10 @@ def main():
         if found is None:
             raise SystemExit("LEAK GATE: planner adapter has no manifest; cannot verify its training data")
         gate["planner_adapter"] = found
-        check_rl_settings(args.planner_adapter, {"arm": args.arm, "implicit_profile": args.implicit_profile,
-                                                 "fewshot": args.fewshot, "selector": args.selector})
+        if args.arm == "pend":           # pend adapters come from train_planner_rl: rl_manifest.json required
+            check_rl_settings(args.planner_adapter, {"arm": args.arm, "implicit_profile": args.implicit_profile,
+                                                     "fewshot": args.fewshot, "selector": args.selector,
+                                                     "planner_path": args.planner_path})
     print("leak gate OK", json.dumps(gate), flush=True)
 
     from task2_env import Task2Env, PlannerLM, setup_environment, make_fewshot_pool
@@ -164,13 +169,20 @@ def main():
     out = os.path.join(args.out_dir, "%s.jsonl" % args.arm)
     done = set()
     if os.path.exists(out):
-        for l in open(out, encoding="utf-8"):
-            if not l.strip():
-                continue
+        lines = [l for l in open(out, encoding="utf-8") if l.strip()]
+        for i, l in enumerate(lines):
             try:
                 r = json.loads(l)
             except ValueError:
-                continue                  # a torn last line after a crash: that episode is regenerated
+                if i != len(lines) - 1:
+                    raise SystemExit("%s: undecodable line %d (not the last one): the file is corrupt" % (out, i + 1))
+                # a torn last line after a crash: cut it off (the next row must not merge into it); regenerated
+                with open(out, "rb+") as f:
+                    data = f.read()
+                    cut = data.rstrip(b"\n").rfind(b"\n")
+                    f.seek(0)
+                    f.truncate(cut + 1 if cut >= 0 else 0)
+                continue
             done.add((r["conversation_id"], r["seed"], r.get("replicate", 0)))
     code = {n: sha_file(os.path.join(HERE, n)) for n in ("rollout_v4.py", "task2_env.py", "task2_episode.py", "ditto_e16.py", "task1_stop.py",
                                                          "fit_prompts.py", "planner_prompt_v3.py", "goal_judge.py",

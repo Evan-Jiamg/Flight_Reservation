@@ -2,7 +2,7 @@
 """Task2Env: one reusable Task 2 environment for evaluation rollouts AND RL (Planner is the policy).
 
 Everything that decides behaviour lives here, once, so evaluation and RL cannot drift apart:
-  * PlannerLM   any causal LM (32B NF4, or a smaller 7-9B/20B model), optional LoRA adapter
+  * PlannerLM   any causal LM (pend: Qwen3-4B-Instruct-2507), optional LoRA adapter
                 (trainable for RL). Prompts are fitted (fit_prompts, never truncated) to
                 min(fit_prompts.PLANNER_BUDGET, model context - max_new - margin). Tokenized with
                 add_special_tokens=False (the chat template carries any BOS).
@@ -95,13 +95,14 @@ JUDGE_MIN_TOKENS = int(os.environ.get("JUDGE_MIN_TOKENS", "4000"))
 
 R0_CONTEXT = int(os.environ.get("R0_CONTEXT", "12288"))     # gpt-oss-120b on the vLLM server: max_model_len
 JUDGE_RETRY_TOKENS = int(os.environ.get("JUDGE_RETRY_TOKENS", "8000"))   # one re-request of an unparseable verdict
+PEND_PORT = os.environ.get("PEND_R0_PORT", "8029")        # our gpt-oss-120b vLLM server (user decision, option A)
 
 # Per-episode counters of R0 / ledger-judge incidents. Episodes run one per thread and every R0 and
 # ledger call of an episode is made on that episode's thread, so a thread-local dict attributes each
 # incident to exactly one episode (the *_total counters on the clients stay process-wide).
 _EP = threading.local()
 EPISODE_COUNTERS = ("r0_len_retries", "r0_len_truncated", "r0_ctx_fit", "r0_empty",
-                    "judge_empty", "judge_unparseable", "judge_retries", "judge_retry_failed")
+                    "judge_empty", "judge_unparseable", "judge_retries", "judge_retry_failed", "judge_error")
 
 
 def episode_begin():
@@ -150,7 +151,7 @@ def rl_masks(planner, g, unparsed, diag, t):
         if want not in txt.lower():
             diag["stop_mask_mismatch"] = True      # the first match is not the parsed value: no stop credit
             sm = None
-    nm = None if g.get("hit_max_new") else planner.field_mask(g["gen_ids"], "profile_note")
+    nm = planner.field_mask(g["gen_ids"], "profile_note")      # None unless a closed string value exists
     return sm, nm
 
 
@@ -165,7 +166,8 @@ def step_compacted(step):
 def episode_clean(counts):
     """An episode may enter a reward group only if no R0 reply was cut and no ledger verdict was lost."""
     return counts.get("r0_len_truncated", 0) == 0 and counts.get("r0_empty", 0) == 0 \
-        and counts.get("judge_empty", 0) == 0 and counts.get("judge_unparseable", 0) == 0
+        and counts.get("judge_empty", 0) == 0 and counts.get("judge_unparseable", 0) == 0 \
+        and counts.get("judge_error", 0) == 0
 
 
 def prompt_tokens_from_error(msg):
@@ -272,19 +274,42 @@ def make_floor_judge(Judge):
             super().__init__(*a, **kw)
             self.gpt5 = str(self.model).startswith("gpt-5")
             self.floor = None if self.gpt5 else JUDGE_MIN_TOKENS
-            self.n_empty = self.n_unparseable = self.n_retries = self.n_retry_failed = 0
+            self.n_empty = self.n_unparseable = self.n_retries = self.n_retry_failed = self.n_errors = 0
+            self._init_args, self._init_kw = a, dict(kw)
+            self._retry = None
             self._lock = threading.Lock()
+
+        def chat_raw(self, system, user, max_tokens):
+            return super().chat(system, user, max_tokens)
+
+        def _retry_judge(self):
+            with self._lock:
+                if self._retry is None:
+                    kw = dict(self._init_kw)
+                    if kw.get("cache_dir"):
+                        kw["cache_dir"] = os.path.join(kw["cache_dir"], "retry_%d" % JUDGE_RETRY_TOKENS)
+                    self._retry = FloorJudge.__bases__[0](*self._init_args, **kw)
+                    self._retry.chat_raw = self._retry.chat
+            return self._retry
 
         def chat(self, system, user, max_tokens=400):
             budget = max(max_tokens, self.floor) if self.floor else max_tokens
-            out = super().chat(system, user, budget)
+            try:
+                out = super().chat(system, user, budget)
+            except Exception:
+                # a verdict lost to an exception would otherwise vanish if the caller swallows it
+                with self._lock:
+                    self.n_errors += 1
+                _ep_count("judge_error")
+                raise
             if not _parses_as_object(out) and not self.gpt5 and JUDGE_RETRY_TOKENS > budget:
-                # one re-request at a larger budget (an answer cut by the budget is the usual cause)
+                # one re-request at a larger budget (an answer cut by the budget is the usual cause), through a
+                # judge with its OWN cache directory, so a cached bad answer is never replayed
                 with self._lock:
                     self.n_retries += 1
                 _ep_count("judge_retries")
                 try:
-                    out = super().chat(system, user, JUDGE_RETRY_TOKENS)
+                    out = self._retry_judge().chat_raw(system, user, JUDGE_RETRY_TOKENS)
                 except Exception:                  # e.g. prompt + 8000 over the server context: keep the first answer
                     with self._lock:
                         self.n_retry_failed += 1
@@ -511,7 +536,8 @@ class PlannerLM:
 
 class Task2Env:
     def __init__(self, arm, gpu, planner, judge=None, ditto_path=DITTO, corpus="/home/mzjiang/v5-latency/data.jsonl",
-                 batch=False, max_batch=8, implicit_profile=False, fewshot_pool=None, selector="length"):
+                 batch=False, max_batch=8, implicit_profile=False, fewshot_pool=None, selector="length", task1_only=False):
+        self.task1_only = bool(task1_only)     # Task 1 generation only: no R0 agent, no ledger judge
         if arm not in ARM_ENV:
             raise ValueError(arm)
         if arm in V3_ARMS and judge is None:
@@ -573,18 +599,23 @@ class Task2Env:
         # reasoning_effort=minimal. A substitute endpoint (e.g. gpt-oss-120b on vLLM) is set with
         # R0_BASE_URL/R0_MODEL and JUDGE_BASE_URL/JUDGE_MODEL; gpt-oss has no "minimal", so the
         # effort is set with R0_REASONING_EFFORT / JUDGE_REASONING_EFFORT. All of it is in describe().
-        if arm == "pend" and os.environ.get("PEND_ALLOW_OTHER_ENDPOINTS") != "1":
+        if arm == "pend" and not self.task1_only and os.environ.get("PEND_ALLOW_OTHER_ENDPOINTS") != "1":
             # user decision (option A): R0 and the ledger judge are our own gpt-oss-120b on vLLM
             for k in ("R0_BASE_URL", "JUDGE_BASE_URL"):
-                if not os.environ.get(k) or "api.openai.com" in os.environ[k]:
-                    raise RuntimeError("%s must point at the local gpt-oss-120b server for the pend arm" % k)
+                u = os.environ.get(k) or ""
+                if not any(h in u for h in ("127.0.0.1:%s" % PEND_PORT, "localhost:%s" % PEND_PORT)):
+                    raise RuntimeError("%s must point at the local gpt-oss-120b server (port %s) for the pend arm, got %r"
+                                       % (k, PEND_PORT, u))
             for k in ("R0_MODEL", "JUDGE_MODEL"):
                 if os.environ.get(k) != "gpt-oss-120b":
                     raise RuntimeError("%s must be gpt-oss-120b for the pend arm (got %r)" % (k, os.environ.get(k)))
         self.r0_effort = os.environ.get("R0_REASONING_EFFORT", "minimal")
         self.judge_effort = os.environ.get("JUDGE_REASONING_EFFORT", "minimal")
+        jkey = hashlib.sha256(("%s|%s" % (os.environ.get("JUDGE_MODEL", "default"),
+                                          os.environ.get("JUDGE_BASE_URL", "default"))).encode()).hexdigest()[:12]
+        self.judge_cache_dir = os.path.join(WORK, "judge_cache_%s" % jkey)      # one cache per judge model+endpoint
         self.ledger_judge = make_floor_judge(Judge)(reasoning_effort=self.judge_effort, verbose=False,
-                                                    cache_dir=os.path.join(WORK, "judge_cache"))
+                                                    cache_dir=self.judge_cache_dir)
         self.r0 = make_tracking_r0(R0Client)(reasoning_effort=self.r0_effort)
         if self.e16:
             import ditto_e16
@@ -661,6 +692,8 @@ class Task2Env:
                 "tree": tree_of(self.arm), "arm_env": ARM_ENV[self.arm], "t1_sampling": self.t1_sampling,
                 "implicit_profile": self.ip, "fewshot": self.fewshot.describe() if self.fewshot else None,
                 "selector": self.selector, "speaker_max_new": self.speaker.max_new, "planner_max_new": self.planner.max_new,
+                "judge_cache_dir": getattr(self, "judge_cache_dir", None), "task1_only": self.task1_only,
+                "endpoint_bypass": os.environ.get("PEND_ALLOW_OTHER_ENDPOINTS") == "1",
                 "batching": None if self.planner_batcher is None else {
                     "planner": self.planner_batcher.max_batch, "speaker": self.speaker_batcher.max_batch}}
 
@@ -1014,10 +1047,13 @@ class Task2Env:
         S, speak, respond, ledger, rid = ss["S"], ss["speak"], ss["respond"], ss["ledger"], ss["rid"]
         # e16: E1.6 SEPSIM_PLANNER_END -- the Planner's Complete act ends the episode after the
         # closing message it asked for (emitted, no assistant reply). v3 arms exit silently instead.
+        if self.task1_only:
+            raise RuntimeError("this Task2Env was built for Task 1 only (no R0 / ledger judge)")
         orphans0 = orphan_incidents()
         episode_begin()
         try:
             ep = run_episode(T_MAX, None, speak, respond, planner_end=(arm in EMIT_END_ARMS))
+            cov_final, complete_final, ledger_dict = round(ledger.coverage(), 4), ledger.complete(), ledger.as_dict()
         finally:
             counts = episode_end()
         if orphan_incidents() != orphans0:
@@ -1037,8 +1073,8 @@ class Task2Env:
                 "emitted_user_turns": ep["emitted_user_turns"], "decision_steps": ep["decision_steps"],
                 "end_kind": ep["end_kind"], "turns": ep["emitted_user_turns"], "stop_kind": ep["end_kind"],
                 "ended_by_token": ep["end_kind"] != "t_max",
-                "coverage": round(ledger.coverage(), 4), "complete": ledger.complete(),
-                "n_req": len(self.reqs[conversation_id]["req"]), "ledger": ledger.as_dict(), "trace": ep["trace"],
+                "coverage": cov_final, "complete": complete_final,
+                "n_req": len(self.reqs[conversation_id]["req"]), "ledger": ledger_dict, "trace": ep["trace"],
                 "ledger_judge_empty_total": self.ledger_judge.n_empty,
                 "ledger_judge_unparseable_total": self.ledger_judge.n_unparseable,
                 "r0_empty_retries_total": getattr(self.r0, "n_empty_retries", None),
@@ -1052,8 +1088,8 @@ class Task2Env:
     def task1_generate(self, conversation_id, seed=0, keep_prompts=False):
         """Task 1 (teacher-forced) generations for one REAL conversation, in the benchmark's generations
         schema (tools/score_method.py): one row per real user turn with greedy (the selected candidate),
-        samples (the other candidates), greedy_ended (Speaker end OR the Planner's end, as E1.6's
-        PLANNER_END records it). The history at turn t is always the real one; the Planner's own state
+        samples (the other candidates), greedy_ended under M2 (Speaker blank at t OR the Planner's end
+        decided at t-1), samples_ended = the Speaker flags (E1.6 convention). The history at turn t is always the real one; the Planner's own state
         carries over, as in run_v2. Planner at temperature 0. No R0, no ledger."""
         from sepsim import agenda as AG, pipeline
         import implicit_profile as IP
@@ -1089,7 +1125,7 @@ class Task2Env:
                          "greedy_ended": bool(st["ended_speaker"]) or prev_decision,
                          "end_mapping": "M2", "ended_by_prev_decision": prev_decision,
                          "speaker_ended": bool(st["ended_speaker"]), "planner_ends_session": bool(st["ended_planner"]),
-                         "samples": samples, "samples_ended": [b or prev_decision for b in s_blank],
+                         "samples": samples, "samples_ended": s_blank,
                          "samples_speaker_ended": s_blank, "profile": st.get("block"),
                          "move": st.get("move"), "act": st.get("act"), "goal_met": st.get("goal_met"),
                          "planner_unparsed": st.get("planner_unparsed"), "planner_hit_max_new": st.get("planner_hit_max_new"),
@@ -1165,7 +1201,8 @@ class Task2Env:
         rows, _ = self.task1_generate(conversation_id, keep_prompts=True)
         n = len(rows)
         return [{"t": r["turn_index"], "n_real": n, "real_final": r["turn_index"] == n, "user_prompt": r["planner_prompt"],
-                 "planner_fit": r.get("planner_fit")} for r in rows]
+                 "planner_fit": r.get("planner_fit"), "emitted_capped": bool(r.get("emitted_capped")),
+                 "planner_hit_max_new": bool(r.get("planner_hit_max_new"))} for r in rows]
 
     def task1_sample(self, conversation_id, t, user_prompt, real_final, G, temperature, top_p, seed):
         """G sampled Planner decisions at one real turn t >= 2 (turn 1 cannot end, so it teaches nothing about
@@ -1196,7 +1233,10 @@ class Task2Env:
                                                       stopping.StoppingLedger(scenario))
             unparsed = fields is None
             sm, nm = rl_masks(self.planner, gen, unparsed, diag, t)
-            valid = sm is not None
+            # a decision = parsed, not capped, a valid end_session value, t >= 2 (the reward does not depend on
+            # whether the stop mask could be located; without a mask the sample just gets no stop credit)
+            valid = (not unparsed and not gen["hit_max_new"] and (diag or {}).get("end_session_valid") is True
+                     and not (diag or {}).get("end_session_t1_ignored"))
             out.append({"t": t, "replicate": g, "real_final": bool(real_final), "ended_planner": bool(end),
                         "planner_unparsed": unparsed, "planner_hit_max_new": gen["hit_max_new"],
                         "decision_valid": valid, "planner_diag": diag, "planner_fit": gen.get("fit"),
@@ -1204,9 +1244,9 @@ class Task2Env:
                         "planner_gen": {"prompt_ids": gen["prompt_ids"], "gen_ids": gen["gen_ids"], "stop_mask": sm,
                                         "note_mask": nm, "hit_max_new": gen["hit_max_new"],
                                         "temperature": temperature, "top_p": top_p, "seed": pseed}})
-        # one stop-supervision example per position: the first VALID sample
+        # one stop-supervision example per position: the first VALID sample with a located stop mask
         for x in out:
-            if not x["decision_valid"]:
+            if not x["decision_valid"] or x["planner_gen"]["stop_mask"] is None:
                 continue
             tgt = self.planner.stop_target(x["planner_gen"]["gen_ids"], x["planner_gen"]["stop_mask"], real_final)
             if tgt is not None:

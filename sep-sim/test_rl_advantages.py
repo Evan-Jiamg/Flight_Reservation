@@ -168,8 +168,17 @@ def check_outputs(out, splits_p, n_updates):
     summ = [v["update"] for v in val if v["kind"] == "summary"]
     assert summ == [u for u in range(0, n_updates + 1) if u % 2 == 0], summ
     best = json.load(open(os.path.join(out, "best.json")))
-    vs = {v["update"]: v["mean_reward_selection"] for v in val if v["kind"] == "summary"}
-    assert best["mean_reward_selection"] == max(vs.values()) and best["update"] in vs
+    summ = [v for v in val if v["kind"] == "summary"]
+    vs = {v["update"]: v["selection_score"] for v in summ if v["selection_score"] is not None}
+    # selection = w_sel_cov*coverage - w_sel_w1*W1 + w_sel_task1*term_f1, recomputed from the logged parts
+    for v in summ:
+        if v["selection_score"] is not None:
+            t1 = v["task1"]["term_f1"] if v["task1"] else 0.0
+            want = (v["w_sel_cov"] * v["turn_stats"]["coverage_mean"] - v["w_sel_w1"] * v["turn_stats"]["turn_w1"]
+                    + v["w_sel_task1"] * t1)
+            assert abs(v["selection_score"] - want) < 1e-9
+    assert all(v["task1"] is not None for v in summ)               # Task 1 validation always runs (D2 / selection)
+    assert best["selection_score"] == max(vs.values()) and best["update"] in vs
     # no validation id ever reached the controller history
     st = json.load(open(os.path.join(out, "ckpt", "u%05d" % n_updates, "state.json")))
     for h in st["history"]:

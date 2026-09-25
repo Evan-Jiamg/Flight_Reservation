@@ -42,11 +42,12 @@ def check_rl_settings(adapter, settings):
             m = json.load(open(p, encoding="utf-8"))
             if m.get("init_adapter"):
                 raise SystemExit("adapter was trained on top of init adapter %s: evaluating it on the plain base is wrong" % m["init_adapter"])
-            diff = {k: (m.get(k), v) for k, v in settings.items() if k in m and m.get(k) != v}
+            norm = lambda k, x: os.path.normpath(str(x)) if (k == "planner_path" and x) else x
+            diff = {k: (m.get(k), v) for k, v in settings.items() if k in m and norm(k, m.get(k)) != norm(k, v)}
             if diff:
                 raise SystemExit("adapter trained with other settings than this evaluation: %r" % diff)
             return m
-    return None
+    raise SystemExit("LEAK GATE: RL adapter without rl_manifest.json (next to it or in its directory)")
 
 
 def main(argv=None):
@@ -76,6 +77,8 @@ def main(argv=None):
     spec_fs = "loo" if a.sessions == "all" else "fold"
     off = {k: v for k, v in (("implicit_profile", a.implicit_profile), ("selector", a.selector), ("fewshot", a.fewshot))
            if v != {"implicit_profile": 1, "selector": "borda", "fewshot": spec_fs}[k]}
+    if "Qwen3-4B-Instruct-2507" not in a.planner_path:
+        off["planner_path"] = a.planner_path            # the spec's Planner
     if off and not a.ablation:
         raise SystemExit("settings %r differ from the pend spec; name the ablation with --ablation" % off)
     if a.sessions == "fold-test" and not a.final:
@@ -85,7 +88,7 @@ def main(argv=None):
     from sepsim import pipeline
     planner = PlannerLM(a.planner_path, a.gpu, adapter=a.planner_adapter or None)
     env = Task2Env("pend", a.gpu, planner, judge=None, batch=bool(a.batch), max_batch=a.max_batch,
-                   implicit_profile=bool(a.implicit_profile), selector=a.selector)
+                   implicit_profile=bool(a.implicit_profile), selector=a.selector, task1_only=True)
     finished = [cid for cid, r in env.recs.items()
                 if any(m.get("is_final") is True for m in r.get("chat_messages", []))]
     if a.fewshot == "loo":
@@ -122,7 +125,8 @@ def main(argv=None):
             if man is None:
                 raise SystemExit("LEAK GATE: adapter has no manifest")
             check_rl_settings(a.planner_adapter, {"arm": "pend", "implicit_profile": a.implicit_profile,
-                                                  "selector": a.selector})
+                                                  "selector": a.selector, "fewshot": a.fewshot,
+                                                  "planner_path": a.planner_path})
             used = set(man.get("train_scenarios", [])) | set(man.get("train_conversations", [])) | set(man.get("fewshot_pool", []))
             if man.get("splits_sha256") and man["splits_sha256"] != sha_file(a.splits):
                 raise SystemExit("LEAK GATE: adapter was trained with another split file (sha differs)")
@@ -154,7 +158,9 @@ def main(argv=None):
                 "ablation": a.ablation, "planner_adapter": a.planner_adapter or None, "planner_path": a.planner_path,
                 "fewshot_k": 3, "copy_ngram": IP.COPY_NGRAM,
                 "fewshot_backoff": "same style+proficiency; fewer than k -> same interaction style",
-                "planner_temperature": 0.0, "end_mapping": "M2", "simcse": getattr(SS, "SIMCSE", None)}
+                "planner_temperature": 0.0, "end_mapping": "M2", "simcse": getattr(SS, "SIMCSE", None),
+                "sessions": a.sessions, "fold": a.fold, "limit": a.limit,
+                "splits_sha256": sha_file(a.splits) if a.sessions != "all" else None}
     code = {n: sha_file(os.path.join(HERE, n)) for n in
             ("task1_v4.py", "task2_env.py", "planner_prompt_v3.py", "fit_prompts.py", "ditto_e16.py",
              "implicit_profile.py", "batching.py", "style_select.py")}

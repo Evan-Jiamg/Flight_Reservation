@@ -72,7 +72,7 @@ def test_w_aux_is_tuned_not_fixed():
         cfg = c.propose(hist(5))
     assert cfg["w_aux"] == pytest.approx(0.01)
     # a run that switched the supervision off (w_aux = 0) is never switched back on by the controller
-    cfg0 = RC.initial_cfg(version="v4", w_aux=0.0)
+    cfg0 = RC.initial_cfg(version="v4", w_aux=0.0, lambda_unparsed=1.0, lambda_hit_max_new=1.0)
     c0 = RC.make_controller("llm", cfg0, transport=lambda req: reply({"factors": {"w_aux": 2.0}}))
     assert c0.propose(hist(5))["w_aux"] == 0.0
 

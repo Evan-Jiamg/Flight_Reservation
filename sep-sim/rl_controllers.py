@@ -52,7 +52,7 @@ FORBIDDEN_KEY_PARTS = ("valid", "val_", "test", "coverage", "complete")
 HISTORY_KEYS = ("update", "split", "reward_version", "n_episodes", "reward_mean", "reward_std", "components_mean",
                 "end_kind_frac", "n_groups", "n_groups_skipped_zero_std", "loss", "kl", "ratio_mean",
                 "clip_frac", "grad_norm", "n_tokens", "lr", "kl_coef", "value_mse", "ratio_init_maxdev",
-                "shadow_reward_mean", "turn_hist", "p_h", "aux_weight", "aux_stats", "task1_train")
+                "shadow_reward_mean", "turn_hist", "p_h", "aux_weight", "aux_stats", "task1_train", "rl_grad_norm")
 
 
 def sha256(s):
@@ -312,7 +312,8 @@ LLM4_SYSTEM = (
     "conversation lengths T matches real people's) - lambda_unparsed * (share of unreadable plans) "
     "- lambda_hit_max_new * (share of plans cut by the length cap). Separately, w_aux weights an auxiliary "
     "supervised loss that pulls the Planner's end_session decision towards the real person's on training "
-    "conversations (it is also annealed to 0 later); compare aux_grad_norm with grad_norm (the RL update) to "
+    "conversations (it is also annealed to 0 later); both share one optimizer step: compare aux_grad_norm with "
+    "rl_grad_norm (the RL part of the same step) to "
     "judge whether it dominates or is negligible, and task1_train accuracy to judge whether it is still needed. "
     "You see ONLY statistics of TRAINING "
     "rollouts, summarised per update, and your earlier decisions with what followed. "
@@ -356,6 +357,10 @@ class LLMFactorController(Controller):
             lo, hi = self.opt["bounds"][k]
             if not (CFG_BOUNDS[k][0] <= lo <= hi <= CFG_BOUNDS[k][1]):
                 raise ValueError("controller bounds for %s outside the reward bounds" % k)
+            v = float(self.cfg[k])
+            if not (lo <= v <= hi) and not (k == "w_aux" and v == 0.0):
+                raise ValueError("initial %s=%g outside the controller bounds [%g, %g]: it would be clamped silently "
+                                 "at the first decision" % (k, v, lo, hi))
         self.log_path = log_path
         base_url = os.environ.get("CONTROLLER_BASE_URL") or os.environ.get("R0_BASE_URL") or "http://127.0.0.1:8029/v1"
         self.opt["base_url"] = base_url
@@ -378,7 +383,7 @@ class LLMFactorController(Controller):
                          "shadow_reward_mean": h.get("shadow_reward_mean"),
                          "coverage": c.get("coverage"), "dist": c.get("dist"), "turns_mean": c.get("turns"),
                          "rate_unparsed": c.get("rate_unparsed"), "rate_hit_max_new": c.get("rate_hit_max_new"),
-                         "kl": h.get("kl"), "grad_norm": h.get("grad_norm"),
+                         "kl": h.get("kl"), "rl_grad_norm": h.get("rl_grad_norm"),
                          "aux_weight_effective": h.get("aux_weight"), "aux": h.get("aux_stats"),
                          "task1_train": {k: (h.get("task1_train") or {}).get(k)
                                          for k in ("acc", "end_at_final", "end_at_nonfinal")}})

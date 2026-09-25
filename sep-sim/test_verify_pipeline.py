@@ -371,7 +371,8 @@ class RLRuns(Base):
                     with open(os.path.join(d, "rl_manifest.json"), "w") as f:
                         json.dump({"train_scenarios": ["tr1", "tr2"], "train_conversations": ["tr1", "tr2"],
                                    "fewshot_pool": []}, f)
-        self.write("rl/validation.jsonl", [{"kind": "summary", "update": 1, "split": "validation"}], jsonl=True)
+        self.write("rl/validation.jsonl", [{"kind": "summary", "update": 1, "split": "validation", "val_temperature": 0.7,
+                                            "val_seeds": [0, 1], "selection_score": None}], jsonl=True)
         self.write("rl/best.json", {"update": 1})
         return rl
 

@@ -16,8 +16,8 @@ Loop (update u = 1, 2, ...; the policy that generates update u's rollouts has po
      history, rl_manifest.json) atomically; then updates.jsonl;
   6. controller.propose(train aggregates only) -> cfg for the next update;
   7. every --val-every updates: SAMPLED-Planner episodes (D5) and greedy Task 1 on splits[fold]["validation"]
-     -> validation.jsonl only; best.json = best checkpoint by validation reward under the FIXED initial cfg
-     (selection_cfg) + w * validation Task 1 term_f1 (M2).
+     -> validation.jsonl only; best.json = best checkpoint by w_sel_cov*coverage - w_sel_w1*W1(turn counts)
+     + w_sel_task1*Task 1 term_f1 (M2); unclean validation episodes are re-run, else the score is withheld.
 Validation never enters history, reward statistics or the controller; the test ids are never read.
 
 --resume continues from ckpt/LATEST; rollouts of an interrupted update that were produced by the same
@@ -52,7 +52,9 @@ import task1_stop as T1  # noqa: E402
 CODE_FILES = ("train_planner_rl.py", "rl_reward.py", "rl_controllers.py", "rl_algos.py", "task2_env.py",
               "task2_episode.py", "goal_judge.py", "planner_prompt_v3.py", "fit_prompts.py", "ditto_e16.py",
               "task1_stop.py", "batching.py", "implicit_profile.py", "style_select.py")
-TIME_KEYS = ("time", "wall_s", "rollout_s", "update_s", "timing", "validation_s")
+TIME_KEYS = ("time", "wall_s", "rollout_s", "update_s", "timing", "validation_s",
+             "planner_s", "speaker_s", "r0_s", "ledger_s")
+VAL_RETRIES = 2          # an unclean validation episode (infrastructure incident) is re-run up to this many times
 RESUME_MAY_CHANGE = ("resume", "allow_code_change", "updates", "rollout_workers", "gpu", "max_batch",
                      "keep_optimizer_last", "dry_run_crash_after_episodes")
 
@@ -87,6 +89,14 @@ def code_shas():
 
 
 def append_jsonl(path, row):
+    if os.path.exists(path) and os.path.getsize(path) > 0:
+        with open(path, "rb+") as f:
+            f.seek(-1, 2)
+            if f.read(1) != b"\n":                       # torn last line from a crash: drop it
+                f.seek(0)
+                data = f.read()
+                f.seek(0)
+                f.truncate(data.rfind(b"\n") + 1)
     with open(path, "a", encoding="utf-8") as f:
         f.write(json.dumps(row, sort_keys=True) + "\n")
         f.flush()
@@ -200,24 +210,26 @@ class FakeLearner:
         if not samples:
             out = {"n_samples": 0, "n_tokens": 0, "loss": 0.0, "kl": 0.0, "ratio_mean": 1.0, "clip_frac": 0.0,
                    "grad_norm": 0.0, "ratio_init_maxdev": 0.0, "optimizer_steps": 0}
-            self._aux_step(aux, cfg, out)
+            self._aux_step(aux, cfg, out, own_step=True)
             return out
         st = self._update(samples, cfg, seed)
         if aux:
             self._aux_step(aux, cfg, st)
         return st
 
-    def _aux_step(self, aux, cfg, st):
+    def _aux_step(self, aux, cfg, st, own_step=False):
         lr = cfg["lr"] * self.lr_scale
+        n_t = sum(int(x["gen_len"]) for x in aux)            # normalised per generated token, like the real learner
         ps = []
         for x in aux:
             k = x["prompt_ids"][0]
             p = _sig(self.theta[k])
             ps.append(p if x["target_ids"][0] == 1 else 1 - p)
             grad = (1 - p) if x["target_ids"][0] == 1 else -p
-            self.theta[k] += lr * float(x["weight"]) * grad / len(aux)
+            self.theta[k] += lr * float(x["weight"]) * grad / n_t
         st["aux_n"], st["aux_p_correct_before"] = len(aux), sum(ps) / len(ps)
-        st["optimizer_steps"] = st.get("optimizer_steps", 0) + 1
+        if own_step:                                           # aux-only update: its own step
+            st["optimizer_steps"] = st.get("optimizer_steps", 0) + 1
 
     def _update(self, samples, cfg, seed):
         self.prepare(samples)
@@ -288,7 +300,7 @@ class FakeEnv:
                     gs = {"status": "UNKNOWN", "unmet": []}
             k = STATUS_IDX[gs["status"]]
             p = _sig(self.learner.theta[k])
-            stop = (rng.random() < p) if planner_temperature > 0 else p > 0.5
+            stop = ((rng.random() < p) if planner_temperature > 0 else p > 0.5) and t >= 2   # turn 1 cannot end
             unparsed = rng.random() < 0.02
             step = {"t": t, "goal_status": gs, "ended_planner": stop, "planner_unparsed": unparsed,
                     "planner_hit_max_new": False, "no_survivor": False, "planner_diag": {},
@@ -311,6 +323,15 @@ class FakeEnv:
 
     def human_turns(self, conversation_id):
         return 2 + seed_of("human", conversation_id) % 6
+
+    def run_task1(self, conversation_id, seed=0, keep_prompts=False):
+        """Greedy teacher-forced stop decisions of the fake policy (theta[3] at the real last message,
+        theta[1] before it); turn 1 cannot end."""
+        n = self.human_turns(conversation_id)
+        turns = [{"t": t, "n_real": n, "real_final": t == n, "speaker_blank": False, "planner_unparsed": False,
+                  "ended_planner": t >= 2 and _sig(self.learner.theta[3 if t == n else 1]) > 0.5} for t in range(1, n + 1)]
+        return {"conversation_id": conversation_id, "n_real": n, "end_mapping": "M2", "k1_speaker_blank": False,
+                "turns": turns}
 
 
 def _fake_task1_prompts(self, conversation_id):
@@ -459,8 +480,8 @@ class Trainer:
         if not prev:
             return
         first = prev[0]
-        for k in ("code_sha256", "splits_sha256", "judge_adapter_sha256", "init_adapter_sha256"):
-            if first[k] != row[k] and not self.a.allow_code_change:
+        for k in ("code_sha256", "splits_sha256", "judge_adapter_sha256", "init_adapter_sha256", "config_file_sha256"):
+            if first.get(k) != row.get(k) and not self.a.allow_code_change:
                 raise SystemExit("provenance mismatch on resume (%s); rerun in a new --out or pass --allow-code-change" % k)
         for k in sorted(set(first["config"]["args"]) | set(row["config"]["args"])):
             if k in RESUME_MAY_CHANGE:
@@ -597,6 +618,7 @@ class Trainer:
         Planner decisions from the state the current policy reaches greedily; reward 1 when
         end_session agrees with the real person (the real last message is the only positive)."""
         a, pv, psha = self.a, u - 1, self.learner.policy_sha()
+        self.t1_skipped_capped = 0
         if a.task1_convs <= 0:
             return []
         reuse = {}
@@ -623,7 +645,11 @@ class Trainer:
                 return rows
             prompts = self.env.task1_prompts(cid)
             assert len(prompts) == n
-            for t in missing:
+            capped_before = [t for t in missing if any(p.get("emitted_capped") for p in prompts[: t - 1])]
+            if capped_before:
+                with self.io_lock:
+                    self.t1_skipped_capped += len(capped_before)
+            for t in [t for t in missing if t not in capped_before]:
                 pr = prompts[t - 1]
                 assert pr["t"] == t and pr["real_final"] == (t == n)
                 smp = self.env.task1_sample(cid, t, pr["user_prompt"], pr["real_final"], a.G,
@@ -661,12 +687,15 @@ class Trainer:
         groups = [[row for row in grp if row["episode"]["clean"]] for grp in groups_all]
         n_unclean = sum(len(g0) - len(g1) for g0, g1 in zip(groups_all, groups))
         n_singletons = sum(1 for g in groups if len(g) == 1)       # a lone clean episode has no baseline
+        all_clean = [row["episode"] for grp in groups for row in grp]   # q: every clean rollout of this update
         groups = [g for g in groups if len(g) >= 2]
         clean_eps = [row["episode"] for grp in groups for row in grp]
+        # note: the G replicates of a group share the scenario seed (Speaker, act-RNG, few-shot draws), so
+        # only the sampled Planner (and R0) differ within a group: common random numbers, by design
         if not clean_eps:
             raise SystemExit("update %d: no clean episode (R0 / ledger judge failing?) -- stopping, not training on it" % u)
-        ctx = self.reward_ctx(clean_eps, cfg)
-        shadow_ctx = self.reward_ctx(clean_eps, self.selection_cfg)
+        ctx = self.reward_ctx(all_clean, cfg)
+        shadow_ctx = self.reward_ctx(all_clean, self.selection_cfg)
         samples, rewarded, rew_groups, stop_groups, shadow = [], [], [], [], []
         for grp in groups:
             rs, sp = [], []
@@ -733,6 +762,7 @@ class Trainer:
                        "end_at_final": (sum(x["ended_planner"] for x in fin) / len(fin)) if fin else None,
                        "end_at_nonfinal": (sum(x["ended_planner"] for x in mid) / len(mid)) if mid else None,
                        "n_not_decisions": sum(1 for x in t1_all if not x.get("decision_valid", True)),
+                       "n_skipped_capped_history": self.t1_skipped_capped,
                        "groups_skipped_zero_std": t1_skipped}
         assert all(s_["policy_version"] == pv for s_ in samples), "sample from another policy version"
         aux, w_aux = [], self.aux_weight(u, cfg)
@@ -748,7 +778,7 @@ class Trainer:
         agg = RR.aggregate(rewarded)
         tm = int(cfg["t_max"])
         turn_hist = [0] * (tm + 1)
-        for e in clean_eps:
+        for e in all_clean:
             turn_hist[min(max(int(e["emitted_user_turns"]), 0), tm)] += 1
         hist = {"update": u, "split": "train", "reward_version": cfg["version"], "task1_train": t1_hist, **agg,
                 "n_groups": len(groups), "n_groups_skipped_zero_std": skipped, "n_unclean_episodes": n_unclean,
@@ -758,7 +788,7 @@ class Trainer:
                 "aux_stats": {k: stats.get(k) for k in ("aux_n", "aux_loss", "aux_grad_norm", "aux_p_correct_before",
                                                          "aux_p_correct_end")},
                 **{k: stats.get(k) for k in ("loss", "kl", "ratio_mean", "clip_frac", "grad_norm", "n_tokens",
-                                              "value_mse", "ratio_init_maxdev")}}
+                                              "value_mse", "ratio_init_maxdev", "rl_grad_norm")}}
         self.history.append(hist)
         self.cfg = self.controller.propose(self.history)
         self.update_done = u
@@ -796,15 +826,20 @@ class Trainer:
 
         def run_val(job):
             cid, s = job
-            r = done.get((cid, s))
-            if r is None or r["policy_sha"] != psha:
+            r = done.get((cid, s))              # the latest attempt (later rows overwrite earlier ones)
+            if r is not None and r["policy_sha"] == psha and (r["episode"]["clean"] or r.get("attempt", 0) >= VAL_RETRIES):
+                return r
+            attempt = r.get("attempt", 0) + 1 if (r is not None and r["policy_sha"] == psha) else 0
+            while True:
                 ep = self.env.run_episode(cid, seed=s, replicate=0, planner_temperature=a.val_temperature,
                                           planner_top_p=a.val_top_p, record_generation=False)
                 r = {"kind": "episode", "update": u, "policy_sha": psha, "conversation_id": cid, "seed": s,
-                     "split": "validation", "episode": ep, "time": time.time()}
+                     "attempt": attempt, "split": "validation", "episode": ep, "time": time.time()}
                 with self.io_lock:
                     append_jsonl(self.p_val, r)
-            return r
+                if ep["clean"] or attempt >= VAL_RETRIES:
+                    return r
+                attempt += 1                    # an infrastructure incident, not the policy: run it again
 
         def run_t1(cid):
             r = done_t1.get(cid)
@@ -815,12 +850,15 @@ class Trainer:
                     append_jsonl(self.p_val, r)
             return r
 
+        if not hasattr(self.env, "run_task1"):
+            raise RuntimeError("validation needs Task 1 (run_task1): D2, task1_base and the selection score use it")
         workers = max(1, a.rollout_workers)
         with ThreadPoolExecutor(max_workers=workers) as ex:
             vrows = list(ex.map(run_val, jobs))
-            t1rows = list(ex.map(run_t1, sorted(self.split["validation"]))) if hasattr(self.env, "run_task1") else []
+            t1rows = list(ex.map(run_t1, sorted(self.split["validation"])))
         eps = [r["episode"] for r in vrows if r["episode"]["clean"]]
         n_unclean = len(vrows) - len(eps)
+        withheld = n_unclean > 0                # every checkpoint is scored on the SAME validation set, or not at all
         vctx = self.reward_ctx(eps, self.selection_cfg) if eps else None
         totals = [RR.reward(e, self.selection_cfg, vctx)["total"] for e in eps]
         score = sum(totals) / len(totals) if totals else float("nan")
@@ -831,7 +869,8 @@ class Trainer:
                           "human_turns_mean": sum(e["human_turns"] for e in eps) / len(eps),
                           "abs_diff_mean": sum(abs(x) for x in d) / len(d),
                           "coverage_mean": sum(float(e["coverage"]) for e in eps) / len(eps),
-                          "turn_w1": turn_w1([e["emitted_user_turns"] for e in eps], [e["human_turns"] for e in eps]),
+                          "turn_w1": turn_w1([e["emitted_user_turns"] for e in eps],
+                                             [min(int(e["human_turns"]), int(self.selection_cfg["t_max"])) for e in eps]),
                           "end_kinds": {k: sum(e["end_kind"] == k for e in eps) for k in sorted({e["end_kind"] for e in eps})}}
         t1 = T1.task1_stop_metrics([r["task1"] for r in t1rows]) if t1rows else None
         if t1 is not None and self.task1_base is None:
@@ -852,10 +891,12 @@ class Trainer:
         # the smoothing, so Task 2 is scored by the turn-count distribution W1 against the validation people
         # plus coverage; Task 1 by the M2 term_f1. The v4 validation reward is still logged (not selected on).
         sel = None
-        if turn_stats is not None and turn_stats.get("turn_w1") is not None:
+        if not withheld and turn_stats is not None and turn_stats.get("turn_w1") is not None:
             sel = (a.w_sel_cov * turn_stats["coverage_mean"] - a.w_sel_w1 * turn_stats["turn_w1"]
                    + (a.w_sel_task1 * t1["term_f1"] if t1 is not None else 0.0))
-        append_jsonl(self.p_val, {"kind": "summary", "update": u, "policy_sha": psha, "split": "validation",
+        summary = {"kind": "summary", "update": u, "policy_sha": psha, "split": "validation",
+                                  "selection_withheld": "unclean validation episode(s) after %d re-runs" % VAL_RETRIES
+                                  if withheld else None,
                                   "validation_s": round(time.time() - _tv, 1),
                                   "n_episodes": len(totals), "n_unclean_episodes": n_unclean,
                                   "val_temperature": a.val_temperature, "val_seeds": a.val_seeds,
@@ -865,7 +906,7 @@ class Trainer:
                                   "selection_score": sel, "w_sel_task1": a.w_sel_task1,
                                   "w_sel_w1": a.w_sel_w1, "w_sel_cov": a.w_sel_cov,
                                   "selection_formula": "w_sel_cov*coverage_mean - w_sel_w1*turn_w1 + w_sel_task1*task1.term_f1",
-                                  "selection_cfg_sha256": RR.cfg_sha(self.selection_cfg), "time": time.time()})
+                                  "selection_cfg_sha256": RR.cfg_sha(self.selection_cfg), "time": time.time()}
         if sel is not None and (self.best is None or sel > self.best["selection_score"]):
             self.best = {"update": u, "checkpoint": os.path.relpath(self.ckpt_dir(u), a.out).replace("\\", "/"),
                          "policy_sha": psha, "mean_reward_selection": score, "selection_score": sel,
@@ -876,6 +917,7 @@ class Trainer:
             st = json.load(open(sp))
             st["best"] = self.best
             write_json_atomic(sp, st)
+        append_jsonl(self.p_val, summary)
 
     # -------------------------------------------------------- main loop
     def run(self):
@@ -994,9 +1036,22 @@ def parse_args(argv=None):
     if a.planner_path and "Qwen3-4B-Instruct-2507" not in a.planner_path:
         off["planner_path"] = a.planner_path          # the spec's Planner is Qwen3-4B-Instruct-2507
     if a.config:
-        ver = (json.load(open(a.config, encoding="utf-8")).get("reward") or {}).get("version", "v4")
-        if ver != "v4":
-            off["reward.version"] = ver
+        cj = json.load(open(a.config, encoding="utf-8"))
+        for sect in ("reward", "algo", "llm", "dual"):
+            if cj.get(sect):
+                off["config." + sect] = cj[sect]            # any override of the declared defaults
+    for k, want in (("stop_credit", 1), ("kl", RC.TRAIN_DEFAULTS["kl_coef"]), ("val_temperature", 0.7),
+                    ("stop_sup_anneal", 10), ("algo", "grpo")):
+        if getattr(a, k) != want:
+            off[k] = getattr(a, k)
+    if sorted(a.val_seeds) != [0, 1]:
+        off["val_seeds"] = a.val_seeds
+    if a.task1_convs <= 0:
+        off["task1_convs"] = a.task1_convs
+    if a.stop_sup_weight == 0:
+        off["stop_sup_weight"] = 0.0
+    elif not (0.01 <= a.stop_sup_weight <= 5.0):
+        ap.error("--stop-sup-weight must be 0 (off) or within the controller bounds [0.01, 5]")
     if off and not a.ablation:
         ap.error("settings %r differ from the pend spec %r; name the ablation with --ablation" % (off, SPEC))
     if not (a.val_temperature > 0):

@@ -402,6 +402,8 @@ def read_plan_pend(raw, turn, scenario, rng, ledger):
             if not isinstance(e, dict):
                 continue
             mv, ac = acts.normalise(str(e.get("move", "")), str(e.get("act", "")))
+            if ac == "other" and str(e.get("act", "")).strip().lower() != "other":
+                continue                    # malformed entry: dropped, as E1.6 sample_act drops it
             try:
                 p = float(e.get("p", 0) or 0)
             except (TypeError, ValueError):

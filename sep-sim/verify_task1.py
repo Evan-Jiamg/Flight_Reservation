@@ -97,6 +97,7 @@ def main(argv=None):
     pb = desc.get("planner_budget", F.PLANNER_BUDGET)
     sb = desc.get("speaker_budget", F.SPEAKER_BUDGET)
     n_steps = n_hit = n_unp = n_cand = n_cand_hit = n_first_dup = 0
+    n_end_no_complete = n_complete_kept = 0
     for cid, rs in by.items():
         users, _ = pipeline.split_messages(recs[cid])
         n = len(users)
@@ -106,6 +107,16 @@ def main(argv=None):
         rep.ok("structure", len(kk) == 1 and kk[0]["turn_index"] == n + 1, "%s K+1 rows %d" % (cid[:10], len(kk)))
         for r in kk:                                   # the K+1 turn is generated like any other: same checks
             w = "%s K+1" % cid[:10]
+            reasons = r.get("guard_reasons") or []
+            elig = [i for i, x in enumerate(reasons) if not x]
+            if elig and r.get("selected_index") is not None:
+                rep.ok("selection", r["selected_index"] in elig, "%s selected %s not in eligible %s" % (w, r["selected_index"], elig))
+            for slot in (r.get("fewshot") or []):
+                for ex_cid, _ in slot:
+                    rep.ok("leakage.fewshot", ex_cid != cid and ex_cid not in forbidden
+                           and goal_of.get(ex_cid) is not None and goal_of.get(ex_cid) != goal_of.get(cid)
+                           and persona_of.get(ex_cid) is not None and persona_of.get(ex_cid) != persona_of.get(cid),
+                           "%s example %s: same conversation/goal/persona, no ids, or validation/test" % (w, ex_cid[:10]))
             pt = r.get("planner_prompt_tokens")
             rep.ok("trunc.planner", pt is not None and pt <= pb, "%s prompt %s > %s" % (w, pt, pb))
             sf = r.get("speaker_fit") or {}
@@ -134,7 +145,12 @@ def main(argv=None):
             rep.ok("trunc.planner", pt is not None and pt <= pb, "%s prompt %s > %s" % (w, pt, pb))
             sf = r.get("speaker_fit") or {}
             stoks = sf.get("final_tokens") if sf.get("compacted") else sf.get("original_tokens")
-            rep.ok("trunc.speaker", stoks is None or stoks <= sb, "%s speaker prompt %s > %s" % (w, stoks, sb))
+            rep.ok("trunc.speaker", stoks is not None and stoks <= sb, "%s speaker prompt %s > %s" % (w, stoks, sb))
+            rep.ok("planner_cap", not (r.get("planner_hit_max_new") and r.get("planner_ends_session")),
+                   "%s a Planner output cut by the cap ended the session" % w)
+            d = r.get("planner_diag") or {}
+            n_end_no_complete += bool(d.get("end_without_complete_entry"))
+            n_complete_kept += bool(d.get("complete_kept_no_alternative"))
             hits = r.get("speaker_hit_max_new")
             rep.ok("trunc.speaker_recorded", isinstance(hits, list) and all(h is not None for h in hits),
                    "%s speaker cap hits not recorded" % w)
@@ -149,8 +165,8 @@ def main(argv=None):
                        w, r.get("greedy_ended"), r.get("speaker_ended"), prev_dec))
             se = r.get("samples_speaker_ended")
             if isinstance(se, list):
-                rep.ok("M2", [bool(x) or prev_dec for x in se] == [bool(x) for x in (r.get("samples_ended") or [])],
-                       "%s samples_ended does not follow M2" % w)
+                rep.ok("M2", [bool(x) for x in se] == [bool(x) for x in (r.get("samples_ended") or [])],
+                       "%s samples_ended must be the Speaker flags (E1.6 convention)" % w)
             prev_dec = bool(r.get("planner_ends_session"))
             rep.ok("planner_diag", isinstance(r.get("planner_diag"), dict), "%s planner_diag missing" % w)
             check_fits(rep, w, r, pb, sb)
@@ -186,6 +202,10 @@ def main(argv=None):
         rep.warn.append("Speaker cap hits on %d of %d candidates" % (n_cand_hit, n_cand))
     if n_first_dup:
         rep.warn.append("duplicate first-turn candidates left: %d" % n_first_dup)
+    if n_end_no_complete:
+        rep.warn.append("end_session without a Complete entry (drawn act kept): %d" % n_end_no_complete)
+    if n_complete_kept:
+        rep.warn.append("Complete act kept while not ending (no alternative entry): %d" % n_complete_kept)
     print("conversations %d, rows %d, K+1 rows %d; implicit_profile %s, fewshot %s, selector %s" % (
         len(by), len(rows), len(k1), desc.get("implicit_profile"), desc.get("fewshot"), desc.get("selector")))
     for x in rep.warn:

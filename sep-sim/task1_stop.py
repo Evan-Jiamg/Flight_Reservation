@@ -31,7 +31,7 @@ def bench_flags(rows, k1_blank=False):
 
 
 def task1_stop_metrics(convs):
-    tp = fp = fn = rows_n = unparsed = premature = 0
+    tp = fp = fn = rows_n = unparsed = premature = capped = 0
     dtp = dfp = dfn = 0
     for c in convs:
         rows = c["turns"] if isinstance(c, dict) else c
@@ -50,6 +50,7 @@ def task1_stop_metrics(convs):
         rows_n += n
         for r in rows:
             unparsed += bool(r.get("planner_unparsed"))
+            capped += bool(r.get("emitted_capped"))
             e, f = bool(r["ended_planner"]), bool(r["real_final"])
             dtp += e and f
             dfp += e and not f
@@ -62,7 +63,7 @@ def task1_stop_metrics(convs):
             "term_f1": (2 * tp / den) if den else 0.0,
             "premature_end_rate": fp / rows_n, "premature": premature / k, "k1_end_rate": tp / k,
             "decision_f1": (2 * dtp / dden) if dden else 0.0,
-            "unparsed_rate": unparsed / rows_n}
+            "unparsed_rate": unparsed / rows_n, "n_emitted_capped_turns": capped}
 
 
 def within_tolerance(metrics, base, tol):
