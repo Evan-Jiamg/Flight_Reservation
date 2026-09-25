@@ -286,10 +286,18 @@ def rules_block_pend():
     ])
 
 
-def system_prompt_pend():
+CRITIQUE_FIELD = '"critique": "<one sentence on what your previous state got wrong, judged against what happened>",\n'
+PROFILE_NOTE_FIELD = (' "profile_note": "<one or two sentences: how THIS person\'s writing differs from the message you '
+                      'last produced for them (length, tone, phrasing, what they ask) and what to do differently; '
+                      'empty on their first message>",\n')
+
+
+def system_prompt_pend(implicit_profile=False):
     s = system_prompt_v3()
     s = _replace_once(s, rules_block_v3(), rules_block_pend())
     s = _replace_once(s, NEW_STOP_FIELDS, NEW_STOP_FIELDS_PEND)
+    if implicit_profile:
+        s = _replace_once(s, CRITIQUE_FIELD, CRITIQUE_FIELD + PROFILE_NOTE_FIELD)
     return s
 
 
@@ -307,8 +315,10 @@ def goal_lines(scenario):
     return "\n".join(out)
 
 
-def user_prompt_pend(scenario, prev_block, hist_u, hist_a, turn, ledger, prev_ann=None):
-    """user_prompt_v3 without the GOAL STATUS block, with the full goal under WHAT THEY CAME FOR."""
+def user_prompt_pend(scenario, prev_block, hist_u, hist_a, turn, ledger, prev_ann=None, ip_sections=""):
+    """user_prompt_v3 without the GOAL STATUS block, with the full goal under WHAT THEY CAME FOR, and
+    (optionally) the Implicit Profile sections placed in the static prefix right before the turn line,
+    so prompt fitting never drops them."""
     marker = "\n\nGOAL STATUS"
     up = user_prompt_v3(scenario, prev_block, hist_u, hist_a, turn, ledger,
                         {"status": "NOT ASSESSED", "unmet": []}, prev_ann=prev_ann)
@@ -320,6 +330,12 @@ def user_prompt_pend(scenario, prev_block, hist_u, hist_a, turn, ledger, prev_an
     if extra:
         old = "\n\nWHAT THEY CAME FOR\n" + topic + "\n\n"
         up = _replace_once(up, old, "\n\nWHAT THEY CAME FOR\n" + topic + "\n" + extra + "\n\n")
+    if ip_sections:
+        static = up.split("\n\nTHE CONVERSATION SO FAR\n", 1)[0]
+        if static.count(ANCHOR) != 1:
+            raise ValueError("turn anchor must occur exactly once in the static prefix")
+        i = up.find(ANCHOR)
+        up = up[:i] + ip_sections + up[i:]
     return up
 
 
@@ -339,6 +355,7 @@ def read_plan_pend(raw, turn, scenario, rng, ledger):
     diag["goal_met_raw"] = d.get("goal_met")
     sw = " ".join(str(d.get("still_wanted", "") or "").split())
     fields["still_wanted"] = sw
+    fields["profile_note"] = " ".join(str(d.get("profile_note", "") or "").split())[:400]
     if end:
         comp = []
         for e in (d.get("act_distribution") or []):

@@ -62,6 +62,18 @@ TREE_E16 = "/tmp2/mzjiang_usersim/grpo_planner/trees/e1r_cf19400"
 TREE = TREE_V2FIX
 
 
+FOLDS_GP = os.path.join("/tmp2/hchsu/trec2026-usersim-benchmark", "domains/main_dataset_search/folds3_goal_persona_v1.json")
+
+
+def make_fewshot_pool(recs_by_cid, allowed, folds_path=FOLDS_GP):
+    """Few-shot pool over the allowed conversations; goal/persona ids from the benchmark's fold manifest
+    (every selection excludes the current conversation and those sharing its goal or persona)."""
+    import implicit_profile as IP
+    from sepsim import pipeline
+    F = json.load(open(folds_path, encoding="utf-8"))
+    return IP.FewShotPool(recs_by_cid, allowed, F["goal_of"], F["persona_of"], pipeline.split_messages)
+
+
 def tree_of(arm):
     return TREE_E16 if arm in E16_ARMS else TREE_V2FIX
 WORK = "/tmp2/mzjiang_usersim/task2"
@@ -280,7 +292,7 @@ class PlannerLM:
 
 class Task2Env:
     def __init__(self, arm, gpu, planner, judge=None, ditto_path=DITTO, corpus="/home/mzjiang/v5-latency/data.jsonl",
-                 batch=False, max_batch=8):
+                 batch=False, max_batch=8, implicit_profile=False, fewshot_pool=None):
         if arm not in ARM_ENV:
             raise ValueError(arm)
         if arm in V3_ARMS and judge is None:
@@ -307,8 +319,12 @@ class Task2Env:
                     run_v2.AGENDA_CORROB) == (arm == "e16", True, True, False, False), "E1.6 runner switches"
             assert _pl.prior_annotations([{"annotations": {"x": 1}}], 2) == {}, "NO_ANN did not bind"
         self.arm, self.gpu, self.planner, self.judge = arm, gpu, planner, judge
+        # Implicit Profile + Speaker few-shot (implicit_profile.py); pend arm only, off by default
+        if (implicit_profile or fewshot_pool is not None) and arm != "pend":
+            raise ValueError("the Implicit Profile is implemented for the pend arm")
+        self.ip, self.fewshot = bool(implicit_profile), fewshot_pool
         if arm == "pend":
-            self.system = V3.system_prompt_pend()
+            self.system = V3.system_prompt_pend(implicit_profile=self.ip)
             assert '"goal_met"' in self.system and '"last_reply_helpful"' not in self.system
         else:
             self.system = V3.system_prompt_v3() if arm in V3_ARMS else PP.system_prompt()
@@ -398,6 +414,7 @@ class Task2Env:
                 "ledger_judge_min_tokens": self.ledger_judge.floor, "ledger_judge_empty": self.ledger_judge.n_empty,
                 "act_prior": os.environ["SEPSIM_ACT_PRIOR"], "v2fix": V2FIX, "t_max": T_MAX,
                 "tree": tree_of(self.arm), "arm_env": ARM_ENV[self.arm], "t1_sampling": self.t1_sampling,
+                "implicit_profile": self.ip, "fewshot": self.fewshot.describe() if self.fewshot else None,
                 "batching": None if self.planner_batcher is None else {
                     "planner": self.planner_batcher.max_batch, "speaker": self.speaker_batcher.max_batch}}
 
@@ -422,7 +439,8 @@ class Task2Env:
                                              str((scenario.get("goal") or {}).get("context", ""))]), 8))
         ledger = Ledger(self.reqs[conversation_id]["req"], judge=self.ledger_judge) if with_ledger else None
         S = {"hist_u": [], "hist_a": [], "prev_block": state.d0(P.initial_stage(scenario.get("goal"))),
-             "block": None, "cov": []}
+             "block": None, "cov": [], "mode": "task2", "ip_notes": [], "ip_ctx": None}
+        import implicit_profile as IP
 
         def speak(t):
             hist_u, hist_a = S["hist_u"], S["hist_a"]
@@ -437,7 +455,12 @@ class Task2Env:
                 up = V3.user_prompt_v3(scenario, S["prev_block"], hist_u, hist_a, t, led,
                                        {"status": gs["status"], "unmet": gs.get("unmet", [])}, prev_ann={})
             elif arm == "pend":
-                up = V3.user_prompt_pend(scenario, S["prev_block"], hist_u, hist_a, t, led, prev_ann={})
+                ip_sec = ""
+                if self.ip:
+                    ctx = S["ip_ctx"] if S["mode"] == "task1" else ({"mode": "task2"} if t >= 2 else None)
+                    ip_sec = IP.render_planner_sections(S["ip_notes"], ctx)
+                up = V3.user_prompt_pend(scenario, S["prev_block"], hist_u, hist_a, t, led, prev_ann={},
+                                         ip_sections=ip_sec)
             else:
                 up = PP.user_prompt(scenario, S["prev_block"], hist_u, hist_a, t, ledger=led,
                                     prev_ann={}, agenda_view=ag.render(), p_end=None)
@@ -468,12 +491,20 @@ class Task2Env:
             if unparsed:
                 fields = {"move": "Other", "act": "other"}
             ended = bool(end_session) if (v3 or arm == "pend") else bool(state.ends_session(fields))
+            note = ""
+            if self.ip and t >= 2 and not unparsed:
+                note = IP.clean_note(fields.get("profile_note"))
+                if note:
+                    S["ip_notes"].append(note)
+            examples = self.fewshot.select(conversation_id, scenario.get("persona"), t) if self.fewshot else []
             base = {"planner_prompt": g["prompt_text"], "planner_fit": g["fit"], "planner_raw": raw,
                     "planner_hit_max_new": g["hit_max_new"], "planner_diag": diag,
                     "planner_unparsed": unparsed, "ended_planner": ended,
                     "move": fields.get("move", ""), "act": fields.get("act", ""),
                     "stop_rule": fields.get("stop_rule", "none"), "goal_status": gs, "self_judge": self_judge,
                     "goal_met": fields.get("goal_met"), "still_wanted": fields.get("still_wanted"),
+                    "profile_note": note if self.ip else None, "ip_notes_n": len(S["ip_notes"]) if self.ip else None,
+                    "fewshot": [[e["cid"], e["t"]] for e in examples] if self.fewshot else None,
                     "ledger_before": {"turns": led.turns, "gain_trace": list(led.gain_trace)}}
             if record_generation:
                 base["planner_gen"] = {"prompt_ids": g["prompt_ids"], "gen_ids": g["gen_ids"], "stop_mask": planner.stop_mask(g["gen_ids"]),
@@ -486,6 +517,8 @@ class Task2Env:
                 block = V3.speaker_block_v3(fields, gs)
             elif arm == "pend":
                 block = V3.speaker_block_pend(fields)
+                if self.ip or examples:
+                    block += IP.speaker_lines(S["ip_notes"] if self.ip else [], examples)
             else:
                 block = PP.render_block(fields, ag.render())
             S["block"] = block
@@ -510,13 +543,20 @@ class Task2Env:
             cands, flags = [x[0] for x in first], [x[1] for x in first]
             reasons, n_extra, eligible = None, 0, None
             if run_v2.GUARDS_ON:
-                reasons = [run_v2.guard_reason(c, prior) for c in cands]
+                def reason_of(c):
+                    r = run_v2.guard_reason(c, prior)
+                    if not r and examples and IP.copies_example(c, examples):
+                        r = "fewshot_copy"      # a run of >= COPY_NGRAM words from another person's message
+                    if not r and (self.ip or examples) and IP.leaks_scaffold(c):
+                        r = "template"          # the new block lines leaked into the message
+                    return r
+                reasons = [reason_of(c) for c in cands]
                 while all(reasons) and n_extra < run_v2.REDRAW:
                     k = run_v2.NSAMP + n_extra
                     sx, ex, _ = self._say_many([req(pipeline.seed_for(sid, t, k + 1), T_S, P_S)])[0]
                     cands.append(sx)
                     flags.append(ex)
-                    reasons.append(run_v2.guard_reason(sx, prior))
+                    reasons.append(reason_of(sx))
                     n_extra += 1
                 eligible = [i for i, r in enumerate(reasons) if not r] or None
             idx = run_v2.choose(cands, fields.get("length_words"), None, eligible)
@@ -583,13 +623,19 @@ class Task2Env:
         PLANNER_END records it). The history at turn t is always the real one; the Planner's own state
         carries over, as in run_v2. Planner at temperature 0. No R0, no ledger."""
         from sepsim import agenda as AG, pipeline
+        import implicit_profile as IP
         ss = self._session(conversation_id, seed, 0, 0.0, 1.0, False, with_ledger=False)
         S, speak, led, ag = ss["S"], ss["speak"], ss["led"], ss["ag"]
+        S["mode"] = "task1"
         rec = self.recs[conversation_id]
         users, agents = pipeline.split_messages(rec)
+        real = [u["text"] for u in users]
+        preds = []
         goal = rec["scenario"].get("goal") or {}
         rows = []
         for t in range(1, len(users) + 1):
+            # only message t-1 (prediction and real text) may inform turn t
+            S["ip_ctx"] = IP.task1_context(real[: t - 1], preds, t) if self.ip else None
             st = speak(t)
             if st.get("planner_stop"):
                 raise RuntimeError("silent Planner exit has no Task 1 utterance; use an emit-end arm")
@@ -605,7 +651,10 @@ class Task2Env:
                          "move": st.get("move"), "act": st.get("act"), "goal_met": st.get("goal_met"),
                          "planner_unparsed": st.get("planner_unparsed"), "planner_hit_max_new": st.get("planner_hit_max_new"),
                          "planner_fit": st.get("planner_fit"), "speaker_fit": st.get("speaker_fit"),
-                         "guard_no_survivor": st.get("no_survivor"), "planner_adapter": self.planner.adapter})
+                         "guard_no_survivor": st.get("no_survivor"), "planner_adapter": self.planner.adapter,
+                         "profile_note": st.get("profile_note"), "ip_notes_n": st.get("ip_notes_n"),
+                         "fewshot": st.get("fewshot")})
+            preds.append(st["user"])
             # teacher forcing: the REAL message and the REAL assistant reply enter the history
             S["hist_u"].append(users[t - 1]["text"])
             if t - 1 < len(agents):
@@ -620,6 +669,7 @@ class Task2Env:
         # K+1 probe (the benchmark's termination measurement): after the real person's last message
         # and whatever reply followed it, one more turn; ended = Speaker end OR Planner end (E1 semantics)
         k = len(users)
+        S["ip_ctx"] = IP.task1_context(real[:k], preds, k + 1) if self.ip else None
         st = speak(k + 1)
         if st.get("planner_stop"):
             raise RuntimeError("silent Planner exit has no Task 1 utterance; use an emit-end arm")
@@ -685,6 +735,9 @@ class Task2Env:
         Planner's alone in this architecture."""
         if self.arm != "pend":
             raise ValueError("run_task1 is implemented for the pend arm")
+        if self.ip or self.fewshot:
+            raise NotImplementedError("Planner-only Task 1 has no predictions for the Implicit Profile; "
+                                      "use task1_generate")
         from sepsim import persona as P, pipeline, state, stopping
         import planner_prompt_v3 as V3
         rec = self.recs[conversation_id]

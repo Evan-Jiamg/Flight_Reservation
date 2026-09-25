@@ -40,6 +40,10 @@ def main(argv=None):
     ap.add_argument("--planner-adapter", default="")
     ap.add_argument("--gpu", type=int, default=1)
     ap.add_argument("--workers", type=int, default=4)
+    ap.add_argument("--implicit-profile", type=int, choices=(0, 1), default=0)
+    ap.add_argument("--fewshot", choices=("off", "loo", "fold"), default="off",
+                    help="loo: all finished sessions (leave-one-out: never the same conversation, goal or persona); "
+                         "fold: splits[fold].train_all only")
     ap.add_argument("--batch", type=int, choices=(0, 1), default=1)
     ap.add_argument("--max-batch", type=int, default=8)
     ap.add_argument("--out", required=True, help="generations .jsonl")
@@ -48,13 +52,25 @@ def main(argv=None):
     a = ap.parse_args(argv)
     if a.sessions == "fold-test" and not a.final:
         raise SystemExit("LEAK GATE: the test sessions need --final (method frozen)")
-    from task2_env import Task2Env, PlannerLM, setup_environment
+    from task2_env import Task2Env, PlannerLM, setup_environment, make_fewshot_pool
     setup_environment("pend")
     from sepsim import pipeline
     planner = PlannerLM(a.planner_path, a.gpu, adapter=a.planner_adapter or None)
-    env = Task2Env("pend", a.gpu, planner, judge=None, batch=bool(a.batch), max_batch=a.max_batch)
+    env = Task2Env("pend", a.gpu, planner, judge=None, batch=bool(a.batch), max_batch=a.max_batch,
+                   implicit_profile=bool(a.implicit_profile))
     finished = [cid for cid, r in env.recs.items()
                 if any(m.get("is_final") is True for m in r.get("chat_messages", []))]
+    if a.fewshot == "loo":
+        if a.sessions != "all":
+            raise SystemExit("--fewshot loo is for --sessions all; fold runs use --fewshot fold")
+        env.fewshot = make_fewshot_pool(env.recs, finished)
+    elif a.fewshot == "fold":
+        if a.fold < 0:
+            raise SystemExit("--fewshot fold needs --fold")
+        spf = [x for x in json.load(open(a.splits, encoding="utf-8"))["folds"] if x["fold"] == a.fold][0]
+        env.fewshot = make_fewshot_pool(env.recs, spf["train_all"])
+        forb = set(spf["forbidden_for_training"])
+        assert not set(spf["train_all"]) & forb, "few-shot pool intersects validation/test"
     if a.sessions == "all":
         cids = sorted(finished)
         if a.planner_adapter:
@@ -94,7 +110,8 @@ def main(argv=None):
     lock = threading.Lock()
     meta = {"describe": env.describe(), "sessions": a.sessions, "fold": a.fold, "n_sessions": len(cids),
             "code_sha256": {n: sha_file(os.path.join(HERE, n)) for n in
-                            ("task1_v4.py", "task2_env.py", "planner_prompt_v3.py", "fit_prompts.py", "ditto_e16.py")},
+                            ("task1_v4.py", "task2_env.py", "planner_prompt_v3.py", "fit_prompts.py", "ditto_e16.py",
+                             "implicit_profile.py", "batching.py")},
             "started": time.strftime("%Y-%m-%d %H:%M:%S")}
     json.dump(meta, open(a.out + ".meta.json", "w"), indent=1)
     t0 = time.time()
