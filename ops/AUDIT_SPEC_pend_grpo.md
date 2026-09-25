@@ -39,7 +39,9 @@ behaviour is also a finding ("unauthorised design change").
   conversation and every conversation sharing its goal or persona. Pool: fold runs =
   splits[fold].train_all; whole-corpus run = leave-one-out. Each candidate slot gets its own
   examples. Copying ≥ 8 consecutive words of an example = guard failure. Approved constants:
-  k = 3, COPY_NGRAM = 8, duplicate redraw rounds = 4.
+  k = 3, COPY_NGRAM = 8, duplicate redraw rounds = 4. Also approved (2026-09-26): at turn 1 the
+  examples prefer other people's FIRST messages (later turns: non-first messages); a candidate
+  that writes our block headers / "profile_note" into the message is rejected ("template" guard).
 
 ## Candidates + Selector
 - 4 candidates per turn (greedy + 3 samples at T 0.7 / top-p 0.9; turn 1 all sampled at the Ditto
@@ -71,13 +73,19 @@ behaviour is also a finding ("unauthorised design change").
   fixed (user, option B): initial value --stop-sup-weight, then tuned by the v4 LLM controller
   (same factors / bounds [0.01, 5] / rollback) from TRAIN statistics (aux loss, aux vs RL gradient
   norm, Task 1 train accuracy); effective weight = w_aux x anneal; w_aux = 0 stays off.
+  The aux loss is normalised like the GRPO loss: by the number of GENERATED tokens of the
+  generations its values belong to (approved 2026-09-26; the v8 smoke measured the aux gradient at
+  ~1400x the RL gradient when it was divided by the 1-2 target tokens).
 - KL 0.04, LoRA r16. Episodes with a cut R0 reply / lost ledger verdict / emitted capped message
   never enter reward groups.
 - Controller: reuse the existing LLM controller adapted to v4 (discrete factors {0.5, 0.8, 1,
   1.25, 2} with bounds, every 5 updates, summarised TRAIN stats only, fixed-weight shadow reward,
   rollback after 2 worse points, local gpt-oss). No novelty needed; NO baselines/control groups now.
 - D5: validation Task 2 with the SAMPLED Planner (T 0.7, seeds 0 and 1); Task 1 greedy.
-  Selection = validation reward (fixed cfg0) + w·validation Task 1 term_f1. Turn W1 reported.
+  Checkpoint selection (approved 2026-09-26) = w_sel_cov·validation coverage − w_sel_w1·W1(validation
+  simulated turn counts, validation people's turn counts) + w_sel_task1·validation Task 1 term_f1
+  (M2), weights default 1, all logged; the v4 validation reward is logged but not selected on.
+  Task 1 validation during training = splits[fold].validation (the 4 sessions; not validation_all).
 - D6: fold 2 first.
 
 ## Data

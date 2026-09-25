@@ -403,7 +403,12 @@ class TorchLearner:
             # auxiliary stop-token supervision (after the on-policy GRPO steps, so it never touches the
             # ratio check): -log p(the human's end_session value | prompt + the policy's own prefix)
             _set_mode(self.model, self.acfg["forward_mode"])
-            n_t = sum(len(x["target_ids"]) for x in aux)
+            # normalised like the GRPO loss: by the number of GENERATED tokens of the generations these values
+            # belong to (not by the 1-2 target tokens, which made the aux gradient ~1400x the RL gradient in the
+            # v8 smoke); w_aux is then a relative weight, tuned by the LLM controller
+            if any("gen_len" not in x for x in aux):
+                raise ValueError("aux example without gen_len: cannot normalise like the GRPO loss")
+            n_t = sum(int(x["gen_len"]) for x in aux)
             p_before = []
             for x in aux:
                 lp, _ = token_logprobs(self.model, list(x["prompt_ids"]) + list(x["prefix_ids"]),

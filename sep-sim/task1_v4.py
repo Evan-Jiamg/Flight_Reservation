@@ -164,7 +164,7 @@ def main(argv=None):
         if old.get("settings") != settings or old.get("code_sha256") != code:
             raise SystemExit("resume refused: %s was written with other settings or code; use a new --out" % a.out)
     meta = {"describe": env.describe(), "sessions": a.sessions, "fold": a.fold, "n_sessions": len(cids),
-            "session_ids": list(cids),
+            "session_ids": list(cids), "limit": a.limit,
             "settings": settings, "code_sha256": code, "started": time.strftime("%Y-%m-%d %H:%M:%S")}
     json.dump(meta, open(mp, "w"), indent=1)
     t0 = time.time()

@@ -203,7 +203,7 @@ def main():
     cut = int(lp1.argmin())                      # an uncertain token (a certain one has no gradient)
     assert float(lp1[cut]) < -0.05, float(lp1[cut])
     x = {"prompt_ids": s1["prompt_ids"], "prefix_ids": s1["gen_ids"][:cut], "target_ids": s1["gen_ids"][cut:cut + 1],
-         "want_end": True, "weight": 1.0}
+         "want_end": True, "weight": 1.0, "gen_len": len(s1["gen_ids"])}
     lp_b = RA.token_logprobs(model, list(x["prompt_ids"]) + list(x["prefix_ids"]), x["target_ids"], 1.0)[0].sum().item()
     lr11 = RA.TorchLearner(model, "grpo", {}, lr=1e-4, seed=0)
     st11 = lr11.update([], {"lr": 1e-4, "kl_coef": 0.0}, seed=7, aux=[x])

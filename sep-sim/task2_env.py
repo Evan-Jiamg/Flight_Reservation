@@ -27,6 +27,7 @@ import os
 import random
 import sys
 import threading
+import time
 
 V2FIX = {
     "SEPSIM_ANTILEAK": "1", "SEPSIM_NEARCOPY": "1", "SEPSIM_COPY_SCOPE": "both",
@@ -475,7 +476,10 @@ class PlannerLM:
         if new == span and not re.search(r"(?i)true|false", span):
             return None
         ids = self.tok(new, add_special_tokens=False)["input_ids"]
-        return {"prefix_ids": list(gen_ids[:i]), "target_ids": list(ids), "want_end": bool(want_end)}
+        # gen_len: the length of the whole generation this value belongs to -- the aux loss is normalised per
+        # generated token exactly like the GRPO loss (user decision 2026-09-26)
+        return {"prefix_ids": list(gen_ids[:i]), "target_ids": list(ids), "want_end": bool(want_end),
+                "gen_len": len(gen_ids)}
 
     def generate(self, system, user, temperature=0.0, top_p=1.0, seed=0):
         import torch
@@ -681,7 +685,7 @@ class Task2Env:
                                              str((scenario.get("goal") or {}).get("context", ""))]), 8))
         ledger = Ledger(self.reqs[conversation_id]["req"], judge=self.ledger_judge) if with_ledger else None
         S = {"hist_u": [], "hist_a": [], "prev_block": state.d0(P.initial_stage(scenario.get("goal"))),
-             "block": None, "cov": [], "mode": "task2", "ip_notes": [], "ip_ctx": None, "ip_last_note": None}
+             "block": None, "cov": [], "mode": "task2", "ip_notes": [], "ip_ctx": None, "ip_last_note": None, "resp_t": {}}
         import implicit_profile as IP
 
         def speak(t):
@@ -707,7 +711,9 @@ class Task2Env:
                 up = PP.user_prompt(scenario, S["prev_block"], hist_u, hist_a, t, ledger=led,
                                     prev_ann={}, agenda_view=ag.render(), p_end=None)
             pseed = int(hashlib.sha256(("%s|%d|%d|%d" % (sid, t, replicate, 7)).encode()).hexdigest()[:8], 16)
+            _t0 = time.time()
             g = self._plan(self.system, up, planner_temperature, planner_top_p, pseed)
+            planner_s = time.time() - _t0            # wall time incl. waiting for a batch / the GPU lock
             raw = g["raw"]
             self_judge = None
             if arm == "e16" and t >= 2:
@@ -753,7 +759,7 @@ class Task2Env:
                 if entry:
                     S["ip_notes"].append(entry)
             base = {"planner_prompt": g["prompt_text"], "planner_fit": g["fit"], "planner_raw": raw,
-                    "planner_hit_max_new": g["hit_max_new"], "planner_diag": diag,
+                    "planner_hit_max_new": g["hit_max_new"], "planner_diag": diag, "planner_s": round(planner_s, 2),
                     "planner_unparsed": unparsed, "ended_planner": ended,
                     "move": fields.get("move", ""), "act": fields.get("act", ""),
                     "stop_rule": fields.get("stop_rule", "none"), "goal_status": gs, "self_judge": self_judge,
@@ -781,8 +787,11 @@ class Task2Env:
             S["block"] = block
             if arm == "pend":
                 spk = block if unparsed else V3.speaker_block_pend(fields, last_line=True)
-                return self._pend_generate(base, block, fields, S, t, sid, sc_text, hist_u, hist_a,
-                                           conversation_id, scenario, unparsed, spk_block=spk)
+                _t0 = time.time()
+                res = self._pend_generate(base, block, fields, S, t, sid, sc_text, hist_u, hist_a,
+                                          conversation_id, scenario, unparsed, spk_block=spk)
+                res["speaker_s"] = round(time.time() - _t0, 2)   # all candidates, redraws, selector
+                return res
             examples = []
             # ---- generation block: line for line the same as rollout_stop_sft.py / run_v2 ----
             ANTILEAK, NEARCOPY = run_v2.ANTILEAK, run_v2.NEARCOPY
@@ -838,10 +847,13 @@ class Task2Env:
                 msgs.append({"role": "user", "content": u})
                 if i < len(S["hist_a"]):
                     msgs.append({"role": "assistant", "content": S["hist_a"][i]})
+            _t0 = time.time()
             reply = self.r0.reply(msgs)
+            _t1 = time.time()
             prev_reply = S["hist_a"][-1] if S["hist_a"] else ""
             S["hist_a"].append(reply)
             ledger.update(t, text, reply)
+            S["resp_t"][t] = {"r0_s": round(_t1 - _t0, 2), "ledger_s": round(time.time() - _t1, 2)}
             led.observe({}, reply, prev_reply)
             ag.retire_satisfied(reply, {})
             if AG.looks_like_new_offer(reply, prev_reply):
@@ -1018,6 +1030,7 @@ class Task2Env:
         for step in ep["trace"]:
             last = after.get(step["t"], last)
             step["coverage_after"], step["complete_after"] = last
+            step.update(S["resp_t"].get(step["t"], {}))
         return {"conversation_id": conversation_id, "record_id": rid, "seed": seed, "arm": arm,
                 "replicate": replicate, "speaker_kind": "ditto", "planner_path": planner.path,
                 "planner_adapter": planner.adapter, "planner_temperature": planner_temperature,

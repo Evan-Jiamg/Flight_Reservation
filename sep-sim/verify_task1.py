@@ -78,6 +78,9 @@ def main(argv=None):
     if a.fold >= 0 and meta.get("sessions") in ("fold-validation", "fold-test"):
         spx = [x for x in json.load(open(a.splits, encoding="utf-8"))["folds"] if x["fold"] == a.fold][0]
         want = sorted(spx["validation"] if meta["sessions"] == "fold-validation" else spx["test_all"])
+        if meta.get("limit"):
+            want = want[: int(meta["limit"])]           # a --limit run scores the first N sorted ids (smoke only)
+            rep.warn.append("limited run: %d of the split's sessions (not a result)" % len(want))
         rep.ok("structure", sorted(meta.get("session_ids") or []) == want,
                "scored ids are not splits[%d].%s" % (a.fold, "validation" if meta["sessions"] == "fold-validation" else "test_all"))
     if a.fold >= 0:

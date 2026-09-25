@@ -52,7 +52,7 @@ import task1_stop as T1  # noqa: E402
 CODE_FILES = ("train_planner_rl.py", "rl_reward.py", "rl_controllers.py", "rl_algos.py", "task2_env.py",
               "task2_episode.py", "goal_judge.py", "planner_prompt_v3.py", "fit_prompts.py", "ditto_e16.py",
               "task1_stop.py", "batching.py", "implicit_profile.py", "style_select.py")
-TIME_KEYS = ("time", "wall_s", "rollout_s", "update_s")
+TIME_KEYS = ("time", "wall_s", "rollout_s", "update_s", "timing", "validation_s")
 RESUME_MAY_CHANGE = ("resume", "allow_code_change", "updates", "rollout_workers", "gpu", "max_batch",
                      "keep_optimizer_last", "dry_run_crash_after_episodes")
 
@@ -330,7 +330,7 @@ def _fake_task1_sample(self, conversation_id, t, user_prompt, real_final, G, tem
                     "planner_gen": {"prompt_ids": [k, t], "gen_ids": [int(stop), 7], "stop_mask": [1, 0],
                                     "temperature": temperature, "top_p": top_p, "seed": g}})
     out[0]["aux"] = {"prompt_ids": [k, t], "prefix_ids": [], "target_ids": [int(bool(real_final))],
-                     "want_end": bool(real_final)}
+                     "want_end": bool(real_final), "gen_len": 2}
     return out
 
 
@@ -649,7 +649,9 @@ class Trainer:
     def one_update(self, u):
         t0 = time.time()
         cfg = copy.deepcopy(self.cfg)
+        _t = time.time()
         groups_all = self.rollouts(u)
+        timing = {"task2_rollouts_s": round(time.time() - _t, 1)}
         pv, psha = u - 1, self.learner.policy_sha()
         for grp in groups_all:
             for row in grp:
@@ -703,7 +705,9 @@ class Trainer:
                     samples.append(s_)
         # Task 1 stop groups (same policy version; one Planner step per sample). A sample that is not a
         # decision (unparsed / capped / no valid end_session) has reward 0 and no stop mask.
+        _t = time.time()
         t1rows = self.task1_rollouts(u)
+        timing["task1_groups_s"] = round(time.time() - _t, 1)
         t1_rewards = [[x["reward"] for x in r["samples"]] for r in t1rows]
         t1_advs, t1_skipped = RA.advantages_for_groups(t1_rewards, self.a.algo, self.acfg) if t1rows else ([], 0)
         for r, rs, ad in zip(t1rows, t1_rewards, t1_advs):
@@ -738,7 +742,9 @@ class Trainer:
                 if x is not None:
                     assert x["want_end"] == r["real_final"], "stop-supervision label disagrees with the human"
                     aux.append(dict(x, weight=w_aux))
+        _t = time.time()
         stats = self.learner.update(samples, cfg, seed=seed_of(self.a.seed, "update", u), aux=aux or None)
+        timing["learner_s"] = round(time.time() - _t, 1)
         agg = RR.aggregate(rewarded)
         tm = int(cfg["t_max"])
         turn_hist = [0] * (tm + 1)
@@ -760,6 +766,7 @@ class Trainer:
                "controller": self.a.controller, "cfg_used": cfg, "cfg_used_sha256": RR.cfg_sha(cfg),
                "reward_ctx": ctx, "next_cfg": self.cfg, "scenarios": [g[0]["conversation_id"] for g in groups_all],
                "train_aggregate": hist, "learner_stats": stats, "n_samples": len(samples),
+               "timing": timing,
                "controller_failures": getattr(self.controller, "n_failures", None),
                "controller_rollbacks": getattr(self.controller, "n_rollbacks", None),
                "policy_sha_after": self.learner.policy_sha(), "time": time.time(), "update_s": time.time() - t0}
@@ -772,6 +779,7 @@ class Trainer:
         """Task 2 episodes on the validation ids with the SAMPLED Planner (D5: --val-temperature, one
         replicate per --val-seeds entry) + Task 1 (greedy, as the benchmark); logged only to validation.jsonl;
         drives best.json and the D2 annealing trigger. Never enters history or the controller."""
+        _tv = time.time()
         a = self.a
         prev = read_jsonl(self.p_val)
         if any(r.get("kind") == "summary" and r["update"] == u for r in prev):
@@ -840,16 +848,25 @@ class Trainer:
             st["aux_anneal_start"] = u
             write_json_atomic(sp, st)
         t1_ok = True if t1 is None else T1.within_tolerance(t1, self.task1_base, a.task1_tol)
-        sel = score + (a.w_sel_task1 * t1["term_f1"] if t1 is not None else 0.0)
+        # checkpoint selection (user 2026-09-26): with ~8 validation episodes the v4 dist term is dominated by
+        # the smoothing, so Task 2 is scored by the turn-count distribution W1 against the validation people
+        # plus coverage; Task 1 by the M2 term_f1. The v4 validation reward is still logged (not selected on).
+        sel = None
+        if turn_stats is not None and turn_stats.get("turn_w1") is not None:
+            sel = (a.w_sel_cov * turn_stats["coverage_mean"] - a.w_sel_w1 * turn_stats["turn_w1"]
+                   + (a.w_sel_task1 * t1["term_f1"] if t1 is not None else 0.0))
         append_jsonl(self.p_val, {"kind": "summary", "update": u, "policy_sha": psha, "split": "validation",
+                                  "validation_s": round(time.time() - _tv, 1),
                                   "n_episodes": len(totals), "n_unclean_episodes": n_unclean,
                                   "val_temperature": a.val_temperature, "val_seeds": a.val_seeds,
                                   "mean_reward_selection": score, "aux_anneal_start": self.aux_anneal_start,
                                   "turn_stats": turn_stats, "task1": t1, "task1_base": self.task1_base,
                                   "task1_within_tol": t1_ok, "task1_tol": a.task1_tol,
                                   "selection_score": sel, "w_sel_task1": a.w_sel_task1,
+                                  "w_sel_w1": a.w_sel_w1, "w_sel_cov": a.w_sel_cov,
+                                  "selection_formula": "w_sel_cov*coverage_mean - w_sel_w1*turn_w1 + w_sel_task1*task1.term_f1",
                                   "selection_cfg_sha256": RR.cfg_sha(self.selection_cfg), "time": time.time()})
-        if totals and (self.best is None or sel > self.best["selection_score"]):
+        if sel is not None and (self.best is None or sel > self.best["selection_score"]):
             self.best = {"update": u, "checkpoint": os.path.relpath(self.ckpt_dir(u), a.out).replace("\\", "/"),
                          "policy_sha": psha, "mean_reward_selection": score, "selection_score": sel,
                          "selection_cfg_sha256": RR.cfg_sha(self.selection_cfg)}
@@ -926,8 +943,11 @@ def parse_args(argv=None):
                          "term_f1 beats the untrained policy's; 0 = never anneal")
     ap.add_argument("--stop-credit", type=int, choices=(0, 1), default=1,
                     help="1: turn-count and Task 1 advantages act only on the end_session value tokens")
+    ap.add_argument("--w-sel-w1", type=float, default=1.0,
+                    help="checkpoint selection: weight of the validation turn-count W1 (turns; subtracted)")
+    ap.add_argument("--w-sel-cov", type=float, default=1.0, help="checkpoint selection: weight of validation coverage")
     ap.add_argument("--w-sel-task1", type=float, default=1.0,
-                    help="checkpoint selection = validation Task 2 reward + this * validation Task 1 term_f1")
+                    help="checkpoint selection: weight of validation Task 1 term_f1 (M2)")
     ap.add_argument("--splits", default="/tmp2/mzjiang_usersim/grpo_planner/splits_v1.json")
     ap.add_argument("--algo", choices=RA.ALGOS, default="grpo")
     ap.add_argument("--controller", choices=("fixed", "dual", "llm"), default="llm",

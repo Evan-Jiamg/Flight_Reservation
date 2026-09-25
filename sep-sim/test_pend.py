@@ -86,9 +86,9 @@ def test_stop_target_swaps_the_value_only():
     pieces = ['{"end_session":', ' false', ',', ' true']
     obj = types.SimpleNamespace(tok=_Tok2(pieces))
     tgt = T2.PlannerLM.stop_target(obj, [0, 1, 2], [0, 1, 0], want_end=True)
-    assert tgt == {"prefix_ids": [0], "target_ids": [3], "want_end": True}
+    assert tgt == {"prefix_ids": [0], "target_ids": [3], "want_end": True, "gen_len": 3}
     tgt = T2.PlannerLM.stop_target(obj, [0, 1, 2], [0, 1, 0], want_end=False)
-    assert tgt == {"prefix_ids": [0], "target_ids": [1], "want_end": False}
+    assert tgt == {"prefix_ids": [0], "target_ids": [1], "want_end": False, "gen_len": 3}
     assert T2.PlannerLM.stop_target(obj, [0, 1, 2], None, want_end=True) is None
 
 
