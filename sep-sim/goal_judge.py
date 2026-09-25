@@ -8,10 +8,16 @@ Output: {"status": "SATISFIED"|"PARTIAL"|"NOT", "unmet": [<= 3 short phrases]}.
 Over-long inputs drop the OLDEST whole exchanges (same budget for both judges, so the
 trained judge sees what its labels were produced from). A reply that does not parse is
 recorded as status UNKNOWN and counted -- never silently mapped to any status.
+
+GoalJudge.status_probs (and assess()["status_probs"]) gives P(SATISFIED/PARTIAL/NOT) by
+teacher-forced scoring of the canonical status prefix after the same fitted generation prompt,
+normalized over the three (see status_token_plan for the exact scored tokens).
 """
 from __future__ import annotations
 
+import copy
 import json
+import math
 import re
 
 STATUSES = ("SATISFIED", "PARTIAL", "NOT")
@@ -106,13 +112,66 @@ def canonical(result):
     return json.dumps({"status": result["status"], "unmet": result["unmet"]}, ensure_ascii=False)
 
 
+# ---- status probabilities (teacher-forced scoring of the canonical status prefix) ----------------
+# The scored continuation for status X is STATUS_HEAD + X, i.e. '{"status": "X' -- the canonical
+# prefix '{"status": "X"' WITHOUT its closing quote: byte-level BPE pre-tokenizers (Qwen, Llama-3)
+# merge that quote with the following comma into one token ('",'), so a sequence ending in a bare
+# '"' is a tokenization the trained judge never saw. status_token_plan asserts that the scored ids
+# are an exact prefix of the ids of the full canonical target (the training tokenization); it
+# raises instead of scoring anything else.
+STATUS_HEAD = '{"status": "'
+
+
+def common_prefix_len(seqs):
+    seqs = [list(s) for s in seqs]
+    n = min(len(s) for s in seqs) if seqs else 0
+    for i in range(n):
+        if any(s[i] != seqs[0][i] for s in seqs[1:]):
+            return i
+    return n
+
+
+def status_token_plan(tok, prompt_text):
+    """-> (shared_ids, {status: branch_ids}, n_prompt_tokens).
+
+    shared_ids = prompt + the part of the status prefix common to all three statuses;
+    branch_ids[X] = the remaining ids of '{"status": "X'. Tokenized exactly as the training
+    target (prompt text + canonical JSON), with add_special_tokens=False (single BOS)."""
+    p_ids = list(tok(prompt_text, add_special_tokens=False)["input_ids"])
+    seqs = {}
+    for st in STATUSES:
+        pre = list(tok(prompt_text + STATUS_HEAD + st, add_special_tokens=False)["input_ids"])
+        full = list(tok(prompt_text + canonical({"status": st, "unmet": []}),
+                        add_special_tokens=False)["input_ids"])
+        if full[:len(pre)] != pre:
+            raise ValueError("status prefix %r does not tokenize as a prefix of the canonical target" % st)
+        if pre[:len(p_ids)] != p_ids:
+            raise ValueError("prompt ids are not a prefix of prompt+status ids (template boundary)")
+        seqs[st] = pre
+    c = common_prefix_len(seqs.values())
+    if c < len(p_ids):
+        raise ValueError("status continuations diverge inside the prompt")
+    branches = {st: s[c:] for st, s in seqs.items()}
+    if any(not b for b in branches.values()):
+        raise ValueError("a status continuation has no distinguishing token")
+    return seqs[STATUSES[0]][:c], branches, len(p_ids)
+
+
+def normalize_logps(logps):
+    """{status: log P(prefix)} -> ({status: p normalized over the three}, total unnormalized mass)."""
+    m = max(logps.values())
+    z = sum(math.exp(v - m) for v in logps.values())
+    return {k: math.exp(v - m) / z for k, v in logps.items()}, math.exp(m) * z
+
+
 class GoalJudge:
     """HF judge (label model or trained Qwen3-4B + LoRA). Greedy, deterministic."""
 
     def __init__(self, model_path, adapter=None, gpu=0, dtype="bfloat16", load_4bit=False,
-                 device_map=None):
+                 device_map=None, with_probs=True):
         self.model_path, self.adapter, self.gpu = model_path, adapter, gpu
         self.dtype, self.load_4bit, self.device_map = dtype, load_4bit, device_map
+        self.with_probs = with_probs       # assess() also scores status_probs (one extra prefill)
         self.tok = self.model = None
         self.n_calls = self.n_unparsed = 0
 
@@ -137,12 +196,48 @@ class GoalJudge:
         self.model.eval()
         return self
 
-    def assess(self, scenario_text, hist_u, hist_a):
-        import torch
+    def prompt_text(self, scenario_text, hist_u, hist_a):
+        """The fitted generation prompt (same for assess and status_probs) and its fit info."""
         if self.model is None:
             self.load()
         msgs, info = fit_messages(self.tok, scenario_text, hist_u, hist_a)
-        text = self.tok.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
+        return self.tok.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True), info
+
+    def _score_prompt(self, text):
+        """-> ({status: p}, mass): teacher-forced log P of each status prefix, normalized."""
+        import torch
+        shared, branches, n_prompt = status_token_plan(self.tok, text)
+        if n_prompt > JUDGE_BUDGET:
+            raise AssertionError("judge prompt %d > budget %d" % (n_prompt, JUDGE_BUDGET))
+        dev = next(self.model.parameters()).device
+        with torch.no_grad():
+            out = self.model(input_ids=torch.tensor([shared], device=dev), use_cache=True, logits_to_keep=1)
+            lp0 = torch.log_softmax(out.logits[0, -1].float(), -1)
+            cache, c = out.past_key_values, len(shared)
+            logps = {}
+            for st, br in branches.items():
+                lp = float(lp0[br[0]])
+                if len(br) > 1:
+                    can_crop = hasattr(cache, "crop")
+                    cb = cache if can_crop else copy.deepcopy(cache)
+                    o = self.model(input_ids=torch.tensor([br[:-1]], device=dev), past_key_values=cb,
+                                   use_cache=True)
+                    lq = torch.log_softmax(o.logits[0].float(), -1)
+                    lp += sum(float(lq[k, br[k + 1]]) for k in range(len(br) - 1))
+                    if can_crop:
+                        cache.crop(c)
+                logps[st] = lp
+        return normalize_logps(logps)
+
+    def status_probs(self, scenario_text, hist_u, hist_a):
+        """{"SATISFIED": p, "PARTIAL": p, "NOT": p}: P('{"status": "X' | fitted prompt), normalized
+        over the three. Same fitted prompt as assess()."""
+        text, _ = self.prompt_text(scenario_text, hist_u, hist_a)
+        return self._score_prompt(text)[0]
+
+    def assess(self, scenario_text, hist_u, hist_a):
+        import torch
+        text, info = self.prompt_text(scenario_text, hist_u, hist_a)
         # the chat template already carries any BOS (Llama-3.1 does); never add a second one
         enc = self.tok(text, return_tensors="pt", add_special_tokens=False)
         enc.pop("token_type_ids", None)
@@ -155,4 +250,8 @@ class GoalJudge:
         res, ok = parse(raw)
         self.n_calls += 1
         self.n_unparsed += int(not ok)
-        return {**res, "parse_ok": ok, "raw": raw, **info}
+        extra = {}
+        if self.with_probs:
+            probs, mass = self._score_prompt(text)
+            extra = {"status_probs": probs, "status_probs_mass": mass}
+        return {**res, "parse_ok": ok, "raw": raw, **info, **extra}

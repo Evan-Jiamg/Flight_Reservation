@@ -31,8 +31,33 @@ V2FIX = {
     "SEPSIM_NSAMP": "3", "SEPSIM_SELECTOR": "length", "SEPSIM_LENGTH_SELECT": "1",
     "SEPSIM_POSITION": "system", "SEPSIM_END_PROBE": "0", "SEPSIM_GUARDRAILS": "0",
 }
+# E1.6 (Sep-1st-Simulator-e1r @ cf19400), copied read-only to /tmp2 by ops/r_e1rtree.sh; the tree
+# E1.6 was generated from (the config in endfix/stage_e16.sh), with no uncommitted changes.
+E16_COMMON = {
+    "SEPSIM_NO_ANN": "1", "SEPSIM_ROLESTOP": "1", "SEPSIM_ACT_FULL": "1", "SEPSIM_T1_SAMPLE": "1",
+    "SEPSIM_PLANNER_END": "1",
+    # UserLM-only (no Ditto counterpart): off, and DittoSpeaker.load refuses them if set
+    "SEPSIM_INTENT_PROSE": "0", "SEPSIM_ENDGATE": "0", "SEPSIM_ENDMASK_RETRY": "0",
+    "SEPSIM_NEXTSTEP_INLINE": "0", "SEPSIM_T1_INTENT_ONLY": "0", "SEPSIM_PROSE_PERSONA": "0",
+    "SEPSIM_KEEPEND": "0", "SEPSIM_ENDSCORE": "0", "SEPSIM_NOSURV": "0", "SEPSIM_AGENDA_CORROB": "0",
+}
+ARM_ENV = {
+    "a0": {"SEPSIM_ACT_PRIOR": "off"},
+    "a2": {"SEPSIM_ACT_PRIOR": "nostopclobber"},
+    # Baseline: E1.6's Planner side as generated (override on, gated by the self-judged ledger)
+    "e16": dict(E16_COMMON, SEPSIM_SELF_JUDGE="1", SEPSIM_STOP_LEDGER="1", SEPSIM_ACT_PRIOR="off"),
+    # Final: E1.6 + v3 fixes; the goal judge replaces SELF_JUDGE, no override, no band
+    "final": dict(E16_COMMON, SEPSIM_SELF_JUDGE="0", SEPSIM_STOP_LEDGER="0", SEPSIM_ACT_PRIOR="nostopclobber"),
+}
+V3_ARMS = ("a2", "final")
 BENCH = "/tmp2/hchsu/trec2026-usersim-benchmark"
-TREE = "/home/mzjiang/Sep-Simulator"
+TREE_V2FIX = "/home/mzjiang/Sep-Simulator"
+TREE_E16 = "/tmp2/mzjiang_usersim/grpo_planner/trees/e1r_cf19400"
+TREE = TREE_V2FIX
+
+
+def tree_of(arm):
+    return TREE_E16 if arm in ("e16", "final") else TREE_V2FIX
 WORK = "/tmp2/mzjiang_usersim/task2"
 DITTO = "/tmp2/mzjiang_usersim/models/Ditto-8B"
 T_MAX = 10
@@ -46,10 +71,16 @@ def setup_environment(arm):
     for k, v in V2FIX.items():
         os.environ[k] = v
     os.environ.pop("SEPSIM_REDRAW", None)
-    os.environ["SEPSIM_ARM"] = "sepsim_v2fix"
+    os.environ["SEPSIM_ARM"] = "sepsim_v2fix" if arm in ("a0", "a2") else "e16d_" + arm
     os.environ["SEPSIM_PLANNER_END"] = "0"
-    os.environ["SEPSIM_ACT_PRIOR"] = "nostopclobber" if arm == "a2" else "off"
-    for p in (HERE, TREE, os.path.join(TREE, "scripts"), os.path.join(BENCH, "tools")):
+    os.environ.pop("SEPSIM_INTENT_CACHE", None)
+    for k in set().union(*ARM_ENV.values()):
+        os.environ.pop(k, None)
+    os.environ.update(ARM_ENV[arm])
+    tree = tree_of(arm)
+    if "sepsim" in sys.modules and not os.path.abspath(sys.modules["sepsim"].__file__).startswith(os.path.abspath(tree)):
+        raise RuntimeError("sepsim already imported from another tree; one arm family per process")
+    for p in (HERE, tree, os.path.join(tree, "scripts"), os.path.join(BENCH, "tools")):
         if p not in sys.path:
             sys.path.insert(0, p)
     sys.modules.setdefault("torchvision", None)
@@ -116,10 +147,10 @@ class PlannerLM:
 
 class Task2Env:
     def __init__(self, arm, gpu, planner, judge=None, ditto_path=DITTO, corpus="/home/mzjiang/v5-latency/data.jsonl"):
-        if arm not in ("a0", "a2"):
+        if arm not in ARM_ENV:
             raise ValueError(arm)
-        if arm == "a2" and judge is None:
-            raise ValueError("a2 needs a goal judge")
+        if arm in V3_ARMS and judge is None:
+            raise ValueError("%s needs a goal judge" % arm)
         setup_environment(arm)
         from sepsim import acts, models, planner_prompt as PP
         import run_v2
@@ -130,10 +161,23 @@ class Task2Env:
         assert (run_v2.ANTILEAK, run_v2.NEARCOPY, run_v2.COPY_SCOPE, run_v2.REDRAW, run_v2.NSAMP,
                 run_v2.SELECTOR, run_v2.LENGTH_SELECT, run_v2.POSITION, run_v2.GUARDRAILS, run_v2.END_PROBE) == \
                (True, True, "both", 4, 3, "length", True, "system", False, False), "v2fix did not bind"
-        expected = frozenset({"nostopclobber"}) if arm == "a2" else frozenset()
+        expected = frozenset({"nostopclobber"}) if arm in V3_ARMS else frozenset()
         assert acts.prior_mode() == expected, "act prior mode wrong for arm %s" % arm
+        self.e16 = arm in ("e16", "final")
+        if self.e16:
+            from sepsim import pipeline as _pl
+            assert os.path.abspath(models.__file__).startswith(os.path.abspath(TREE_E16)), models.__file__
+            assert (models.ROLESTOP, models.INTENT_PROSE, models.NEXTSTEP_INLINE, models.ENDMASK_RETRY) == \
+                   (True, False, False, False), "E1.6 speaker switches did not bind"
+            assert (run_v2.SELF_JUDGE, run_v2.PLANNER_END, run_v2.T1_SAMPLE, run_v2.ENDGATE,
+                    run_v2.AGENDA_CORROB) == (arm == "e16", True, True, False, False), "E1.6 runner switches"
+            assert _pl.prior_annotations([{"annotations": {"x": 1}}], 2) == {}, "NO_ANN did not bind"
         self.arm, self.gpu, self.planner, self.judge = arm, gpu, planner, judge
-        self.system = V3.system_prompt_v3() if arm == "a2" else PP.system_prompt()
+        self.system = V3.system_prompt_v3() if arm in V3_ARMS else PP.system_prompt()
+        if arm == "e16":
+            assert '"last_reply_helpful"' in self.system and "length_words\": <words if they made THIS move>" in self.system
+        if arm == "final":
+            assert '"last_reply_helpful"' not in self.system and "inside that move's band" not in self.system
         self.recs = {}
         for l in open(corpus, encoding="utf-8"):
             if l.strip():
@@ -142,8 +186,15 @@ class Task2Env:
         self.reqs = json.load(open(os.path.join(BENCH, "data/req_shards_v1.json")))
         self.ledger_judge = Judge(reasoning_effort="minimal", verbose=False, cache_dir=os.path.join(WORK, "judge_cache"))
         self.r0 = R0Client()
-        FitDitto = F.make_fit_ditto_speaker(models.DittoSpeaker)
+        if self.e16:
+            import ditto_e16
+            base_cls = ditto_e16.DittoSpeaker
+        else:
+            base_cls = models.DittoSpeaker
+        FitDitto = F.make_fit_ditto_speaker(base_cls)
         self.speaker = FitDitto(path=ditto_path, gpu=gpu, position=run_v2.POSITION).load()
+        # E1.6 Z1 (T1_SAMPLE): turn 1 is sampled at the speaker checkpoint's own card values
+        self.t1_sampling = self.speaker.card_sampling() if self.e16 else None
 
     def describe(self):
         import fit_prompts as F
@@ -152,7 +203,8 @@ class Task2Env:
                 "system_prompt_sha256": hashlib.sha256(self.system.encode()).hexdigest(),
                 "goal_judge": (self.judge.model_path, self.judge.adapter) if self.judge else None,
                 "r0_model": self.r0.model, "ledger_judge_model": self.ledger_judge.model,
-                "act_prior": os.environ["SEPSIM_ACT_PRIOR"], "v2fix": V2FIX, "t_max": T_MAX}
+                "act_prior": os.environ["SEPSIM_ACT_PRIOR"], "v2fix": V2FIX, "t_max": T_MAX,
+                "tree": tree_of(self.arm), "arm_env": ARM_ENV[self.arm], "t1_sampling": self.t1_sampling}
 
     def run_episode(self, conversation_id, seed, replicate=0, planner_temperature=0.0, planner_top_p=1.0,
                     record_generation=False):
@@ -178,7 +230,8 @@ class Task2Env:
         def speak(t):
             hist_u, hist_a = S["hist_u"], S["hist_a"]
             gs = None
-            if arm == "a2":
+            v3 = arm in V3_ARMS
+            if v3:
                 gs = self.judge.assess(sc_text, hist_u, hist_a) if hist_a else {"status": "NOT ASSESSED", "unmet": []}
                 up = V3.user_prompt_v3(scenario, S["prev_block"], hist_u, hist_a, t, led,
                                        {"status": gs["status"], "unmet": gs.get("unmet", [])}, prev_ann={})
@@ -188,29 +241,42 @@ class Task2Env:
             pseed = int(hashlib.sha256(("%s|%d|%d|%d" % (sid, t, replicate, 7)).encode()).hexdigest()[:8], 16)
             g = planner.generate(self.system, up, planner_temperature, planner_top_p, pseed)
             raw = g["raw"]
-            if arm == "a2":
+            self_judge = None
+            if arm == "e16" and t >= 2:
+                # E1.6 SEPSIM_SELF_JUDGE, line for line (run_v2.py @ cf19400): the Planner's own
+                # rating of the last reply feeds the ledger BEFORE read_plan, so STOP_LEDGER sees it
+                _d = state.json_of(raw) or {}
+                _h = _d.get("last_reply_helpful")
+                _q = _d.get("last_reply_quality")
+                self_judge = {"helpful": _h if isinstance(_h, bool) else None,
+                              "dataset_quality": _q if _q in stopping.QUALITY_ORDER else None}
+                led.judge(self_judge["helpful"], self_judge["dataset_quality"])
+            if v3:
                 fields, diag, end_session = V3.read_plan_v3(raw, t, scenario, rng, led)
+            elif arm == "e16":
+                fields, diag = PP.read_plan(raw, t, scenario, rng, led, agenda_open=False)
+                end_session = None
             else:
                 fields, diag = PP.read_plan(raw, t, scenario, rng, led)
                 end_session = None
             unparsed = fields is None
             if unparsed:
                 fields = {"move": "Other", "act": "other"}
-            ended = bool(end_session) if arm == "a2" else bool(state.ends_session(fields))
+            ended = bool(end_session) if v3 else bool(state.ends_session(fields))
             base = {"planner_prompt": g["prompt_text"], "planner_fit": g["fit"], "planner_raw": raw,
                     "planner_hit_max_new": g["hit_max_new"], "planner_diag": diag,
                     "planner_unparsed": unparsed, "ended_planner": ended,
                     "move": fields.get("move", ""), "act": fields.get("act", ""),
-                    "stop_rule": fields.get("stop_rule", "none"), "goal_status": gs,
+                    "stop_rule": fields.get("stop_rule", "none"), "goal_status": gs, "self_judge": self_judge,
                     "ledger_before": {"turns": led.turns, "gain_trace": list(led.gain_trace)}}
             if record_generation:
                 base["planner_gen"] = {"prompt_ids": g["prompt_ids"], "gen_ids": g["gen_ids"],
                                        "temperature": planner_temperature, "top_p": planner_top_p, "seed": pseed}
-            if arm == "a2" and ended:
+            if v3 and ended:
                 return {**base, "planner_stop": True, "user": ""}
             if unparsed:
                 block = S["prev_block"]
-            elif arm == "a2":
+            elif v3:
                 block = V3.speaker_block_v3(fields, gs)
             else:
                 block = PP.render_block(fields, ag.render())
@@ -221,13 +287,19 @@ class Task2Env:
             prior = list(hist_u) + (list(hist_a) if run_v2.COPY_SCOPE == "both" else [])
             if run_v2.GUARDS_ON:
                 avoid = prior
+            # E1.6 Z1 (T1_SAMPLE): on turn 1 every draw, the first included, is sampled at the
+            # speaker card's values and the pick is uniform among guard survivors (seeded)
+            z1 = self.e16 and t == 1
+            T_G, P_G = self.t1_sampling if z1 else (0.0, 1.0)
+            T_S, P_S = self.t1_sampling if z1 else (0.7, 0.9)
             greedy, ge = speaker.say(sc_text, block, hist_u, hist_a, t, seed=pipeline.seed_for(sid, t),
-                                     temperature=0.0, avoid=avoid, reject_template=ANTILEAK, reject_reuse=NEARCOPY)
+                                     temperature=T_G, top_p=P_G, avoid=avoid, reject_template=ANTILEAK,
+                                     reject_reuse=NEARCOPY)
             fit0 = speaker.last_fit
             cands, flags = [greedy], [ge]
             for k in range(run_v2.NSAMP):
                 s_, e_ = speaker.say(sc_text, block, hist_u, hist_a, t, seed=pipeline.seed_for(sid, t, k + 1),
-                                     temperature=0.7, top_p=0.9, avoid=avoid, reject_template=ANTILEAK,
+                                     temperature=T_S, top_p=P_S, avoid=avoid, reject_template=ANTILEAK,
                                      reject_reuse=NEARCOPY)
                 cands.append(s_)
                 flags.append(e_)
@@ -237,7 +309,7 @@ class Task2Env:
                 while all(reasons) and n_extra < run_v2.REDRAW:
                     k = run_v2.NSAMP + n_extra
                     sx, ex = speaker.say(sc_text, block, hist_u, hist_a, t, seed=pipeline.seed_for(sid, t, k + 1),
-                                         temperature=0.7, top_p=0.9, avoid=avoid, reject_template=ANTILEAK,
+                                         temperature=T_S, top_p=P_S, avoid=avoid, reject_template=ANTILEAK,
                                          reject_reuse=NEARCOPY)
                     cands.append(sx)
                     flags.append(ex)
@@ -245,7 +317,10 @@ class Task2Env:
                     n_extra += 1
                 eligible = [i for i, r in enumerate(reasons) if not r] or None
             idx = run_v2.choose(cands, fields.get("length_words"), None, eligible)
-            return {**base, "user": cands[idx], "ended_speaker": bool(flags[idx]), "block": block,
+            if z1:
+                pool = eligible if eligible else list(range(len(cands)))
+                idx = random.Random(pipeline.seed_for(sid, t, 97)).choice(pool)
+            return {**base, "user": cands[idx], "ended_speaker": bool(flags[idx]), "block": block, "t1_sampled": z1,
                     "guard_reasons": reasons, "guard_extra": n_extra,
                     "no_survivor": reasons is not None and eligible is None,
                     "selected_index": idx, "n_candidates": len(cands), "speaker_fit": fit0}
@@ -269,7 +344,9 @@ class Task2Env:
             S["cov"].append((t, (round(ledger.coverage(), 4), bool(ledger.complete()))))
             return reply
 
-        ep = run_episode(T_MAX, None, speak, respond)
+        # e16: E1.6 SEPSIM_PLANNER_END -- the Planner's Complete act ends the episode after the
+        # closing message it asked for (emitted, no assistant reply). v3 arms exit silently instead.
+        ep = run_episode(T_MAX, None, speak, respond, planner_end=(arm == "e16"))
         after, last = dict(S["cov"]), (0.0, False)
         for step in ep["trace"]:
             last = after.get(step["t"], last)

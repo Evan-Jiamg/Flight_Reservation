@@ -31,6 +31,8 @@ slot instead of the lexical agenda.
 """
 from __future__ import annotations
 
+import os
+
 from sepsim import acts, state, stopping
 from sepsim import persona as P
 from sepsim import planner_prompt as PP
@@ -67,6 +69,17 @@ NEW_AFFECT_FIELDS = (' "affect": "<their mood in a few words>",\n'
 # D10: in Task 2 the USER messages are simulated, so "typed by the real person" is false.
 OLD_REAL_PERSON = ("Every USER message you are shown was typed by the real person. Their wording, punctuation and\n"
                    "length are evidence, not a simulation of it.")
+# E1.6 SEPSIM_ACT_FULL (kept in Final): one act_distribution entry per move, each with its own
+# length_words, so the length that rides along is the length of the act actually drawn. v3 keeps
+# the per-act length and removes only the band it was tied to.
+OLD_ACT_FULL_LEN = "and its own length_words inside that move's band."
+NEW_ACT_FULL_LEN = "and its own length_words: how many words this turn has if they made that move."
+
+
+def act_full():
+    return os.environ.get("SEPSIM_ACT_FULL", "0") == "1"
+
+
 NEW_REAL_PERSON = ("The USER messages below are this person's messages so far. Their wording, punctuation and\n"
                    "length show how this person writes.")
 
@@ -106,6 +119,8 @@ def system_prompt_v3():
     s = _replace_once(s, OLD_LEN_FIELD, NEW_LEN_FIELD)
     s = _replace_once(s, OLD_REAL_PERSON, NEW_REAL_PERSON)
     s = _replace_once(s, OLD_AFFECT_FIELD, NEW_AFFECT_FIELDS)
+    if act_full():
+        s = _replace_once(s, OLD_ACT_FULL_LEN, NEW_ACT_FULL_LEN)
     return s
 
 
@@ -126,10 +141,19 @@ def read_plan_v3(raw, turn, scenario, rng, ledger):
     end = es is True or (isinstance(es, str) and es.strip().lower() == "true")
     diag["end_session_raw"] = es
     diag["end_session_valid"] = isinstance(es, bool) or (isinstance(es, str) and es.strip().lower() in ("true", "false"))
+    lw_src, lw_val = "top", d.get("length_words")
+    if act_full():
+        # the drawn act's own entry, matched exactly as E1.6 read_plan matches it (never clamped)
+        for e in (d.get("act_distribution") or []):
+            if isinstance(e, dict) and e.get("length_words") is not None and \
+                    acts.normalise(str(e.get("move", "")), str(e.get("act", ""))) == (fields["move"], fields["act"]):
+                lw_src, lw_val = "act_entry", e.get("length_words")
+                break
     try:
-        lw = int(round(float(d.get("length_words"))))
+        lw = int(round(float(lw_val)))
     except (TypeError, ValueError):
         lw = None
+    diag["length_source"] = lw_src
     if lw is not None and lw > 0:
         fields["length_words"] = lw
     else:
@@ -176,9 +200,17 @@ def band_block(scenario):
     """The exact 'HOW LONG THEY WRITE' block PP.user_prompt renders for this persona."""
     per = (scenario or {}).get("persona") or {}
     label, lo, hi, why = P.length_guidance(per, "Reveal")
-    return ("\n\nHOW LONG THEY WRITE\n- band: %s, roughly %d to %d words (%s)\n"
+    band = ("\n\nHOW LONG THEY WRITE\n- band: %s, roughly %d to %d words (%s)\n"
             "- the band shifts with the move: closing turns are much shorter, "
             "opening turns longer" % (label, lo, hi, why))
+    if act_full():
+        # E1.6 appends one band row per move under ACT_FULL; it goes together with the band
+        rows = []
+        for mv in ("Disclose", "Reveal", "Inquire", "Navigate", "Note", "Complete"):
+            _, l2, h2, _ = P.length_guidance(per, mv)
+            rows.append("- %s: %d to %d words" % (mv, l2, h2))
+        band += "\n" + "\n".join(rows)
+    return band
 
 
 def gives_up_suffix(scenario):
