@@ -148,6 +148,38 @@ class PlannerLM:
         self.adapter = adapter
         self.n_calls = 0
 
+    STOP_RE = None
+
+    def stop_mask(self, gen_ids):
+        """1 on the generated tokens that spell the end_session VALUE (true/false), else 0.
+        Char span found in the decoded text, mapped to tokens by binary search over prefix decodes
+        (exact for byte-level BPE, where single-token decodes need not concatenate to the text).
+        Returns None when the field is absent (then no stop credit is given to that generation)."""
+        import re
+        if PlannerLM.STOP_RE is None:
+            PlannerLM.STOP_RE = re.compile(r'"end_session"\s*:\s*"?(true|false)"?', re.I)
+        ids = list(gen_ids)
+        full = self.tok.decode(ids, skip_special_tokens=False)
+        m = PlannerLM.STOP_RE.search(full)
+        if not m:
+            return None
+        a, b = m.start(1), m.end(1)
+
+        def first_token_covering(pos):
+            lo, hi = 1, len(ids)          # smallest k with len(decode(ids[:k])) > pos -> token k-1
+            while lo < hi:
+                mid = (lo + hi) // 2
+                if len(self.tok.decode(ids[:mid], skip_special_tokens=False)) > pos:
+                    hi = mid
+                else:
+                    lo = mid + 1
+            return lo - 1
+        i, j = first_token_covering(a), first_token_covering(b - 1)
+        mask = [0] * len(ids)
+        for k in range(i, j + 1):
+            mask[k] = 1
+        return mask
+
     def generate(self, system, user, temperature=0.0, top_p=1.0, seed=0):
         import torch
         import fit_prompts as F
@@ -258,8 +290,10 @@ class Task2Env:
                 "act_prior": os.environ["SEPSIM_ACT_PRIOR"], "v2fix": V2FIX, "t_max": T_MAX,
                 "tree": tree_of(self.arm), "arm_env": ARM_ENV[self.arm], "t1_sampling": self.t1_sampling}
 
-    def run_episode(self, conversation_id, seed, replicate=0, planner_temperature=0.0, planner_top_p=1.0,
-                    record_generation=False):
+    def _session(self, conversation_id, seed, replicate=0, planner_temperature=0.0, planner_top_p=1.0,
+                 record_generation=False, with_ledger=True):
+        """Per-conversation state and the speak/respond closures, shared by Task 2 (run_episode) and
+        Task 1 (task1_generate) so both run exactly the same Planner + Ditto + Selector code."""
         from sepsim import agenda as AG, persona as P, pipeline, planner_prompt as PP, state, stopping
         import run_v2
         from r0_client import Ledger
@@ -275,7 +309,7 @@ class Task2Env:
         led = stopping.StoppingLedger(scenario)
         ag = AG.Agenda(AG.terms_of(" ".join([str((scenario.get("goal") or {}).get("topic", "")),
                                              str((scenario.get("goal") or {}).get("context", ""))]), 8))
-        ledger = Ledger(self.reqs[conversation_id]["req"], judge=self.ledger_judge)
+        ledger = Ledger(self.reqs[conversation_id]["req"], judge=self.ledger_judge) if with_ledger else None
         S = {"hist_u": [], "hist_a": [], "prev_block": state.d0(P.initial_stage(scenario.get("goal"))),
              "block": None, "cov": []}
 
@@ -332,7 +366,7 @@ class Task2Env:
                     "goal_met": fields.get("goal_met"), "still_wanted": fields.get("still_wanted"),
                     "ledger_before": {"turns": led.turns, "gain_trace": list(led.gain_trace)}}
             if record_generation:
-                base["planner_gen"] = {"prompt_ids": g["prompt_ids"], "gen_ids": g["gen_ids"],
+                base["planner_gen"] = {"prompt_ids": g["prompt_ids"], "gen_ids": g["gen_ids"], "stop_mask": planner.stop_mask(g["gen_ids"]),
                                        "temperature": planner_temperature, "top_p": planner_top_p, "seed": pseed}
             if v3 and ended:
                 return {**base, "planner_stop": True, "user": ""}
@@ -390,7 +424,8 @@ class Task2Env:
             return {**base, "user": cands[idx], "ended_speaker": bool(flags[idx]), "block": block, "t1_sampled": z1,
                     "guard_reasons": reasons, "guard_extra": n_extra,
                     "no_survivor": reasons is not None and eligible is None,
-                    "selected_index": idx, "n_candidates": len(cands), "speaker_fit": fit0}
+                    "selected_index": idx, "n_candidates": len(cands), "speaker_fit": fit0,
+                    "candidates": list(cands), "candidates_ended": [bool(f) for f in flags]}
 
         def respond(t, text):
             S["hist_u"].append(text)
@@ -411,6 +446,15 @@ class Task2Env:
             S["cov"].append((t, (round(ledger.coverage(), 4), bool(ledger.complete()))))
             return reply
 
+        return {"S": S, "speak": speak, "respond": respond, "ledger": ledger, "led": led, "ag": ag,
+                "rid": rid, "scenario": scenario}
+
+    def run_episode(self, conversation_id, seed, replicate=0, planner_temperature=0.0, planner_top_p=1.0,
+                    record_generation=False):
+        from task2_episode import run_episode
+        arm, planner = self.arm, self.planner
+        ss = self._session(conversation_id, seed, replicate, planner_temperature, planner_top_p, record_generation)
+        S, speak, respond, ledger, rid = ss["S"], ss["speak"], ss["respond"], ss["ledger"], ss["rid"]
         # e16: E1.6 SEPSIM_PLANNER_END -- the Planner's Complete act ends the episode after the
         # closing message it asked for (emitted, no assistant reply). v3 arms exit silently instead.
         ep = run_episode(T_MAX, None, speak, respond, planner_end=(arm in EMIT_END_ARMS))
@@ -429,6 +473,62 @@ class Task2Env:
                 "ledger_judge_empty_total": self.ledger_judge.n_empty,
                 "r0_empty_retries_total": getattr(self.r0, "n_empty_retries", None),
                 "human_turns": self.human_turns(conversation_id)}
+
+    def task1_generate(self, conversation_id, seed=0):
+        """Task 1 (teacher-forced) generations for one REAL conversation, in the benchmark's generations
+        schema (tools/score_method.py): one row per real user turn with greedy (the selected candidate),
+        samples (the other candidates), greedy_ended (Speaker end OR the Planner's end, as E1.6's
+        PLANNER_END records it). The history at turn t is always the real one; the Planner's own state
+        carries over, as in run_v2. Planner at temperature 0. No R0, no ledger."""
+        from sepsim import agenda as AG, pipeline
+        ss = self._session(conversation_id, seed, 0, 0.0, 1.0, False, with_ledger=False)
+        S, speak, led, ag = ss["S"], ss["speak"], ss["led"], ss["ag"]
+        rec = self.recs[conversation_id]
+        users, agents = pipeline.split_messages(rec)
+        goal = rec["scenario"].get("goal") or {}
+        rows = []
+        for t in range(1, len(users) + 1):
+            st = speak(t)
+            if st.get("planner_stop"):
+                raise RuntimeError("silent Planner exit has no Task 1 utterance; use an emit-end arm")
+            cands, ends, idx = st["candidates"], st["candidates_ended"], st["selected_index"]
+            samples = [c for i, c in enumerate(cands) if i != idx]
+            s_ends = [e for i, e in enumerate(ends) if i != idx]
+            rows.append({"record_id": rec["record_id"], "conversation_id": conversation_id, "turn_index": t,
+                         "is_first_turn": t == 1, "discipline": goal.get("discipline", "unknown"),
+                         "intent_variant": "pend_" + os.path.basename(str(self.planner.path).rstrip("/")),
+                         "greedy": st["user"], "greedy_ended": bool(st["ended_speaker"]) or bool(st["ended_planner"]),
+                         "speaker_ended": bool(st["ended_speaker"]), "planner_ends_session": bool(st["ended_planner"]),
+                         "samples": samples, "samples_ended": s_ends, "profile": st.get("block"),
+                         "move": st.get("move"), "act": st.get("act"), "goal_met": st.get("goal_met"),
+                         "planner_unparsed": st.get("planner_unparsed"), "planner_hit_max_new": st.get("planner_hit_max_new"),
+                         "planner_fit": st.get("planner_fit"), "speaker_fit": st.get("speaker_fit"),
+                         "guard_no_survivor": st.get("no_survivor"), "planner_adapter": self.planner.adapter})
+            # teacher forcing: the REAL message and the REAL assistant reply enter the history
+            S["hist_u"].append(users[t - 1]["text"])
+            if t - 1 < len(agents):
+                prev = S["hist_a"][-1] if S["hist_a"] else ""
+                reply = agents[t - 1]["text"]
+                S["hist_a"].append(reply)
+                led.observe({}, reply, prev)
+                ag.retire_satisfied(reply, {})
+                if AG.looks_like_new_offer(reply, prev):
+                    ag.reset_on_new_offer()
+            S["prev_block"] = S["block"] if S["block"] is not None else S["prev_block"]
+        # K+1 probe (the benchmark's termination measurement): after the real person's last message
+        # and whatever reply followed it, one more turn; ended = Speaker end OR Planner end (E1 semantics)
+        k = len(users)
+        st = speak(k + 1)
+        if st.get("planner_stop"):
+            raise RuntimeError("silent Planner exit has no Task 1 utterance; use an emit-end arm")
+        k1 = {"record_id": rec["record_id"], "conversation_id": conversation_id, "gold_k": k, "turn_index": k + 1,
+              "intent_variant": rows[0]["intent_variant"] + "_k1" if rows else "k1",
+              "ended_speaker": bool(st["ended_speaker"]), "ended_planner": bool(st["ended_planner"]),
+              "ended_empty": not (st["user"] or "").strip(),
+              "ended": bool(st["ended_speaker"]) or bool(st["ended_planner"]),
+              "greedy": st["user"], "greedy_ended": bool(st["ended_speaker"]) or bool(st["ended_planner"]),
+              "planner_move": st.get("move"), "planner_act": st.get("act"), "goal_met": st.get("goal_met")}
+        return rows, k1
 
     def human_turns(self, conversation_id):
         """Number of messages the real person sent in this conversation (the Task 2 turn target)."""
@@ -461,7 +561,7 @@ class Task2Env:
             out.append({"t": t, "replicate": g, "real_final": bool(real_final), "ended_planner": bool(end),
                         "planner_unparsed": fields is None, "planner_hit_max_new": gen["hit_max_new"],
                         "reward": float(bool(end) == bool(real_final)),
-                        "planner_gen": {"prompt_ids": gen["prompt_ids"], "gen_ids": gen["gen_ids"],
+                        "planner_gen": {"prompt_ids": gen["prompt_ids"], "gen_ids": gen["gen_ids"], "stop_mask": self.planner.stop_mask(gen["gen_ids"]),
                                         "temperature": temperature, "top_p": top_p, "seed": pseed}})
         return out
 

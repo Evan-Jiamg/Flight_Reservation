@@ -615,7 +615,7 @@ def verify(episodes, meta_path, splits_path, fold, split, arm=None, training=Fal
         if os.path.exists(t1p):
             folds = {int(f["fold"]): f for f in splits["folds"]}
             f = folds.get(fold, {})
-            train, forb = set(f.get("train", [])), set(f.get("forbidden_for_training", []))
+            train, forb = set(f.get("train_all", f.get("train", []))), set(f.get("forbidden_for_training", []))
             t1rows = load_jsonl(t1p, rep)
             for r in t1rows:
                 w = "task1 %s t%s u%s" % (str(r.get("conversation_id"))[:12], r.get("t"), r.get("update"))

@@ -127,7 +127,8 @@ def episode_samples(episode, policy_version=None):
             raise ValueError("empty generation at t=%s" % step.get("t"))
         out.append({"conversation_id": episode["conversation_id"], "replicate": episode.get("replicate"),
                     "t": step["t"], "prompt_ids": list(g["prompt_ids"]), "gen_ids": list(g["gen_ids"]),
-                    "temperature": float(g["temperature"]), "policy_version": policy_version})
+                    "temperature": float(g["temperature"]), "policy_version": policy_version,
+                    "stop_mask": list(g["stop_mask"]) if g.get("stop_mask") is not None else None})
     return out
 
 
@@ -331,7 +332,14 @@ class TorchLearner:
                     old = s["old_logp"].to(logp.device)
                     ref = s["ref_logp"].to(logp.device)
                     ratio = torch.exp(logp - old)
-                    adv = float(s["adv"])
+                    # per-token advantage: the sequence advantage on every token, plus the stop
+                    # advantage on the tokens of the end_session value only (stop credit assignment)
+                    adv = torch.full_like(logp, float(s["adv"]))
+                    if s.get("adv_stop") and s.get("stop_mask"):
+                        m = torch.tensor(s["stop_mask"], dtype=logp.dtype, device=logp.device)
+                        if m.shape != logp.shape:
+                            raise AssertionError("stop_mask length %d != %d generated tokens" % (m.shape[0], logp.shape[0]))
+                        adv = adv + float(s["adv_stop"]) * m
                     if clipped:
                         surr = torch.minimum(ratio * adv, torch.clamp(ratio, 1 - eps, 1 + eps) * adv)
                     else:

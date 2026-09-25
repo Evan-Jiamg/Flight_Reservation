@@ -176,6 +176,24 @@ def main():
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
+    # ---- 10 stop credit: sequence advantage 0, stop advantage +1 on ONE token -> that token's log-prob rises
+    s0 = dict(fresh(samples)[0])
+    k = min(2, len(s0["gen_ids"]) - 1)
+    s0.update(adv=0.0, adv_stop=1.0, stop_mask=[1 if i == k else 0 for i in range(len(s0["gen_ids"]))])
+    before = logps(model, [s0])[0]
+    lr10 = RA.TorchLearner(model, "grpo", {"minibatches": 1, "epochs": 1}, lr=1e-4, seed=0)
+    lr10.update([dict(s0)], {"lr": 1e-4, "kl_coef": 0.0}, seed=5)
+    after = logps(model, [s0])[0]
+    dk = float(after[k] - before[k])
+    assert dk > 0, "masked token log-prob did not rise (%.3g)" % dk
+    bad = dict(s0, stop_mask=[1, 0])
+    try:
+        lr10.update([bad], {"lr": 1e-4, "kl_coef": 0.0}, seed=6) if len(s0["gen_ids"]) != 2 else None
+        raise SystemExit("a stop_mask of the wrong length was accepted")
+    except AssertionError:
+        pass
+    log("10 ok: stop-credit token log-prob +%.3g; wrong-length mask refused" % dk)
+
     # ---- 9 PPO smoke (optional algorithm)
     ppo = RA.TorchLearner(model, "ppo", {}, lr=1e-5, seed=0)
     stp = ppo.update(fresh(samples), {"lr": 1e-5, "kl_coef": 0.0}, seed=4)

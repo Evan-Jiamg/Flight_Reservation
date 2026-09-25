@@ -46,6 +46,35 @@ def test_reward_v3_values():
     assert agg["components_mean"]["turns"] == 7 and agg["components_mean"]["coverage"] == pytest.approx(0.3)
 
 
+class _Tok:
+    """ids index into a vocabulary of strings; decode concatenates (a stand-in for BPE pieces)."""
+
+    def __init__(self, vocab):
+        self.vocab = vocab
+
+    def decode(self, ids, skip_special_tokens=False):
+        return "".join(self.vocab[i] for i in ids)
+
+
+def _mask(pieces):
+    import types
+    import task2_env as T2
+    tok = _Tok(pieces)
+    obj = types.SimpleNamespace(tok=tok)
+    return T2.PlannerLM.stop_mask(obj, list(range(len(pieces))))
+
+
+def test_stop_mask_marks_only_the_value_tokens():
+    pieces = ['{"goal_met": "yes",', ' "end', '_session', '":', ' tr', 'ue', ',', ' "next_step": "x"}']
+    m = _mask(pieces)
+    assert m == [0, 0, 0, 0, 1, 1, 0, 0]
+    pieces = ['{"end_session": ', 'false', '}']
+    assert _mask(pieces) == [0, 1, 0]
+    pieces = ['{"end_session": "', 'tr', 'ue"', '}']            # string form, value split mid-token
+    assert _mask(pieces) == [0, 1, 1, 0]
+    assert _mask(['{"act": "x"}']) is None                       # field absent -> no stop credit
+
+
 def conv(n, ends):
     return {"turns": [{"t": t, "real_final": t == n, "ended_planner": t in ends, "planner_unparsed": False}
                       for t in range(1, n + 1)]}
@@ -85,7 +114,7 @@ def test_parallel_rollouts_equal_serial():
         tb = sorted(strip(T.read_jsonl(os.path.join(b, "rollouts_task1.jsonl"))), key=ka)
         assert ta == tb and ta
         sp_ = json.load(open(sp))["folds"][0]
-        assert all(r["conversation_id"] in sp_["train"] and r["conversation_id"] not in sp_["forbidden_for_training"] for r in ta)
+        assert all(r["conversation_id"] in sp_["train_all"] and r["conversation_id"] not in sp_["forbidden_for_training"] for r in ta)
         assert sorted({r["update"] for r in ta}) == [1, 2, 3]
         for r in ta:
             assert r["real_final"] == (r["t"] == r["n_real"]) and len(r["samples"]) == 4

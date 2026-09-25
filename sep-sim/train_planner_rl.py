@@ -123,6 +123,7 @@ def load_split(path, fold):
     assert not set(train) & forbidden, "train intersects forbidden_for_training"
     assert set(val) <= forbidden, "validation must be listed as forbidden for training"
     assert not set(train) & set(val), "train/validation overlap"
+    assert not set(f.get("train_all", train)) & forbidden, "train_all intersects forbidden_for_training"
     # the test ids are not kept in memory at all (only through 'forbidden')
     return {"fold": int(fold), "train": train, "train_all": list(f.get("train_all", train)),
             "validation": val, "forbidden": forbidden, "sha256": sha_file(path)}
@@ -202,9 +203,10 @@ class FakeLearner:
                     p = _sig(self.theta[k])
                     dlogp = (1 - p) if s["gen_ids"][0] == 1 else -p
                     clipped = self.algo in ("grpo", "ppo") or self.acfg["rloo_clipped"]
-                    active = (not clipped) or RA.clipped_surrogate(r, s["adv"], eps) == r * s["adv"]
+                    adv = s["adv"] + (s.get("adv_stop") or 0.0) * ((s.get("stop_mask") or [0])[0])
+                    active = (not clipped) or RA.clipped_surrogate(r, adv, eps) == r * adv
                     if active:
-                        g[k] += s["adv"] * r * dlogp / len(mb)
+                        g[k] += adv * r * dlogp / len(mb)
                     if self.algo == "ppo":
                         self.value[k] += 0.1 * (s["ret"] - self.value[k]) / len(mb)
                 for k in range(5):
@@ -259,7 +261,7 @@ class FakeEnv:
                     "planner_hit_max_new": False, "no_survivor": False, "planner_diag": {},
                     "stop_rule": "satiation" if stop and level else ("disgust" if stop and rng.random() < 0.3 else "none")}
             if record_generation:
-                step["planner_gen"] = {"prompt_ids": [k, t], "gen_ids": [int(stop), 7],
+                step["planner_gen"] = {"prompt_ids": [k, t], "gen_ids": [int(stop), 7], "stop_mask": [1, 0],
                                        "temperature": planner_temperature, "top_p": planner_top_p, "seed": t}
             if stop:
                 step.update(decision="planner_stop", emitted=False, user="", agent=None)
@@ -289,7 +291,7 @@ def _fake_task1_sample(self, conversation_id, t, user_prompt, real_final, G, tem
         out.append({"t": t, "replicate": g, "real_final": bool(real_final), "ended_planner": stop,
                     "planner_unparsed": False, "planner_hit_max_new": False,
                     "reward": float(stop == bool(real_final)),
-                    "planner_gen": {"prompt_ids": [k, t], "gen_ids": [int(stop), 7],
+                    "planner_gen": {"prompt_ids": [k, t], "gen_ids": [int(stop), 7], "stop_mask": [1, 0],
                                     "temperature": temperature, "top_p": top_p, "seed": g}})
     return out
 
@@ -504,11 +506,11 @@ class Trainer:
             if r["update"] == u and r["policy_version"] == pv and r["policy_sha"] == psha:
                 reuse[(r["conversation_id"], r["t"])] = r
         rng = random.Random(seed_of(a.seed, "task1", u))
-        pool = sorted(self.split["train"])
+        pool = sorted(self.split["train_all"])     # Task 1 needs no requirement shards: every train session
         cids = rng.sample(pool, min(a.task1_convs, len(pool)))
         jobs = []
         for cid in cids:
-            assert_train_id(cid, self.split)
+            assert cid in self.split["train_all"] and cid not in self.split["forbidden"], "non-train conversation %r in a Task 1 group" % cid
             jobs.append((cid, rng.random()))
 
         def run_conv(job):
@@ -562,13 +564,27 @@ class Trainer:
                 rs.append(rw["total"])
                 rewarded.append((row["episode"], rw))
             rew_groups.append(rs)
-        advs, skipped = RA.advantages_for_groups(rew_groups, self.a.algo, self.acfg)
-        for grp, rs, ad in zip(groups, rew_groups, advs):
-            if ad is None:
+        stop_credit = self.a.stop_credit and cfg["version"] == "v3"
+        if stop_credit:
+            # stop credit assignment: the turn-count term is caused only by the end_session decisions,
+            # so its group advantage goes to the end_session value tokens of every step; coverage and
+            # the format constraints keep the sequence-level advantage
+            comps = {id(row): rw for row, (_, rw) in zip([r for g in groups for r in g], rewarded)}
+            len_groups = [[-cfg["w_len"] * comps[id(row)]["components"]["len_err"] for row in grp] for grp in groups]
+            seq_groups = [[R - L for R, L in zip(rs, ls)] for rs, ls in zip(rew_groups, len_groups)]
+            advs, sk1 = RA.advantages_for_groups(seq_groups, self.a.algo, self.acfg)
+            advs_stop, sk2 = RA.advantages_for_groups(len_groups, self.a.algo, self.acfg)
+            skipped = sum(1 for a1, a2 in zip(advs, advs_stop) if a1 is None and a2 is None)
+        else:
+            advs, skipped = RA.advantages_for_groups(rew_groups, self.a.algo, self.acfg)
+            advs_stop = [None] * len(groups)
+        for grp, rs, ad, ads in zip(groups, rew_groups, advs, advs_stop):
+            if ad is None and ads is None:
                 continue
-            for row, R, A in zip(grp, rs, ad):
+            for j, (row, R) in enumerate(zip(grp, rs)):
                 for s in RA.episode_samples(row["episode"], policy_version=row["policy_version"]):
-                    s["ret"], s["adv"] = R, A
+                    s["ret"], s["adv"] = R, (ad[j] if ad is not None else 0.0)
+                    s["adv_stop"] = ads[j] if ads is not None else 0.0
                     samples.append(s)
         # Task 1 stop groups (same policy version; one Planner step per sample)
         t1rows = self.task1_rollouts(u)
@@ -582,7 +598,10 @@ class Trainer:
                 pseudo = {"conversation_id": r["conversation_id"], "replicate": x["replicate"],
                           "trace": [{"t": x["t"], "planner_gen": x["planner_gen"]}]}
                 for s in RA.episode_samples(pseudo, policy_version=pv):
-                    s["ret"], s["adv"], s["source"] = R, A, "task1"
+                    if self.a.stop_credit:
+                        s["ret"], s["adv"], s["adv_stop"], s["source"] = R, 0.0, A, "task1"
+                    else:
+                        s["ret"], s["adv"], s["source"] = R, A, "task1"
                     samples.append(s)
         t1_all = [x for r in t1rows for x in r["samples"]]
         t1_hist = None
@@ -723,6 +742,8 @@ def parse_args(argv=None):
                     help="reported: whether Task 1 term_f1 / premature stay within this of update 0")
     ap.add_argument("--task1-convs", type=int, default=4,
                     help="Task 1 stop groups per update: real TRAIN conversations (last + one earlier message, G samples each); 0 = off")
+    ap.add_argument("--stop-credit", type=int, choices=(0, 1), default=1,
+                    help="1: turn-count and Task 1 advantages act only on the end_session value tokens")
     ap.add_argument("--w-sel-task1", type=float, default=1.0,
                     help="checkpoint selection = validation Task 2 reward + this * validation Task 1 term_f1")
     ap.add_argument("--splits", default="/tmp2/mzjiang_usersim/grpo_planner/splits_v1.json")
@@ -760,6 +781,8 @@ def parse_args(argv=None):
         ap.error("--G must be >= 2 (group baselines)")
     if not (a.temperature > 0):
         ap.error("training rollouts need --temperature > 0")
+    if a.stop_credit and a.algo != "grpo":
+        ap.error("--stop-credit 1 is implemented for grpo")
     if not a.dry_run:
         for k in (("planner_path",) if a.arm == "pend" else ("planner_path", "judge_adapter", "judge_base")):
             if getattr(a, k) is None:
