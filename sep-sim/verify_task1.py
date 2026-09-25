@@ -71,6 +71,15 @@ def main(argv=None):
     F2 = json.load(open(a.folds, encoding="utf-8"))
     goal_of, persona_of = F2["goal_of"], F2["persona_of"]
     forbidden = set()
+    if a.fold < 0 and meta.get("fold", -1) >= 0:
+        a.fold = int(meta["fold"])                     # a fold run is always checked against its fold
+    if meta.get("sessions") in ("fold-validation", "fold-test") and a.fold < 0:
+        rep.ok("leakage.fold", False, "fold run without a fold: the forbidden-pool check cannot run")
+    if a.fold >= 0 and meta.get("sessions") in ("fold-validation", "fold-test"):
+        spx = [x for x in json.load(open(a.splits, encoding="utf-8"))["folds"] if x["fold"] == a.fold][0]
+        want = sorted(spx["validation"] if meta["sessions"] == "fold-validation" else spx["test_all"])
+        rep.ok("structure", sorted(meta.get("session_ids") or []) == want,
+               "scored ids are not splits[%d].%s" % (a.fold, "validation" if meta["sessions"] == "fold-validation" else "test_all"))
     if a.fold >= 0:
         sp = [x for x in json.load(open(a.splits, encoding="utf-8"))["folds"] if x["fold"] == a.fold][0]
         forbidden = set(sp["forbidden_for_training"])
@@ -119,7 +128,7 @@ def main(argv=None):
             n_hit += bool(r.get("planner_hit_max_new"))
             n_unp += bool(r.get("planner_unparsed"))
             pt = r.get("planner_prompt_tokens")
-            rep.ok("trunc.planner", pt is None or pt <= pb, "%s prompt %s > %s" % (w, pt, pb))
+            rep.ok("trunc.planner", pt is not None and pt <= pb, "%s prompt %s > %s" % (w, pt, pb))
             sf = r.get("speaker_fit") or {}
             stoks = sf.get("final_tokens") if sf.get("compacted") else sf.get("original_tokens")
             rep.ok("trunc.speaker", stoks is None or stoks <= sb, "%s speaker prompt %s > %s" % (w, stoks, sb))
@@ -154,8 +163,10 @@ def main(argv=None):
             for slot in (r.get("fewshot") or []):
                 for ex_cid, _ in slot:
                     rep.ok("leakage.fewshot", ex_cid != cid, "%s example from the same conversation" % w)
-                    rep.ok("leakage.fewshot", goal_of.get(ex_cid) != goal_of.get(cid), "%s example shares the goal" % w)
-                    rep.ok("leakage.fewshot", persona_of.get(ex_cid) != persona_of.get(cid), "%s example shares the persona" % w)
+                    rep.ok("leakage.fewshot", goal_of.get(ex_cid) is not None and goal_of.get(ex_cid) != goal_of.get(cid),
+                           "%s example shares the goal (or has no goal id)" % w)
+                    rep.ok("leakage.fewshot", persona_of.get(ex_cid) is not None and persona_of.get(ex_cid) != persona_of.get(cid),
+                           "%s example shares the persona (or has no persona id)" % w)
                     rep.ok("leakage.fewshot", ex_cid not in forbidden, "%s example from validation/test %s" % (w, ex_cid[:10]))
     if "session_ids" in meta:
         missing = sorted(set(meta["session_ids"]) - set(by))

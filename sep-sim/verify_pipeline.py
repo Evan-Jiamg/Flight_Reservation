@@ -736,6 +736,14 @@ def verify(episodes, meta_path, splits_path, fold, split, arm=None, training=Fal
             rep.note("%s.system_prompt_sha" % arm, "expected sha recomputed from sepsim")
     check_system_sha(meta, arm, expected_sha, rep)
     check_leakage(all_rows, splits, fold, split, training, rep)
+    if arm == "pend":
+        check_fewshot_leak(all_rows, splits, fold, rep)
+        if not training:
+            # evaluation: an unclean episode (cut R0 reply, lost ledger verdict, capped emission, compaction)
+            # has a wrong coverage/turn count and cannot be silently averaged in -- rerun it
+            for r in rows:
+                rep.ok("eval.clean", r.get("clean") is True, "%s s%s" % (str(r.get("conversation_id"))[:12], r.get("seed")),
+                       "evaluation episode is not clean: %r" % (r.get("episode_counters"),))
     check_structure(all_rows, arm, rep)
     sb = speaker_budget or meta.get("speaker_budget") or F.SPEAKER_BUDGET
     check_truncation(all_rows, arm, meta, sb, judge_budget, max_new_warn, rep)
@@ -752,6 +760,32 @@ def verify(episodes, meta_path, splits_path, fold, split, arm=None, training=Fal
                 check_truncation(vrows, arm, meta, sb, judge_budget, max_new_warn, rep)
                 {"a2": check_a2, "pend": check_pend, "a0": check_a0}[check_family(arm)](vrows, rep, arm)
     return rep
+
+
+FOLDS_GP = "/tmp2/hchsu/trec2026-usersim-benchmark/domains/main_dataset_search/folds3_goal_persona_v1.json"
+
+
+def check_fewshot_leak(rows, splits, fold, rep, folds_gp=FOLDS_GP):
+    """Task 2 few-shot examples: never the same conversation, goal or persona; never validation/test."""
+    used = [(r, s) for r in rows for s in (r.get("trace") or []) if s.get("fewshot")]
+    if not used:
+        return
+    if not os.path.exists(folds_gp):
+        rep.ok("leak.fewshot", False, "fewshot", "goal/persona manifest %s missing: cannot check" % folds_gp)
+        return
+    G = json.load(open(folds_gp, encoding="utf-8"))
+    goal_of, persona_of = G["goal_of"], G["persona_of"]
+    f = {int(x["fold"]): x for x in splits["folds"]}.get(fold, {})
+    forb = set(f.get("forbidden_for_training", []))
+    for r, s in used:
+        cid = r.get("conversation_id")
+        w = "%s t%s" % (str(cid)[:12], s.get("t"))
+        for slot in s["fewshot"]:
+            for ex_cid, _ in slot:
+                ok = (ex_cid != cid and ex_cid not in forb and goal_of.get(ex_cid) is not None
+                      and goal_of.get(ex_cid) != goal_of.get(cid) and persona_of.get(ex_cid) is not None
+                      and persona_of.get(ex_cid) != persona_of.get(cid))
+                rep.ok("leak.fewshot", ok, w, "example %s: same conversation/goal/persona, no ids, or validation/test" % str(ex_cid)[:12])
 
 
 def check_rl_selection(rl_dir, splits, fold, rep):

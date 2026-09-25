@@ -132,6 +132,8 @@ def load_split(path, fold):
     assert set(val) <= forbidden, "validation must be listed as forbidden for training"
     assert not set(train) & set(val), "train/validation overlap"
     assert not set(f.get("train_all", train)) & forbidden, "train_all intersects forbidden_for_training"
+    for k, n in (f.get("sizes") or {}).items():          # the declared sizes of the split file
+        assert len(f[k]) == n, "splits fold %d: %s has %d ids, declared %d" % (fold, k, len(f[k]), n)
     # the test ids are not kept in memory at all (only through 'forbidden')
     return {"fold": int(fold), "train": train, "train_all": list(f.get("train_all", train)),
             "validation": val, "forbidden": forbidden, "sha256": sha_file(path)}
@@ -754,6 +756,8 @@ class Trainer:
                "controller": self.a.controller, "cfg_used": cfg, "cfg_used_sha256": RR.cfg_sha(cfg),
                "reward_ctx": ctx, "next_cfg": self.cfg, "scenarios": [g[0]["conversation_id"] for g in groups_all],
                "train_aggregate": hist, "learner_stats": stats, "n_samples": len(samples),
+               "controller_failures": getattr(self.controller, "n_failures", None),
+               "controller_rollbacks": getattr(self.controller, "n_rollbacks", None),
                "policy_sha_after": self.learner.policy_sha(), "time": time.time(), "update_s": time.time() - t0}
         self.save_checkpoint(u, row)
         append_jsonl(self.p_upd, row)
@@ -963,6 +967,8 @@ def parse_args(argv=None):
     off = {k: getattr(a, k) for k in SPEC if getattr(a, k) != SPEC[k]}
     if a.controller != "llm":
         off["controller"] = a.controller
+    if a.planner_path and "Qwen3-4B-Instruct-2507" not in a.planner_path:
+        off["planner_path"] = a.planner_path          # the spec's Planner is Qwen3-4B-Instruct-2507
     if a.config:
         ver = (json.load(open(a.config, encoding="utf-8")).get("reward") or {}).get("version", "v4")
         if ver != "v4":

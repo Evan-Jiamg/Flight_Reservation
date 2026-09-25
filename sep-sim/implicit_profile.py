@@ -157,6 +157,10 @@ class FewShotPool:
     def __init__(self, recs_by_cid, allowed, goal_of, persona_of, split_messages):
         self.goal_of, self.persona_of = dict(goal_of), dict(persona_of)
         self.allowed = set(allowed)
+        missing = sorted(c for c in self.allowed if self.goal_of.get(c) is None or self.persona_of.get(c) is None)
+        if missing:
+            # without the ids, an example sharing the goal/persona could not be excluded
+            raise KeyError("pool conversations without goal/persona ids: %s" % missing[:5])
         self.items = []
         for cid in sorted(self.allowed):
             rec = recs_by_cid[cid]

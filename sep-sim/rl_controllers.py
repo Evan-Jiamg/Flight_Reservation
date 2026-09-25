@@ -417,8 +417,11 @@ class LLMFactorController(Controller):
         try:
             resp = self.transport(req)
             rec["response_sha256"] = sha256(json.dumps(resp, sort_keys=True))
+            rec["finish_reason"] = resp["choices"][0].get("finish_reason")
             content = resp["choices"][0]["message"].get("content") or ""
             rec["response_content"] = content[:4000]
+            if rec["finish_reason"] == "length":
+                raise ValueError("controller reply cut by max_tokens=%s" % self.opt["max_tokens"])
             prop = first_json_object(content)
             facs = prop.get("factors") or {}
             if not isinstance(facs, dict):

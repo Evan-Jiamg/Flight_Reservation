@@ -124,6 +124,10 @@ def main(argv=None):
             check_rl_settings(a.planner_adapter, {"arm": "pend", "implicit_profile": a.implicit_profile,
                                                   "selector": a.selector})
             used = set(man.get("train_scenarios", [])) | set(man.get("train_conversations", [])) | set(man.get("fewshot_pool", []))
+            if man.get("splits_sha256") and man["splits_sha256"] != sha_file(a.splits):
+                raise SystemExit("LEAK GATE: adapter was trained with another split file (sha differs)")
+            if used & set(f["forbidden_for_training"]):
+                raise SystemExit("LEAK GATE: adapter used validation/test conversations: %s" % sorted(used & set(f["forbidden_for_training"]))[:5])
             if used & set(cids):
                 raise SystemExit("LEAK GATE: adapter was trained on sessions scored here: %s" % sorted(used & set(cids))[:5])
     if a.limit:

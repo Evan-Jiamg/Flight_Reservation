@@ -30,12 +30,17 @@ def sha_file(p):
     return hashlib.sha256(open(p, "rb").read()).hexdigest()
 
 
+SPLITS_SHA = {"sha": None}
+
+
 def check_manifest(path, fold, split_fold, what):
     if not os.path.exists(path):
         return None
     m = json.load(open(path))
     if "fold" in m and int(m["fold"]) != fold:
         raise SystemExit("LEAK GATE: %s trained for fold %s, evaluating fold %d" % (what, m["fold"], fold))
+    if m.get("splits_sha256") and SPLITS_SHA.get("sha") and m["splits_sha256"] != SPLITS_SHA["sha"]:
+        raise SystemExit("LEAK GATE: %s was trained with another split file (sha differs)" % what)
     train = set(m.get("train_scenarios") or [])
     if train and not train <= set(split_fold["train"]):
         raise SystemExit("LEAK GATE: %s trained on non-train scenarios %s" % (what, sorted(train - set(split_fold["train"]))[:3]))
@@ -116,6 +121,7 @@ def main():
     sf = [f for f in splits["folds"] if f["fold"] == args.fold][0]
     scen = list(sf[args.split])
     gate = {"fold": args.fold, "split": args.split, "n_scenarios": len(scen), "splits_sha256": sha_file(args.splits)}
+    SPLITS_SHA["sha"] = gate["splits_sha256"]
     if args.arm in ("a2", "final") and args.smoke and not args.judge_adapter:
         if not args.judge_base:
             raise SystemExit("--smoke still needs --judge-base")

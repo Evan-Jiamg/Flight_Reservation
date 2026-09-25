@@ -100,7 +100,7 @@ JUDGE_RETRY_TOKENS = int(os.environ.get("JUDGE_RETRY_TOKENS", "8000"))   # one r
 # incident to exactly one episode (the *_total counters on the clients stay process-wide).
 _EP = threading.local()
 EPISODE_COUNTERS = ("r0_len_retries", "r0_len_truncated", "r0_ctx_fit", "r0_empty",
-                    "judge_empty", "judge_unparseable", "judge_retries")
+                    "judge_empty", "judge_unparseable", "judge_retries", "judge_retry_failed")
 
 
 def episode_begin():
@@ -113,10 +113,23 @@ def episode_end():
     return dict(c) if c else {k: 0 for k in EPISODE_COUNTERS}
 
 
+_ORPHANS = {"n": 0}
+_ORPHAN_LOCK = threading.Lock()
+
+
 def _ep_count(name):
     c = getattr(_EP, "counts", None)
     if c is not None:
         c[name] += 1
+    else:
+        # an incident on a thread with no active episode: if an episode is running, the one-episode-per-thread
+        # assumption is broken (e.g. the Ledger fans judge calls out to a pool) -- run_episode refuses then
+        with _ORPHAN_LOCK:
+            _ORPHANS["n"] += 1
+
+
+def orphan_incidents():
+    return _ORPHANS["n"]
 
 
 def rl_masks(planner, g, unparsed, diag, t):
@@ -258,7 +271,7 @@ def make_floor_judge(Judge):
             super().__init__(*a, **kw)
             self.gpt5 = str(self.model).startswith("gpt-5")
             self.floor = None if self.gpt5 else JUDGE_MIN_TOKENS
-            self.n_empty = self.n_unparseable = self.n_retries = 0
+            self.n_empty = self.n_unparseable = self.n_retries = self.n_retry_failed = 0
             self._lock = threading.Lock()
 
         def chat(self, system, user, max_tokens=400):
@@ -269,7 +282,12 @@ def make_floor_judge(Judge):
                 with self._lock:
                     self.n_retries += 1
                 _ep_count("judge_retries")
-                out = super().chat(system, user, JUDGE_RETRY_TOKENS)
+                try:
+                    out = super().chat(system, user, JUDGE_RETRY_TOKENS)
+                except Exception:                  # e.g. prompt + 8000 over the server context: keep the first answer
+                    with self._lock:
+                        self.n_retry_failed += 1
+                    _ep_count("judge_retry_failed")
             if not (out or "").strip():
                 with self._lock:
                     self.n_empty += 1
@@ -551,6 +569,14 @@ class Task2Env:
         # reasoning_effort=minimal. A substitute endpoint (e.g. gpt-oss-120b on vLLM) is set with
         # R0_BASE_URL/R0_MODEL and JUDGE_BASE_URL/JUDGE_MODEL; gpt-oss has no "minimal", so the
         # effort is set with R0_REASONING_EFFORT / JUDGE_REASONING_EFFORT. All of it is in describe().
+        if arm == "pend" and os.environ.get("PEND_ALLOW_OTHER_ENDPOINTS") != "1":
+            # user decision (option A): R0 and the ledger judge are our own gpt-oss-120b on vLLM
+            for k in ("R0_BASE_URL", "JUDGE_BASE_URL"):
+                if not os.environ.get(k) or "api.openai.com" in os.environ[k]:
+                    raise RuntimeError("%s must point at the local gpt-oss-120b server for the pend arm" % k)
+            for k in ("R0_MODEL", "JUDGE_MODEL"):
+                if os.environ.get(k) != "gpt-oss-120b":
+                    raise RuntimeError("%s must be gpt-oss-120b for the pend arm (got %r)" % (k, os.environ.get(k)))
         self.r0_effort = os.environ.get("R0_REASONING_EFFORT", "minimal")
         self.judge_effort = os.environ.get("JUDGE_REASONING_EFFORT", "minimal")
         self.ledger_judge = make_floor_judge(Judge)(reasoning_effort=self.judge_effort, verbose=False,
@@ -976,11 +1002,15 @@ class Task2Env:
         S, speak, respond, ledger, rid = ss["S"], ss["speak"], ss["respond"], ss["ledger"], ss["rid"]
         # e16: E1.6 SEPSIM_PLANNER_END -- the Planner's Complete act ends the episode after the
         # closing message it asked for (emitted, no assistant reply). v3 arms exit silently instead.
+        orphans0 = orphan_incidents()
         episode_begin()
         try:
             ep = run_episode(T_MAX, None, speak, respond, planner_end=(arm in EMIT_END_ARMS))
         finally:
             counts = episode_end()
+        if orphan_incidents() != orphans0:
+            raise RuntimeError("an R0/judge incident was counted outside any episode thread while %s ran: per-episode "
+                               "attribution is broken, so no episode can be marked clean" % conversation_id)
         capped = sum(1 for s in ep["trace"] if s.get("emitted_capped"))
         compacted = sum(1 for s in ep["trace"] if step_compacted(s))
         clean = episode_clean(counts) and capped == 0 and compacted == 0 and ep["emitted_user_turns"] > 0
