@@ -523,8 +523,8 @@ def check_pend(rows, rep, arm="pend"):
             w = "%s s%s t%s" % (str(r.get("conversation_id"))[:12], r.get("seed"), s.get("t"))
             cands, reasons = s["candidates"], s.get("guard_reasons") or [""] * len(s["candidates"])
             hits = s.get("speaker_hit_max_new")
-            rep.ok("trunc.speaker_max_new_recorded", isinstance(hits, list) and len(hits) == len(cands), w,
-                   "speaker_hit_max_new missing")
+            rep.ok("trunc.speaker_max_new_recorded", isinstance(hits, list) and len(hits) == len(cands)
+                   and all(h is not None for h in hits), w, "speaker_hit_max_new missing or unknown (None)")
             if isinstance(hits, list) and len(hits) == len(cands):
                 n_cand += len(cands)
                 n_hit_any += sum(bool(h) for h in hits)
@@ -547,6 +547,10 @@ def check_pend(rows, rep, arm="pend"):
     name = "pend.duplicates_left"
     rep._c(name)
     (rep.warn if n_dup_left else rep.note)(name, "duplicate candidates left after redraws: %d" % n_dup_left)
+    unp = max([r.get("ledger_judge_unparseable_total") or 0 for r in rows] or [0])
+    name = "pend.ledger_judge_unparseable"
+    rep._c(name)
+    (rep.warn if unp else rep.note)(name, "ledger-judge answers that are not a verdict object (running total) %d" % unp)
     r0t = max([r.get("r0_len_truncated_total") or 0 for r in rows] or [0])
     rep.ok("trunc.r0_reply", r0t == 0, "episodes", "%d R0 replies still cut by the token budget" % r0t)
     rep.note("trunc.r0_reply", "R0 length retries (running total) %d" % max([r.get("r0_len_retries_total") or 0 for r in rows] or [0]))

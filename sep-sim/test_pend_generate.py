@@ -111,7 +111,8 @@ def fake_say_many(reqs):
             txt = "I need taipei air data" if len(calls) in (1, 2, 3) else "something else entirely here"
         else:
             txt = "fresh draw %d about taipei" % len(calls)
-        out.append((txt, False, {"original_tokens": 100 + len(calls), "dropped_exchanges": 0, "compacted": False}, False))
+        out.append((txt, False, {"original_tokens": 100 + len(calls), "dropped_exchanges": 0, "compacted": False},
+                    len(calls) == 4))           # the 4th draw was cut by the Speaker cap
     return out
 class FakeScorer:
     def similarities(self, cands, refs):
@@ -154,5 +155,7 @@ def test_pend_generate_end_to_end_with_fake_speaker():
     assert r["temps"][0] == 0.0 and all(t == 0.7 for t in r["temps"][1:])
     # Task 2: style references are the few-shot examples; the selected candidate passed every guard
     assert r["sel_refs"] == "fewshot" and r["reasons"][r["sel"]] == ""
+    # a candidate cut by the Speaker cap is ineligible and never selected
+    assert r["hits"][3] is True and r["reasons"][3] == "max_new" and r["sel"] != 3
     assert r["fit"]["original_tokens"] == max(100 + i for i in range(1, len(r["blocks"]) + 1)) or r["fit"]["original_tokens"] > 100
     assert len(r["hits"]) == len(r["cands"]) and len(r["fewshot"]) == len(r["cands"])

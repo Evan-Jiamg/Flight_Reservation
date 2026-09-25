@@ -24,8 +24,11 @@ import hashlib
 import random
 import re
 
-MAX_NOTES = 6
-MAX_NOTE_CHARS = 400
+# Declared constants (reported with the results):
+#   COPY_NGRAM = 8   a run of 8 identical consecutive words is a clause-level copy of another person's
+#                    message; shorter shared runs are ordinary phrases ("i am looking for a dataset").
+#   k = 3 examples per candidate (FewShotPool.select) -- enough to show a style, small next to the prompt.
+# Every Implicit Profile note is kept and sent, uncut (user requirement: all iterations reach the Speaker).
 COPY_NGRAM = 8
 GREET = re.compile(r"^\s*(hi|hello|hey|dear|good (morning|afternoon|evening)|thanks|thank you)\b", re.I)
 IP_HEAD = "\n\nWHAT YOU HAVE LEARNED ABOUT HOW THIS PERSON WRITES (your own notes, oldest first)\n"
@@ -74,7 +77,7 @@ def task1_context(real_users, preds, t):
 
 
 def render_planner_sections(notes, ctx):
-    notes = [n for n in (notes or []) if n][-MAX_NOTES:]
+    notes = [n for n in (notes or []) if n]
     s = IP_HEAD + ("\n".join("- " + n for n in notes) if notes else "- (no notes yet)")
     if ctx and ctx.get("mode") == "task1":
         s += (T1_HEAD + "- you predicted: \"%s\"\n- they really wrote the last USER message below\n- measured: %s\n"
@@ -88,13 +91,12 @@ def render_planner_sections(notes, ctx):
 
 
 def clean_note(note):
-    n = " ".join(str(note or "").split())
-    return n[:MAX_NOTE_CHARS]
+    return " ".join(str(note or "").split())
 
 
 def speaker_lines(notes, examples):
     out = []
-    notes = [n for n in (notes or []) if n][-MAX_NOTES:]
+    notes = [n for n in (notes or []) if n]
     if notes:
         out.append(SPK_NOTES + " | ".join(notes))
     if examples:
@@ -141,7 +143,7 @@ def style_key(persona):
 class FewShotPool:
     """Real user messages from an allowed set of conversations, keyed by style."""
 
-    def __init__(self, recs_by_cid, allowed, goal_of, persona_of, split_messages, max_words=80):
+    def __init__(self, recs_by_cid, allowed, goal_of, persona_of, split_messages):
         self.goal_of, self.persona_of = dict(goal_of), dict(persona_of)
         self.allowed = set(allowed)
         self.items = []
@@ -151,7 +153,7 @@ class FewShotPool:
             key = style_key((rec.get("scenario") or {}).get("persona"))
             for i, u in enumerate(users):
                 txt = " ".join((u.get("text") or "").split())
-                if txt and len(words(txt)) <= max_words:
+                if txt:
                     self.items.append({"cid": cid, "t": i + 1, "text": txt, "key": key})
 
     def describe(self):
@@ -163,7 +165,9 @@ class FewShotPool:
         (conversation, turn, variant); each candidate of a turn uses its own variant, so the Speaker
         prompts of the candidates differ."""
         key = style_key(persona)
-        g, p = self.goal_of.get(cid), self.persona_of.get(cid)
+        if cid not in self.goal_of or cid not in self.persona_of:
+            raise KeyError("conversation %s has no goal/persona id: the exclusion rule cannot be applied" % cid)
+        g, p = self.goal_of[cid], self.persona_of[cid]
         allowed = [x for x in self.items if x["cid"] != cid
                    and (g is None or self.goal_of.get(x["cid"]) != g)
                    and (p is None or self.persona_of.get(x["cid"]) != p)]

@@ -556,6 +556,8 @@ class Trainer:
                 return rows
             prompts = self.env.task1_prompts(cid)
             n = len(prompts)
+            if n < 2:
+                return []                    # turn 1 never ends: a one-message conversation has no stop decision
             pos = [n] + ([2 + int(x * (n - 2))] if n >= 3 else [])
             for t in pos:
                 pr = prompts[t - 1]

@@ -355,7 +355,7 @@ def read_plan_pend(raw, turn, scenario, rng, ledger):
     diag["goal_met_raw"] = d.get("goal_met")
     sw = " ".join(str(d.get("still_wanted", "") or "").split())
     fields["still_wanted"] = sw
-    fields["profile_note"] = " ".join(str(d.get("profile_note", "") or "").split())[:400]
+    fields["profile_note"] = " ".join(str(d.get("profile_note", "") or "").split())      # never cut
     if end:
         comp = []
         for e in (d.get("act_distribution") or []):

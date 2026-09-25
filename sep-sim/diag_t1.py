@@ -3,8 +3,10 @@
 
 The benchmark (docs/metric_specs.md; tools/metrics/surface.py) computes distinct1 / distinct2 /
 first_turn_dup_rate over EVERY first-turn candidate (greedy + samples); that official definition is what
-is compared with E1.6. This script reports the same formulas on the single emitted first message per
-conversation, labelled as a diagnostic, next to the official values recomputed with the same code.
+is compared with E1.6. This script copies those formulas line for line (lower-cased whitespace split,
+bigrams over the flattened stream, duplicate rate over the non-empty strings) and reports them on the
+single emitted first message per conversation, labelled as a diagnostic. The "official" column here is
+a re-implementation for side-by-side reading; the number to cite is score_method.py's.
 """
 import json
 import sys

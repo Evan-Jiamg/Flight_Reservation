@@ -76,6 +76,19 @@ def main(argv=None):
         rep.ok("structure", ts == list(range(1, n + 1)), "%s turns %s != 1..%d" % (cid[:10], ts[:12], n))
         kk = k1_by.get(cid, [])
         rep.ok("structure", len(kk) == 1 and kk[0]["turn_index"] == n + 1, "%s K+1 rows %d" % (cid[:10], len(kk)))
+        for r in kk:                                   # the K+1 turn is generated like any other: same checks
+            w = "%s K+1" % cid[:10]
+            pt = r.get("planner_prompt_tokens")
+            rep.ok("trunc.planner", pt is not None and pt <= pb, "%s prompt %s > %s" % (w, pt, pb))
+            sf = r.get("speaker_fit") or {}
+            stoks = sf.get("final_tokens") if sf.get("compacted") else sf.get("original_tokens")
+            rep.ok("trunc.speaker", stoks is not None and stoks <= sb, "%s speaker prompt %s > %s" % (w, stoks, sb))
+            hits = r.get("speaker_hit_max_new")
+            rep.ok("trunc.speaker_recorded", isinstance(hits, list) and all(h is not None for h in hits), "%s cap hits unknown" % w)
+            if isinstance(hits, list) and r.get("selected_index") is not None:
+                rep.ok("trunc.speaker_selected", not hits[r["selected_index"]], "%s selected candidate cut by the cap" % w)
+            n_hit += bool(r.get("planner_hit_max_new"))
+            n_steps += 1
         for r in rs:
             w = "%s t%d" % (cid[:10], r["turn_index"])
             n_steps += 1
@@ -87,6 +100,8 @@ def main(argv=None):
             stoks = sf.get("final_tokens") if sf.get("compacted") else sf.get("original_tokens")
             rep.ok("trunc.speaker", stoks is None or stoks <= sb, "%s speaker prompt %s > %s" % (w, stoks, sb))
             hits = r.get("speaker_hit_max_new")
+            rep.ok("trunc.speaker_recorded", isinstance(hits, list) and all(h is not None for h in hits),
+                   "%s speaker cap hits not recorded" % w)
             if isinstance(hits, list):
                 n_cand += len(hits)
                 n_cand_hit += sum(bool(h) for h in hits)

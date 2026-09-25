@@ -169,13 +169,25 @@ def make_tracking_r0(R0Client):
     return TrackingR0
 
 
+def _parses_as_object(text):
+    import re
+    t = (text or "").strip()
+    m = re.search(r"\{.*\}", t, re.S)
+    if not m:
+        return False
+    try:
+        return isinstance(json.loads(m.group(0)), dict)
+    except ValueError:
+        return False
+
+
 def make_floor_judge(Judge):
     class FloorJudge(Judge):
         def __init__(self, *a, **kw):
             super().__init__(*a, **kw)
             self.gpt5 = str(self.model).startswith("gpt-5")
             self.floor = None if self.gpt5 else JUDGE_MIN_TOKENS
-            self.n_empty = 0
+            self.n_empty = self.n_unparseable = 0
             self._lock = threading.Lock()
 
         def chat(self, system, user, max_tokens=400):
@@ -183,6 +195,9 @@ def make_floor_judge(Judge):
             if not (out or "").strip():
                 with self._lock:
                     self.n_empty += 1
+            elif not _parses_as_object(out):
+                with self._lock:
+                    self.n_unparseable += 1          # e.g. an answer cut by the budget: the Ledger credits nothing
             return out
     return FloorJudge
 
@@ -321,7 +336,8 @@ class PlannerLM:
             self.n_calls += 1
             res.append({"raw": self.tok.decode(gen, skip_special_tokens=True), "prompt_text": user_fit,
                         "prompt_ids": list(ids), "gen_ids": gen,
-                        "fit": {**fit, "prompt_tokens": len(ids), "budget": self.budget, "batched": len(items)},
+                        "fit": {**fit, "prompt_tokens": len(ids), "budget": self.budget, "batched": len(items),
+                                "batch_seed": int(items[0]["seed"]) if (t0 and t0 > 0) else None},
                         "hit_max_new": cut is None and len(gen) >= self.max_new})
         return res
 
@@ -460,11 +476,12 @@ class Task2Env:
                                                     max_batch=2 * max_batch, name="speaker-batcher")
 
     def _plan(self, system, user, temperature, top_p, seed):
+        item = {"system": system, "user": user, "temperature": temperature, "top_p": top_p, "seed": seed}
         if self.planner_batcher is not None:
-            return self.planner_batcher({"system": system, "user": user, "temperature": temperature,
-                                         "top_p": top_p, "seed": seed})
+            return self.planner_batcher(item)
+        # unbatched: the SAME function as the batched path, one item at a time (identical code, no padding)
         with self.gpu_lock:
-            return self.planner.generate(system, user, temperature, top_p, seed)
+            return self.planner.generate_batch([item])[0]
 
     def _plan_many(self, items):
         if self.planner_batcher is not None:
@@ -472,10 +489,17 @@ class Task2Env:
         return [self._plan(it["system"], it["user"], it["temperature"], it["top_p"], it["seed"]) for it in items]
 
     def _say_many(self, reqs):
-        """-> [(text, ended, fit)] in request order."""
+        """-> [(text, ended, fit, hit_max_new)] in request order."""
         if self.speaker_batcher is not None:
             return self.speaker_batcher.map(reqs)
-        out = []
+        if hasattr(self.speaker, "say_batch"):
+            # unbatched: the SAME function as the batched path, one request at a time (cap hits recorded)
+            out = []
+            for r in reqs:
+                with self.gpu_lock:
+                    out.append(self.speaker.say_batch([r])[0])
+            return out
+        out = []                       # legacy arms (v2fix tree Ditto): cap hit not measurable
         for r in reqs:
             with self.gpu_lock:
                 txt, e = self.speaker.say(r["scenario_text"], r["block"], r["hist_u"], r["hist_a"], r["turn"],
@@ -681,7 +705,6 @@ class Task2Env:
         return {"S": S, "speak": speak, "respond": respond, "ledger": ledger, "led": led, "ag": ag,
                 "rid": rid, "scenario": scenario}
 
-    DUP_REDRAW = 4
 
     def _pend_generate(self, base, block, fields, S, t, sid, sc_text, hist_u, hist_a, cid, scenario, unparsed):
         """pend generation stage. Same guards and schedule as the other arms (greedy + NSAMP samples at
@@ -742,6 +765,8 @@ class Task2Env:
 
         def reason_of(i):
             c = cands[i]
+            if hits[i]:
+                return "max_new"             # cut by the Speaker's token cap: never emitted
             r = run_v2.guard_reason(c, prior)
             exs = all_examples()
             if not r and exs and IP.copies_example(c, exs):
@@ -754,7 +779,7 @@ class Task2Env:
 
         reasons = [reason_of(i) for i in range(len(cands))]
         dup_redraws = 0
-        for rnd in range(1, self.DUP_REDRAW + 1):
+        for rnd in range(1, run_v2.REDRAW + 1):          # the same redraw budget as E1.6's all-fail rule
             dups = [i for i, x in enumerate(reasons) if x == "duplicate"]
             if not dups:
                 break
@@ -828,6 +853,7 @@ class Task2Env:
                 "coverage": round(ledger.coverage(), 4), "complete": ledger.complete(),
                 "n_req": len(self.reqs[conversation_id]["req"]), "ledger": ledger.as_dict(), "trace": ep["trace"],
                 "ledger_judge_empty_total": self.ledger_judge.n_empty,
+                "ledger_judge_unparseable_total": self.ledger_judge.n_unparseable,
                 "r0_empty_retries_total": getattr(self.r0, "n_empty_retries", None),
                 "r0_len_retries_total": self.r0.n_len_retries, "r0_len_truncated_total": self.r0.n_len_truncated,
                 "r0_ctx_fit_total": self.r0.n_ctx_fit,
@@ -901,7 +927,12 @@ class Task2Env:
               "ended_empty": not (st["user"] or "").strip(),
               "ended": bool(st["ended_speaker"]) or bool(st["ended_planner"]),
               "greedy": st["user"], "greedy_ended": bool(st["ended_speaker"]) or bool(st["ended_planner"]),
-              "planner_move": st.get("move"), "planner_act": st.get("act"), "goal_met": st.get("goal_met")}
+              "planner_move": st.get("move"), "planner_act": st.get("act"), "goal_met": st.get("goal_met"),
+              "planner_hit_max_new": st.get("planner_hit_max_new"), "planner_unparsed": st.get("planner_unparsed"),
+              "planner_prompt_tokens": (st.get("planner_fit") or {}).get("prompt_tokens"),
+              "speaker_fit": st.get("speaker_fit"), "speaker_hit_max_new": st.get("speaker_hit_max_new"),
+              "guard_reasons": st.get("guard_reasons"), "selected_index": st.get("selected_index"),
+              "fewshot": st.get("fewshot")}
         return rows, k1
 
     def human_turns(self, conversation_id):
@@ -915,7 +946,7 @@ class Task2Env:
         Task 1 training group can sample G decisions from the same state the Planner would be in.
         With the Implicit Profile / few-shot on, the pass is the full Task 1 generation (the notes need the
         Speaker's predictions), i.e. exactly what the Task 1 evaluation runs."""
-        if self.ip or self.fewshot:
+        if self.arm == "pend":
             rows, _ = self.task1_generate(conversation_id, keep_prompts=True)
             n = len(rows)
             return [{"t": r["turn_index"], "n_real": n, "real_final": r["turn_index"] == n, "user_prompt": r["planner_prompt"]}
@@ -964,9 +995,9 @@ class Task2Env:
         Planner's alone in this architecture."""
         if self.arm != "pend":
             raise ValueError("run_task1 is implemented for the pend arm")
-        if self.ip or self.fewshot:
-            # the notes need the Speaker's predictions: run the full Task 1 generation (same code as the
-            # evaluation) and read the Planner's decisions off it
+        if self.arm == "pend":
+            # the full Task 1 generation (the same code as the evaluation; the Implicit Profile also needs
+            # the Speaker's predictions), with the Planner's decisions read off it
             rows, _ = self.task1_generate(conversation_id, seed=seed)
             n = len(rows)
             return {"conversation_id": conversation_id, "record_id": self.recs[conversation_id]["record_id"],

@@ -118,8 +118,19 @@ def main(argv=None):
     json.dump(meta, open(a.out + ".meta.json", "w"), indent=1)
     t0 = time.time()
 
+    errors = []
+
     def one(cid):
-        rows, k1 = env.task1_generate(cid)
+        try:
+            rows, k1 = env.task1_generate(cid)
+        except Exception as e:                      # recorded, never swallowed: the run exits non-zero
+            import traceback
+            with lock:
+                errors.append({"conversation_id": cid, "error": repr(e), "trace": traceback.format_exc()[-2000:]})
+                with open(a.out + ".errors.jsonl", "a", encoding="utf-8") as f:
+                    f.write(json.dumps(errors[-1]) + "\n")
+            print("  ERROR %s %r" % (cid[:10], e), flush=True)
+            return
         with lock:
             # a partial conversation from an interrupted run is replaced as a whole
             if cid in done and os.path.exists(a.out):
@@ -138,7 +149,9 @@ def main(argv=None):
 
     with ThreadPoolExecutor(max_workers=max(1, a.workers)) as ex:
         list(ex.map(one, todo))
-    print("DONE", json.dumps({"sessions": len(cids), "generated": len(todo)}), flush=True)
+    print("DONE", json.dumps({"sessions": len(cids), "generated": len(todo) - len(errors), "errors": len(errors)}), flush=True)
+    if errors:
+        raise SystemExit("%d conversation(s) failed; see %s.errors.jsonl" % (len(errors), a.out))
 
 
 if __name__ == "__main__":

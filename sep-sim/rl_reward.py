@@ -187,7 +187,8 @@ def reward_v3(episode, cfg):
     cov = float(episode["coverage"])
     if not (0.0 <= cov <= 1.0):
         raise ValueError("coverage %r outside [0, 1]" % cov)
-    len_err = abs(turns - human) / cfg["t_max"]
+    target = min(human, int(cfg["t_max"]))       # the protocol caps an episode at t_max: that is the reachable target
+    len_err = abs(turns - target) / cfg["t_max"]
     counts = {
         "unparsed": sum(bool(s.get("planner_unparsed")) for s in trace),
         "hit_max_new": sum(bool(s.get("planner_hit_max_new")) for s in trace),
@@ -197,7 +198,7 @@ def reward_v3(episode, cfg):
     rates = {k: counts[k] / n for k in CONSTRAINTS}
     penalty = sum(cfg["lambda_" + k] * rates[k] for k in CONSTRAINTS)
     total = cfg["w_cov"] * cov - cfg["w_len"] * len_err - penalty
-    comps = {"coverage": cov, "len_err": len_err, "turns": turns, "human_turns": human,
+    comps = {"coverage": cov, "len_err": len_err, "turns": turns, "human_turns": human, "turn_target": target,
              "turn_diff": turns - human, "decision_steps": n, "constraint_penalty": penalty}
     comps.update({"rate_" + k: rates[k] for k in CONSTRAINTS})
     return {"total": float(total), "components": comps}

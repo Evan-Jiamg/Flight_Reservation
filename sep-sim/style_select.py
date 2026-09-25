@@ -62,20 +62,20 @@ class StyleScorer:
         self._model = AutoModel.from_pretrained(self.path).to(self.device).eval()
         _ = torch
 
-    CHUNK_WORDS = 200          # well under BERT's 512 positions: long texts are chunked, never truncated
+    CHUNK_TOKENS = 450         # < 512 BERT positions incl. [CLS]/[SEP], with room for decode/re-encode drift
 
     def embed(self, texts):
-        """One normalised vector per text; a text longer than CHUNK_WORDS is split into chunks whose
-        embeddings are averaged (no truncation anywhere)."""
+        """One normalised vector per text; a text longer than CHUNK_TOKENS wordpieces is split into chunks
+        whose embeddings are averaged (no truncation anywhere)."""
         import torch
         with self._lock:
             if self._model is None:
                 self._load()
             pieces, owner = [], []
             for i, t in enumerate(texts):
-                w = (t or "").split() or [""]
-                for s in range(0, len(w), self.CHUNK_WORDS):
-                    pieces.append(" ".join(w[s:s + self.CHUNK_WORDS]))
+                ids = self._tok((t or ""), add_special_tokens=False)["input_ids"] or []
+                for s in range(0, max(1, len(ids)), self.CHUNK_TOKENS):
+                    pieces.append(self._tok.decode(ids[s:s + self.CHUNK_TOKENS]))
                     owner.append(i)
             enc = self._tok(pieces, padding=True, truncation=False, return_tensors="pt")
             if enc["input_ids"].shape[1] > 512:

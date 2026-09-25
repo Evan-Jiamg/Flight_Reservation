@@ -66,7 +66,7 @@ def main():
     ap.add_argument("--fewshot", choices=("off", "fold"), default="off",
                     help="fold: Speaker few-shot examples from splits[fold].train_all only (pend arm)")
     ap.add_argument("--selector", choices=("length", "borda"), default="length")
-    ap.add_argument("--batch", type=int, choices=(0, 1), default=0)
+    ap.add_argument("--batch", type=int, choices=(0, 1), default=1)
     ap.add_argument("--max-batch", type=int, default=8)
     ap.add_argument("--workers", type=int, default=1, help="episodes in threads (useful with --batch 1)")
     ap.add_argument("--smoke", action="store_true",
@@ -136,10 +136,21 @@ def main():
     from concurrent.futures import ThreadPoolExecutor
     lock = threading.Lock()
 
+    errors = []
+
     def one(job):
         cid, seed = job
         te = time.time()
-        row = env.run_episode(cid, seed, replicate=args.replicate)
+        try:
+            row = env.run_episode(cid, seed, replicate=args.replicate)
+        except Exception as e:                      # recorded, never swallowed: the run exits non-zero
+            import traceback
+            with lock:
+                errors.append({"conversation_id": cid, "seed": seed, "error": repr(e), "trace": traceback.format_exc()[-2000:]})
+                with open(out + ".errors.jsonl", "a", encoding="utf-8") as f:
+                    f.write(json.dumps(errors[-1]) + "\n")
+            print("  ERROR %s s%d %r" % (cid[:8], seed, e), flush=True)
+            return
         row.update(fold=args.fold, split=args.split, wall_seconds=round(time.time() - te, 1))
         with lock:
             with open(out, "a", encoding="utf-8") as f:
@@ -151,9 +162,13 @@ def main():
     todo = [j for j in jobs if j not in done]
     with ThreadPoolExecutor(max_workers=max(1, args.workers)) as ex:
         list(ex.map(one, todo))
-    print("DONE", json.dumps({"episodes": len(jobs), "planner_calls": planner.n_calls,
+    if errors:
+        print("ERRORS", len(errors), flush=True)
+    print("DONE", json.dumps({"episodes": len(jobs), "errors": len(errors), "planner_calls": planner.n_calls,
                               "judge_unparsed": judge.n_unparsed if judge else 0,
                               "speaker_regen": env.speaker.n_regen}), flush=True)
+    if errors:
+        raise SystemExit("%d episode(s) failed; see %s.errors.jsonl" % (len(errors), out))
 
 
 if __name__ == "__main__":

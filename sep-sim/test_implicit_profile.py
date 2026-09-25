@@ -32,7 +32,7 @@ def test_task1_context_reads_only_message_t_minus_1():
 def test_planner_sections():
     notes = ["n%d" % i for i in range(10)]
     s = IP.render_planner_sections(notes, None)
-    assert s.startswith(IP.IP_HEAD) and "- n9" in s and "- n3" not in s and "- n4" in s     # last 6
+    assert s.startswith(IP.IP_HEAD) and all("- n%d" % i in s for i in range(10))           # every note, uncut
     t1 = IP.render_planner_sections([], {"mode": "task1", "pred_prev": "Hello! Could you please list datasets?",
                                          "gold_prev": "need taipei pm2.5 data"})
     assert "(no notes yet)" in t1 and IP.T1_HEAD in t1 and 'you predicted: "Hello! Could you please list datasets?"' in t1
