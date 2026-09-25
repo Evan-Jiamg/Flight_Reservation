@@ -27,6 +27,13 @@ behaviour is also a finding ("unauthorised design change").
   by length are re-requested; still-cut replies are counted. Ledger judge floor 4000 tokens, one
   re-request at 8000 when the answer is not a verdict object; empty/unparseable answers counted.
 
+- The E1.6 "- stopping: <rule>" line appears ONLY in the Speaker block of the last message; the
+  Planner's own state never carries it (approved 2026-09-26).
+- Also approved (2026-09-26, previously implicit): an episode with no emitted message is unclean; with
+  no guard survivor a whole non-blank candidate is preferred over a whole blank one; end_session with no
+  Complete entry keeps the drawn act, and a Complete act with no non-Complete alternative is kept (both
+  counted, verify WARN); evaluation episodes must be clean (verify FAIL); T_MAX = 10.
+
 ## Implicit Profile (both tasks, from the first message)
 - Every turn t ≥ 2 the Planner writes `profile_note` (how THIS person writes; never advice to the
   assistant). Task 1: compare the simulator's PREDICTION of message t-1 with the REAL message t-1
@@ -42,6 +49,8 @@ behaviour is also a finding ("unauthorised design change").
   k = 3, COPY_NGRAM = 8, duplicate redraw rounds = 4. Also approved (2026-09-26): at turn 1 the
   examples prefer other people's FIRST messages (later turns: non-first messages); a candidate
   that writes our block headers / "profile_note" into the message is rejected ("template" guard).
+  The back-off is decided on the total count before the first-message preference; a repeated note is
+  compared ignoring case/whitespace; the copy guard checks against the examples of all slots (approved).
 
 ## Candidates + Selector
 - 4 candidates per turn (greedy + 3 samples at T 0.7 / top-p 0.9; turn 1 all sampled at the Ditto
@@ -66,7 +75,8 @@ behaviour is also a finding ("unauthorised design change").
   rest keeps the sequence-level advantage. stop_mask only on real decisions (t ≥ 2, parsed,
   valid end_session, not capped).
 - D4: profile_note tokens carry no sequence advantage (KL only).
-- Task 1 stop groups on train_all conversations (last message + one earlier, t ≥ 2), G samples,
+- Task 1 stop groups on train_all conversations (last message + one earlier, t ≥ 2), G samples; their
+  advantage acts on the end_session tokens only (approved),
   reward 1 if end_session agrees with the real person; non-decisions reward 0, no stop mask.
 - D2: auxiliary stop-token supervision on the Task 1 positions, annealed linearly to 0 (over 10
   updates) once validation Task 1 term_f1 beats the untrained policy's. Its weight w_aux is NOT

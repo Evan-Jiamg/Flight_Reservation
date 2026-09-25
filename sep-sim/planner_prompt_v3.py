@@ -443,8 +443,14 @@ LAST_MESSAGE_LINE = "\n- this is their last message: they close the conversation
 
 
 def speaker_block_pend(fields, last_line=True):
-    """The block for the Speaker; last_line=False gives the Planner's own state (no Speaker-only line)."""
-    blk = PP.render_block(fields, (fields.get("still_wanted") or "(nothing named)", ""))
+    """The block for the Speaker; last_line=False gives the Planner's own state (no Speaker-only line).
+    E1.6 render_block shows "- stopping: <stop_rule>" whenever a rule is named, even on a message that is NOT
+    the last one (a stop cue to Ditto mid-conversation). pend (user 2026-09-26): the stopping line appears only
+    in the Speaker block of the last message; the Planner's own state never carries it."""
+    f = fields
+    if not (last_line and fields.get("last_message")) and (fields.get("stop_rule") or "none") != "none":
+        f = dict(fields, stop_rule="none")
+    blk = PP.render_block(f, (fields.get("still_wanted") or "(nothing named)", ""))
     if last_line and fields.get("last_message"):
         blk += LAST_MESSAGE_LINE            # the closing signal is explicit, not only implied by the act
     return blk

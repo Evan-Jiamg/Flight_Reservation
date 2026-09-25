@@ -86,3 +86,29 @@ def test_task1_metrics_count_capped_emissions():
     conv = {"turns": [{"t": 1, "real_final": False, "ended_planner": False, "emitted_capped": True},
                       {"t": 2, "real_final": True, "ended_planner": True}]}
     assert T1.task1_stop_metrics([conv])["n_emitted_capped_turns"] == 1
+
+
+STOP_CODE = """
+import json
+import task2_env as T2
+T2.setup_environment("pend")
+import planner_prompt_v3 as V3
+f = {"move": "Inquire", "act": "ask_more", "stop_rule": "satiation", "still_wanted": "x", "last_message": False}
+g = dict(f, move="Complete", act="settle", last_message=True)
+print(json.dumps([V3.speaker_block_pend(f), V3.speaker_block_pend(f, last_line=False),
+                  V3.speaker_block_pend(g), V3.speaker_block_pend(g, last_line=False)]))
+"""
+
+
+@pytest.mark.skipif(not os.path.isdir(os.path.join(E1R, "sepsim")), reason="E1.6 tree not present")
+def test_stopping_line_only_on_the_last_message_speaker_block():
+    import subprocess
+    import sys
+    env = {k: v for k, v in os.environ.items() if not k.startswith("SEPSIM_")}
+    pre = "import sys; sys.path[:0] = [%r, %r, %r]" % (E1R, os.path.join(E1R, "scripts"), HERE)
+    out = subprocess.run([sys.executable, "-c", pre + "\n" + STOP_CODE], capture_output=True, text=True, env=env, timeout=120)
+    assert out.returncode == 0, out.stderr[-2000:]
+    cont_spk, cont_state, last_spk, last_state = json.loads(out.stdout.strip().splitlines()[-1])
+    assert "- stopping:" not in cont_spk and "- stopping:" not in cont_state      # the conversation goes on
+    assert "- stopping: satiation" in last_spk and "this is their last message" in last_spk
+    assert "- stopping:" not in last_state and "this is their last message" not in last_state

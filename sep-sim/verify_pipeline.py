@@ -578,8 +578,9 @@ def check_pend(rows, rep, arm="pend"):
                     rep.ok("pend.duplicates_flagged", bool(reasons[i]), w, "candidate %d duplicates an earlier one unflagged" % i)
                     n_dup_left += 1
             rep.ok("pend.state_clean", not IP.leaks_scaffold(s.get("block") or "")
-                   and "this is their last message" not in (s.get("block") or ""), w,
-                   "Speaker-only lines (notes / examples / last-message line) leaked into the Planner's state")
+                   and "this is their last message" not in (s.get("block") or "")
+                   and "- stopping:" not in (s.get("block") or ""), w,
+                   "Speaker-only lines (notes / examples / last-message / stopping line) leaked into the Planner's state")
             elig = [i for i, x in enumerate(reasons) if not x]
             if elig:
                 rep.ok("pend.selected_eligible", s["selected_index"] in elig, w,
