@@ -49,7 +49,15 @@ Goal 滿足判斷器：Qwen3-4B-Instruct-2507 + LoRA（新訓練）
 
 - **停止由 Planner 決定。** 判斷器只提供「目標滿足到什麼程度、還缺什麼」，不直接輸出停不停。停止仍是 Planner 的 Act（settle / abandon），由 Ditto 說出收尾語。
 - **不讀輪數、不讀規則。** 判斷器輸入不含輪數與 StoppingLedger 規則輸出；Planner prompt 也移除這些行（附錄 D 的遮蔽清單：turns so far、useful/unhelpful 計數、stopping condition、THEY HAVE SENT N MESSAGES、repeated offer；persona 的「gives up」只去掉括號內的規則說明）。
-- **截斷修正。** Planner prompt 超過上限時改成保留 goal/state 前綴與最新對話、壓縮最舊的歷史（與 `stop_prompt.py` 的 TREC 策略相同），不再從尾端截斷。
+- **截斷修正（Planner 與 Speaker 都要修，列為第一步）。**
+  - 現況：`sepsim/models.py` 的 Planner 在 12000 tokens、Speaker 在 7000 tokens（第 248、365、405 行）用 `truncation=True` 從**尾端**截斷，砍掉最新對話與生成提示。
+  - 實測（Ditto rep0，680 步）：Planner prompt 有 2 步超過 12000。Speaker prompt 超過 7000 的比例介於 57 步（8.4%，只算對話歷史的下限）和 88 步（13%，Planner prompt 近似值）之間，全部在第 7–10 輪（第 10 輪有 26–37/68 集）。這是 sepsim 原本就有的 bug，影響所有已跑過的 UserLM/Ditto 結果。
+  - 修法：
+    1. 上限放寬為「模型 context − 生成長度 − 安全邊際」。Qwen2.5-32B 是 32,768；Ditto/UserLM 更長。目前資料中的所有 prompt 都不必截斷。
+    2. 若仍超過：保留靜態前綴 + 「較早的對話已省略」標記 + 最新對話，結尾一定是生成提示（與 `stop_prompt.py` 相同的演算法）。
+    3. 在 runner 內以包裝類別實作，不改 sepsim 原始碼；每次呼叫記錄原始長度、刪除量、是否壓縮。
+  - 測試：原本就沒超過上限的 prompt，新舊做法產生的 token ids 必須逐位元相同（回歸）；合成的超長 prompt 結尾必須是生成提示，且保留最新一輪對話。
+  - 影響：A0（no-gate）與 A1 在修正後**重跑**，作為乾淨的基準；舊結果只保留為探索性。
 
 ---
 
@@ -127,6 +135,18 @@ Goal 滿足判斷器：Qwen3-4B-Instruct-2507 + LoRA（新訓練）
 - 方法（判斷器 checkpoint、Planner prompt v3、arm 定義）凍結後，才用各折 outer train 全部重訓判斷器，對 outer test 只跑一次。
 - fold0 標為探索性；fold1/2 為主要估計。
 
+### 5.4 可選：縮小 Planner（8B / 9B / 20B-MoE）
+- **候選（伺服器上現有）：** Qwen2.5-7B-Instruct（與 32B 同家族）、Qwen3.5-9B、Llama-3.1-8B-Instruct、gpt-oss-20b（MoE，每次約啟用 3.6B 參數）。伺服器上沒有 12B 模型，要用需另外下載。
+- **第一關，離線逐步比較，不需要 rollout：** 把 Ditto rep0 中 32B 實際看到的 680 個 Planner prompt 原封不動餵給候選模型，量：
+  - JSON 解析率；
+  - act/move 與 32B 的一致率；
+  - 第一次結束 Act 的輪數（對 32B、對真人 K）；
+  - stop_rule 分佈；
+  - 每次呼叫耗時與記憶體。
+- **過關標準（事先固定）：** 解析率 ≥98%，且結束輪數與真人 K 的絕對誤差不比 32B 差超過 0.5 輪。
+- **第二關：** 過關者才跑完整 Task 2（A2 設定，1 個 replicate），與 32B 版本做配對比較。逐步比較的一致率不等於自由對話的品質（Planner 輸出會回饋進後續對話），所以最終以 rollout 為準。
+- **好處：** 小 Planner 加 Ditto 有機會放進 244 V100 或 221，rollout 不必全擠在 245，replicate 與 RL 都會變得可行。
+
 ---
 
 ## 6. 之後（可選，另行確認）：RL
@@ -160,6 +180,8 @@ Goal 滿足判斷器：Qwen3-4B-Instruct-2507 + LoRA（新訓練）
 5. **LLM 控制超參數**：要不要做成 §4 的可選消融？
 6. **UserLM 軌跡**：你已決定不再跑新的 UserLM。已經跑完的 UserLM 軌跡能不能當判斷器的訓練樣本（多約 1000 筆、內容類型較雜）？
 7. **RL（§6）**：同意先不做嗎？
+8. **截斷修正（§2）**：同意修正後重跑 A0/A1 作為新基準，舊結果只當探索性嗎？
+9. **縮小 Planner（§5.4）**：要不要做？要測哪幾個候選？需不需要下載 12B 模型？
 
 ---
 
