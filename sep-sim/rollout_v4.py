@@ -47,7 +47,7 @@ def check_manifest(path, fold, split_fold, what):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--arm", choices=("a0", "a2", "e16", "final"), required=True)
+    ap.add_argument("--arm", choices=("a0", "a2", "e16", "final", "pend"), required=True)
     ap.add_argument("--fold", type=int, required=True)
     ap.add_argument("--split", choices=("train", "validation", "test"), required=True)
     ap.add_argument("--splits", default="/tmp2/mzjiang_usersim/grpo_planner/splits_v1.json")
@@ -106,7 +106,7 @@ def main():
     done = set()
     if os.path.exists(out):
         done = {(json.loads(l)["conversation_id"], json.loads(l)["seed"]) for l in open(out)}
-    code = {n: sha_file(os.path.join(HERE, n)) for n in ("rollout_v4.py", "task2_env.py", "task2_episode.py", "ditto_e16.py",
+    code = {n: sha_file(os.path.join(HERE, n)) for n in ("rollout_v4.py", "task2_env.py", "task2_episode.py", "ditto_e16.py", "task1_stop.py",
                                                          "fit_prompts.py", "planner_prompt_v3.py", "goal_judge.py")}
     meta = {"env": env.describe(), "gate": gate, "code_sha256": code, "replicate": args.replicate, "smoke": args.smoke,
             "planner_nf4": args.planner_nf4, "planner_dtype": args.planner_dtype,

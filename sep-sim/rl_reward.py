@@ -31,6 +31,10 @@ CONSTRAINTS = ("unparsed", "hit_max_new", "no_survivor", "judge_unknown")
 EVAL_ONLY = ("coverage", "complete", "ledger", "coverage_after", "complete_after", "n_req")
 
 REWARD_DEFAULTS = {
+    "version": "v2",
+    "w_cov": 1.0,
+    "w_len": 1.0,
+    "t_max": 10.0,
     "w_goal": 1.0,
     "w_partial": 0.5,
     "w_over": 0.5,
@@ -43,6 +47,9 @@ REWARD_DEFAULTS = {
     "early_stop_statuses": ["NOT"],
 }
 REWARD_BOUNDS = {
+    "w_cov": (0.0, 10.0),
+    "w_len": (0.0, 10.0),
+    "t_max": (1.0, 100.0),
     "w_goal": (0.0, 10.0),
     "w_partial": (0.0, 1.0),
     "w_over": (0.0, 10.0),
@@ -72,6 +79,8 @@ def validate(cfg):
         if not (lo <= v <= hi):
             raise ValueError("reward cfg %s=%r outside declared bounds [%g, %g]" % (k, v, lo, hi))
         out[k] = v
+    if out["version"] not in ("v2", "v3"):
+        raise ValueError("reward cfg version must be v2 or v3, got %r" % (out["version"],))
     for k in ("abandon_reasons", "early_stop_statuses"):
         if not isinstance(out[k], (list, tuple)) or not all(isinstance(x, str) for x in out[k]):
             raise ValueError("reward cfg %s must be a list of strings" % k)
@@ -156,6 +165,53 @@ def reward_v2(episode, cfg):
     return {"total": float(total), "components": comps}
 
 
+def reward_v3(episode, cfg):
+    """Reward v3 (pend arm, no goal judge; user direction 2026-09-25).
+
+      coverage   the requirement ledger's final coverage of this episode (0..1). DECLARED: unlike v2,
+                 v3 uses the ledger as a reward term (it keeps the Planner from ending before the
+                 assistant has delivered anything); coverage therefore cannot be read as an independent
+                 evaluation of a v3-trained policy without saying so.
+      len_err    |emitted user turns - the real person's number of messages in this conversation| / t_max
+                 (the human count is a label of the TRAIN conversation being rolled out).
+      rate_<k>   constraint rates as in v2 (unparsed, hit_max_new, no_survivor; judge_unknown is 0).
+      total = w_cov*coverage - w_len*len_err - sum_k lambda_k * rate_k
+    """
+    cfg = validate(cfg)
+    trace, n = _steps(episode)
+    if n == 0:
+        raise ValueError("episode without decision steps")
+    if "human_turns" not in episode:
+        raise ValueError("reward v3 needs episode['human_turns']")
+    turns, human = int(episode["emitted_user_turns"]), int(episode["human_turns"])
+    cov = float(episode["coverage"])
+    if not (0.0 <= cov <= 1.0):
+        raise ValueError("coverage %r outside [0, 1]" % cov)
+    len_err = abs(turns - human) / cfg["t_max"]
+    counts = {
+        "unparsed": sum(bool(s.get("planner_unparsed")) for s in trace),
+        "hit_max_new": sum(bool(s.get("planner_hit_max_new")) for s in trace),
+        "no_survivor": sum(bool(s.get("no_survivor")) for s in trace),
+        "judge_unknown": sum((s.get("goal_status") or {}).get("status") == "UNKNOWN" for s in trace),
+    }
+    rates = {k: counts[k] / n for k in CONSTRAINTS}
+    penalty = sum(cfg["lambda_" + k] * rates[k] for k in CONSTRAINTS)
+    total = cfg["w_cov"] * cov - cfg["w_len"] * len_err - penalty
+    comps = {"coverage": cov, "len_err": len_err, "turns": turns, "human_turns": human,
+             "turn_diff": turns - human, "decision_steps": n, "constraint_penalty": penalty}
+    comps.update({"rate_" + k: rates[k] for k in CONSTRAINTS})
+    return {"total": float(total), "components": comps}
+
+
+def reward(episode, cfg):
+    """Dispatch on cfg['version'] (v2: goal-judge reward; v3: coverage and turn count)."""
+    return reward_v3(episode, cfg) if validate(cfg)["version"] == "v3" else reward_v2(episode, cfg)
+
+
+AGG_KEYS = {"v2": ["goal", "over_continue", "early_stop", "decision_steps"],
+            "v3": ["coverage", "len_err", "turns", "human_turns", "turn_diff", "decision_steps"]}
+
+
 def aggregate(episodes_with_rewards):
     """Train aggregates for controllers: means of reward and components over a list of
     (episode, reward) pairs. Pure; the caller guarantees these are TRAIN rollouts."""
@@ -165,7 +221,8 @@ def aggregate(episodes_with_rewards):
     tot = [r["total"] for _, r in rows]
     m = sum(tot) / len(tot)
     sd = (sum((x - m) ** 2 for x in tot) / len(tot)) ** 0.5
-    keys = ["goal", "over_continue", "early_stop", "decision_steps"] + ["rate_" + k for k in CONSTRAINTS]
+    ver = "v3" if "len_err" in rows[0][1]["components"] else "v2"
+    keys = AGG_KEYS[ver] + ["rate_" + k for k in CONSTRAINTS]
     comp = {k: sum(float(r["components"][k]) for _, r in rows) / len(rows) for k in keys}
     ends = {}
     for ep, _ in rows:

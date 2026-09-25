@@ -32,7 +32,9 @@ import os
 import random
 import shutil
 import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 if HERE not in sys.path:
@@ -41,9 +43,11 @@ if HERE not in sys.path:
 import rl_algos as RA  # noqa: E402
 import rl_controllers as RC  # noqa: E402
 import rl_reward as RR  # noqa: E402
+import task1_stop as T1  # noqa: E402
 
 CODE_FILES = ("train_planner_rl.py", "rl_reward.py", "rl_controllers.py", "rl_algos.py", "task2_env.py",
-              "task2_episode.py", "goal_judge.py", "planner_prompt_v3.py", "fit_prompts.py", "ditto_e16.py")
+              "task2_episode.py", "goal_judge.py", "planner_prompt_v3.py", "fit_prompts.py", "ditto_e16.py",
+              "task1_stop.py")
 TIME_KEYS = ("time", "wall_s", "rollout_s", "update_s")
 
 
@@ -267,7 +271,8 @@ class FakeEnv:
         emitted = sum(s["emitted"] for s in trace)
         return {"conversation_id": conversation_id, "record_id": "r_" + conversation_id, "seed": seed,
                 "arm": "a2", "replicate": replicate, "emitted_user_turns": emitted, "decision_steps": len(trace),
-                "end_kind": end_kind, "coverage": level / 2.0, "complete": level == 2, "trace": trace}
+                "end_kind": end_kind, "coverage": level / 2.0, "complete": level == 2, "trace": trace,
+                "human_turns": 2 + seed_of("human", conversation_id) % 6}
 
 
 def stub_llm_transport(request):
@@ -291,8 +296,11 @@ class Trainer:
         self.p_best = os.path.join(a.out, "best.json")
         self.split = load_split(a.splits, a.fold)
         self.judge_info = check_judge_manifest(a.judge_adapter, self.split, strict=not a.judge_manifest_train_all)
+        self.io_lock = threading.Lock()
         user_cfg = json.load(open(a.config, encoding="utf-8")) if a.config else {}
-        cfg0 = RC.initial_cfg(**{**user_cfg.get("reward", {}), "lr": a.lr, "kl_coef": a.kl})
+        # pend: reward v3 with format constraints on (declared defaults; a --config file may override)
+        base_reward = {"version": "v3", "lambda_unparsed": 1.0, "lambda_hit_max_new": 1.0} if a.arm == "pend" else {}
+        cfg0 = RC.initial_cfg(**{**base_reward, **user_cfg.get("reward", {}), "lr": a.lr, "kl_coef": a.kl})
         self.selection_cfg = copy.deepcopy(cfg0)          # fixed forever: comparable validation scores
         self.acfg = RA.algo_cfg(**user_cfg.get("algo", {}))
         self.controller = RC.make_controller(
@@ -301,6 +309,7 @@ class Trainer:
             **user_cfg.get(a.controller, {}))
         self.cfg = copy.deepcopy(cfg0)
         self.history, self.best, self.update_done = [], None, 0
+        self.task1_base = None       # Task 1 stop metrics of the starting policy (update 0 validation)
         self.env = self.learner = None
         self.n_new_episodes = 0
         self.config_record = {"args": vars(a), "cfg0": cfg0, "selection_cfg": self.selection_cfg,
@@ -320,7 +329,7 @@ class Trainer:
                             adapter=None, trainable=False)
         model = RA.setup_policy(planner, init_adapter=a.init_adapter)
         planner.adapter = "rl:%s" % a.out
-        judge = GoalJudge(a.judge_base, adapter=a.judge_adapter, gpu=a.gpu)
+        judge = GoalJudge(a.judge_base, adapter=a.judge_adapter, gpu=a.gpu) if a.arm != "pend" else None
         self.env = Task2Env(arm=a.arm, gpu=a.gpu, planner=planner, judge=judge)
         self.learner = RA.TorchLearner(model, a.algo, self.acfg, lr=self.cfg["lr"], seed=a.seed)
         self.config_record["env"] = self.env.describe()
@@ -366,7 +375,7 @@ class Trainer:
             torch.save(RA.rng_state(), os.path.join(tmp, "rng.pt"))
         state = {"update": u, "policy_version": u, "policy_sha": self.learner.policy_sha(),
                  "cfg": self.cfg, "controller": self.controller.state_dict(), "history": self.history,
-                 "best": self.best, "update_row": update_row,
+                 "best": self.best, "update_row": update_row, "task1_base": self.task1_base,
                  "python_rng": [rng["python"][0], list(rng["python"][1]), rng["python"][2]]}
         write_json_atomic(os.path.join(tmp, "state.json"), state)
         if os.path.exists(d):             # only possible if LATEST was not advanced after a crash
@@ -391,6 +400,7 @@ class Trainer:
             raise AssertionError("restored policy sha differs from the checkpoint record")
         self.controller.load_state_dict(st["controller"])
         self.cfg, self.history, self.best, self.update_done = st["cfg"], st["history"], st["best"], u
+        self.task1_base = st.get("task1_base")
         py = st["python_rng"]
         random.setstate((py[0], tuple(py[1]), py[2]))
         if not self.a.dry_run:
@@ -417,30 +427,45 @@ class Trainer:
         for r in read_jsonl(self.p_roll):
             if r["update"] == u and r["policy_version"] == pv and r["policy_sha"] == psha:
                 reuse[(r["slot"], r["replicate"])] = r
-        groups = []
-        for slot, cid in enumerate(self.scenarios_for(u)):
+        cids = self.scenarios_for(u)
+        for cid in cids:
             assert_train_id(cid, self.split)
-            grp = []
+        rows = {}
+        todo = []
+        for slot, cid in enumerate(cids):
             for g in range(a.G):
                 key = (slot, g)
                 if key in reuse:
-                    row = reuse[key]
-                    assert row["conversation_id"] == cid
+                    assert reuse[key]["conversation_id"] == cid
+                    rows[key] = reuse[key]
                 else:
-                    t0 = time.time()
-                    ep = self.env.run_episode(cid, seed=seed_of(a.seed, "episode", u, slot) % 100000, replicate=g,
-                                              planner_temperature=a.temperature, planner_top_p=a.top_p,
-                                              record_generation=True)
-                    row = {"update": u, "slot": slot, "replicate": g, "conversation_id": cid, "split": "train",
-                           "policy_version": pv, "policy_sha": psha, "cfg_sha256": RR.cfg_sha(self.cfg),
-                           "time": time.time(), "rollout_s": time.time() - t0, "episode": ep}
-                    append_jsonl(self.p_roll, row)
-                    self.n_new_episodes += 1
-                    if a.dry_run_crash_after_episodes and self.n_new_episodes >= a.dry_run_crash_after_episodes:
-                        raise SystemExit("dry-run: simulated crash after %d new episodes" % self.n_new_episodes)
-                grp.append(row)
-            groups.append(grp)
-        return groups
+                    todo.append((slot, g, cid))
+
+        def run_one(job):
+            slot, g, cid = job
+            t0 = time.time()
+            ep = self.env.run_episode(cid, seed=seed_of(a.seed, "episode", u, slot) % 100000, replicate=g,
+                                      planner_temperature=a.temperature, planner_top_p=a.top_p,
+                                      record_generation=True)
+            row = {"update": u, "slot": slot, "replicate": g, "conversation_id": cid, "split": "train",
+                   "policy_version": pv, "policy_sha": psha, "cfg_sha256": RR.cfg_sha(self.cfg),
+                   "time": time.time(), "rollout_s": time.time() - t0, "episode": ep}
+            with self.io_lock:
+                append_jsonl(self.p_roll, row)
+                self.n_new_episodes += 1
+                if a.dry_run_crash_after_episodes and self.n_new_episodes >= a.dry_run_crash_after_episodes:
+                    raise SystemExit("dry-run: simulated crash after %d new episodes" % self.n_new_episodes)
+            return (slot, g), row
+
+        if a.rollout_workers <= 1:
+            for job in todo:
+                k, r = run_one(job)
+                rows[k] = r
+        else:
+            with ThreadPoolExecutor(max_workers=a.rollout_workers) as ex:
+                for k, r in ex.map(run_one, todo):
+                    rows[k] = r
+        return [[rows[(slot, g)] for g in range(a.G)] for slot in range(len(cids))]
 
     # -------------------------------------------------------- one update
     def one_update(self, u):
@@ -454,7 +479,7 @@ class Trainer:
             rs = []
             for row in grp:
                 assert row["policy_version"] == pv and row["policy_sha"] == self.learner.policy_sha(), "off-policy rollout"
-                rw = RR.reward_v2(row["episode"], cfg)
+                rw = RR.reward(row["episode"], cfg)
                 rs.append(rw["total"])
                 rewarded.append((row["episode"], rw))
             rew_groups.append(rs)
@@ -469,7 +494,7 @@ class Trainer:
         assert all(s["policy_version"] == pv for s in samples), "sample from another policy version"
         stats = self.learner.update(samples, cfg, seed=seed_of(self.a.seed, "update", u))
         agg = RR.aggregate(rewarded)
-        hist = {"update": u, "split": "train", **agg, "n_groups": len(groups), "n_groups_skipped_zero_std": skipped,
+        hist = {"update": u, "split": "train", "reward_version": cfg["version"], **agg, "n_groups": len(groups), "n_groups_skipped_zero_std": skipped,
                 "lr": cfg["lr"], "kl_coef": cfg["kl_coef"],
                 **{k: stats.get(k) for k in ("loss", "kl", "ratio_mean", "clip_frac", "grad_norm", "n_tokens",
                                               "value_mse", "ratio_init_maxdev")}}
@@ -493,25 +518,61 @@ class Trainer:
         if any(r.get("kind") == "summary" and r["update"] == u for r in prev):
             return
         done = {(r["conversation_id"], r["seed"]): r for r in prev if r.get("kind") == "episode" and r["update"] == u}
+        done_t1 = {r["conversation_id"]: r for r in prev if r.get("kind") == "task1" and r["update"] == u}
         psha = self.learner.policy_sha()
-        totals = []
+        jobs = []
         for cid in sorted(self.split["validation"]):
             assert cid in self.split["validation"] and cid not in self.split["train"]
             for s in a.val_seeds:
-                r = done.get((cid, s))
-                if r is None or r["policy_sha"] != psha:
-                    ep = self.env.run_episode(cid, seed=s, replicate=0, planner_temperature=0.0, planner_top_p=1.0,
-                                              record_generation=False)
-                    rw = RR.reward_v2(ep, self.selection_cfg)
-                    r = {"kind": "episode", "update": u, "policy_sha": psha, "conversation_id": cid, "seed": s,
-                         "split": "validation", "reward_selection": rw, "episode": ep, "time": time.time()}
+                jobs.append((cid, s))
+
+        def run_val(job):
+            cid, s = job
+            r = done.get((cid, s))
+            if r is None or r["policy_sha"] != psha:
+                ep = self.env.run_episode(cid, seed=s, replicate=0, planner_temperature=0.0, planner_top_p=1.0,
+                                          record_generation=False)
+                rw = RR.reward(ep, self.selection_cfg)
+                r = {"kind": "episode", "update": u, "policy_sha": psha, "conversation_id": cid, "seed": s,
+                     "split": "validation", "reward_selection": rw, "episode": ep, "time": time.time()}
+                with self.io_lock:
                     append_jsonl(self.p_val, r)
-                totals.append(r["reward_selection"]["total"])
+            return r
+
+        def run_t1(cid):
+            r = done_t1.get(cid)
+            if r is None or r["policy_sha"] != psha:
+                r = {"kind": "task1", "update": u, "policy_sha": psha, "conversation_id": cid,
+                     "split": "validation", "task1": self.env.run_task1(cid), "time": time.time()}
+                with self.io_lock:
+                    append_jsonl(self.p_val, r)
+            return r
+
+        workers = max(1, a.rollout_workers)
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            vrows = list(ex.map(run_val, jobs))
+            t1rows = list(ex.map(run_t1, sorted(self.split["validation"]))) if hasattr(self.env, "run_task1") else []
+        totals = [r["reward_selection"]["total"] for r in vrows]
         score = sum(totals) / len(totals) if totals else float("nan")
+        eps = [r["episode"] for r in vrows]
+        turn_stats = None
+        if eps and all("human_turns" in e for e in eps):
+            d = [e["emitted_user_turns"] - e["human_turns"] for e in eps]
+            turn_stats = {"sim_turns_mean": sum(e["emitted_user_turns"] for e in eps) / len(eps),
+                          "human_turns_mean": sum(e["human_turns"] for e in eps) / len(eps),
+                          "abs_diff_mean": sum(abs(x) for x in d) / len(d),
+                          "coverage_mean": sum(float(e["coverage"]) for e in eps) / len(eps),
+                          "end_kinds": {k: sum(e["end_kind"] == k for e in eps) for k in sorted({e["end_kind"] for e in eps})}}
+        t1 = T1.task1_stop_metrics([r["task1"] for r in t1rows]) if t1rows else None
+        if t1 is not None and self.task1_base is None:
+            self.task1_base = {"update": u, **t1}
+        t1_ok = True if t1 is None else T1.within_tolerance(t1, self.task1_base, a.task1_tol)
         append_jsonl(self.p_val, {"kind": "summary", "update": u, "policy_sha": psha, "split": "validation",
                                   "n_episodes": len(totals), "mean_reward_selection": score,
+                                  "turn_stats": turn_stats, "task1": t1, "task1_base": self.task1_base,
+                                  "task1_within_tol": t1_ok, "task1_tol": a.task1_tol,
                                   "selection_cfg_sha256": RR.cfg_sha(self.selection_cfg), "time": time.time()})
-        if totals and (self.best is None or score > self.best["mean_reward_selection"]):
+        if totals and t1_ok and (self.best is None or score > self.best["mean_reward_selection"]):
             self.best = {"update": u, "checkpoint": os.path.relpath(self.ckpt_dir(u), a.out).replace("\\", "/"),
                          "policy_sha": psha, "mean_reward_selection": score,
                          "selection_cfg_sha256": RR.cfg_sha(self.selection_cfg)}
@@ -550,7 +611,12 @@ class Trainer:
 def parse_args(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--fold", type=int, required=True)
-    ap.add_argument("--arm", choices=("final", "a2"), default="final", help="policy env: final = E1.6 base + v3 fixes + goal judge")
+    ap.add_argument("--arm", choices=("pend", "final", "a2"), default="pend",
+                    help="policy env: pend = E1.6 base + fixes, Planner judges the goal and ends (no goal judge)")
+    ap.add_argument("--rollout-workers", type=int, default=1,
+                    help="episodes run in threads; GPU calls are serialised inside Task2Env, R0/ledger calls overlap")
+    ap.add_argument("--task1-tol", type=float, default=0.05,
+                    help="a checkpoint is selectable only if Task 1 term_f1 / premature are within this of update 0")
     ap.add_argument("--splits", default="/tmp2/mzjiang_usersim/grpo_planner/splits_v1.json")
     ap.add_argument("--algo", choices=RA.ALGOS, default="grpo")
     ap.add_argument("--controller", choices=("fixed", "dual", "llm"), default="fixed")
@@ -587,7 +653,7 @@ def parse_args(argv=None):
     if not (a.temperature > 0):
         ap.error("training rollouts need --temperature > 0")
     if not a.dry_run:
-        for k in ("planner_path", "judge_adapter", "judge_base"):
+        for k in (("planner_path",) if a.arm == "pend" else ("planner_path", "judge_adapter", "judge_base")):
             if getattr(a, k) is None:
                 ap.error("--%s is required (except with --dry-run)" % k.replace("_", "-"))
     return a

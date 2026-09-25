@@ -47,7 +47,7 @@ LLM_BOUNDS = {"window": (1, 50), "max_ratio": (1.0, 3.0)}
 LLM_URL = "https://api.openai.com/v1/chat/completions"
 
 FORBIDDEN_KEY_PARTS = ("valid", "val_", "test", "coverage", "complete")
-HISTORY_KEYS = ("update", "split", "n_episodes", "reward_mean", "reward_std", "components_mean",
+HISTORY_KEYS = ("update", "split", "reward_version", "n_episodes", "reward_mean", "reward_std", "components_mean",
                 "end_kind_frac", "n_groups", "n_groups_skipped_zero_std", "loss", "kl", "ratio_mean",
                 "clip_frac", "grad_norm", "n_tokens", "lr", "kl_coef", "value_mse", "ratio_init_maxdev")
 
@@ -93,9 +93,13 @@ def check_history(history):
     for h in history:
         if h.get("split") != "train":
             raise ValueError("controller history entry is not a train aggregate: split=%r" % h.get("split"))
+        # reward v3 uses the TRAIN rollouts' ledger coverage as a declared reward term, so under v3 the
+        # train-aggregate key "coverage" is allowed; validation/test keys stay forbidden in every version
+        parts = FORBIDDEN_KEY_PARTS if h.get("reward_version") != "v3" else \
+            tuple(p for p in FORBIDDEN_KEY_PARTS if p != "coverage")
         for k in _walk_keys(h):
             kl = k.lower()
-            if any(p in kl for p in FORBIDDEN_KEY_PARTS):
+            if any(p in kl for p in parts):
                 raise ValueError("controller history carries forbidden key %r" % k)
     return history
 

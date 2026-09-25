@@ -252,3 +252,128 @@ def user_prompt_v3(scenario, prev_block, hist_u, hist_a, turn, ledger, goal_stat
 
 def speaker_block_v3(fields, goal_status):
     return PP.render_block(fields, (unmet_text(goal_status), ""))
+
+
+# ================================================================ pend (user direction, 2026-09-25)
+# Planner + Ditto + Selector, no goal judge. The Planner itself judges whether the goal is met
+# (goal_met / still_wanted, from the assistant's replies) and decides end_session. end_session=true
+# means the message being planned is the LAST one: Ditto writes it (a close, which need not thank
+# anyone) and the episode ends after it -- E1/E1.6 PLANNER_END semantics, not a silent exit.
+# Built on v3 (all v3 fixes: override off, no band/clamp, Task-2-true facts only, patience, D10,
+# no truncation) with: GOAL STATUS block -> none; goal topic -> topic + context (D4);
+# "- pending:" in the Speaker block -> the Planner's own still_wanted (replaces the lexical agenda, D3).
+
+GOAL_MET = ("yes", "partly", "no")
+NEW_STOP_FIELDS_PEND = (
+    ' "goal_met": "<yes | partly | no: judged from the assistant\'s replies so far, has this person got what they came for?>",\n'
+    ' "still_wanted": "<in a few words, what they still want from the assistant, or nothing>",\n'
+    ' "stop_rule": "<the named reason that fits your decision, or none>",\n'
+    ' "end_session": <true if the message you are planning is their LAST one (they write it, then leave), else false>,\n')
+
+
+def rules_block_pend():
+    lines = rules_block_v3().split("\n")
+    i = lines.index("    Before deciding, put both cases in one sentence each: the case for leaving")
+    return "\n".join(lines[:i] + [
+        "    Before deciding, put both cases in one sentence each: the case for leaving",
+        "    now, and the case for one more turn. Then decide end_session yourself:",
+        "    true means the message you are planning now is their LAST one: they write it",
+        "    and leave. Its act is their Complete act, and next_step says how they close;",
+        "    a close need not thank anyone (people often just stop with a last remark, a",
+        "    short acknowledgement or a final ask). false means they write again after the",
+        "    assistant replies. People do not apply fixed criteria; they stop on a feeling",
+        "    of good enough. So judge THIS person, with THIS patience, at THIS point.",
+    ])
+
+
+def system_prompt_pend():
+    s = system_prompt_v3()
+    s = _replace_once(s, rules_block_v3(), rules_block_pend())
+    s = _replace_once(s, NEW_STOP_FIELDS, NEW_STOP_FIELDS_PEND)
+    return s
+
+
+def goal_lines(scenario):
+    """D4: the whole goal the person came with (topic, context, what they already know)."""
+    sc = scenario or {}
+    goal = sc.get("goal") or {}
+    out = []
+    ctx = " ".join(str(goal.get("context", "")).split())
+    if ctx:
+        out.append("- context: " + ctx)
+    known = (sc.get("persona_goal_interaction") or {}).get("known_datasets") or []
+    if known:
+        out.append("- they already know: " + ", ".join(str(k) for k in known))
+    return "\n".join(out)
+
+
+def user_prompt_pend(scenario, prev_block, hist_u, hist_a, turn, ledger, prev_ann=None):
+    """user_prompt_v3 without the GOAL STATUS block, with the full goal under WHAT THEY CAME FOR."""
+    marker = "\n\nGOAL STATUS"
+    up = user_prompt_v3(scenario, prev_block, hist_u, hist_a, turn, ledger,
+                        {"status": "NOT ASSESSED", "unmet": []}, prev_ann=prev_ann)
+    blk = goal_block({"status": "NOT ASSESSED", "unmet": []})
+    up = _replace_once(up, blk, "")
+    assert marker not in up
+    topic = " ".join(str(((scenario or {}).get("goal") or {}).get("topic", "")).split())
+    extra = goal_lines(scenario)
+    if extra:
+        old = "\n\nWHAT THEY CAME FOR\n" + topic + "\n\n"
+        up = _replace_once(up, old, "\n\nWHAT THEY CAME FOR\n" + topic + "\n" + extra + "\n\n")
+    return up
+
+
+def read_plan_pend(raw, turn, scenario, rng, ledger):
+    """read_plan_v3 (override off, own length, turn-1 end ignored), plus goal_met / still_wanted.
+
+    When end_session is true the message is the close: its act is the Planner's own Complete entry
+    (ACT_FULL lists one entry per move, so it always exists), with that entry's length. This makes
+    the act agree with the Planner's decision; it does not decide anything itself. Both the act that
+    was drawn before and the replacement are kept in diag."""
+    fields, diag, end = read_plan_v3(raw, turn, scenario, rng, ledger)
+    if fields is None:
+        return None, diag, False
+    d = state.json_of(raw) or {}
+    gm = str(d.get("goal_met", "") or "").strip().lower()
+    fields["goal_met"] = gm if gm in GOAL_MET else None
+    diag["goal_met_raw"] = d.get("goal_met")
+    sw = " ".join(str(d.get("still_wanted", "") or "").split())
+    fields["still_wanted"] = sw
+    if end:
+        comp = []
+        for e in (d.get("act_distribution") or []):
+            if not isinstance(e, dict):
+                continue
+            mv, ac = acts.normalise(str(e.get("move", "")), str(e.get("act", "")))
+            if mv == "Complete":
+                try:
+                    p = float(e.get("p", 0) or 0)
+                except (TypeError, ValueError):
+                    p = 0.0
+                comp.append((p, mv, ac, e.get("length_words")))
+        diag["drawn_before_end"] = [fields.get("move"), fields.get("act")]
+        if comp:
+            comp.sort(key=lambda x: -x[0])          # stable: the first listed wins a tie
+            _, mv, ac, lw = comp[0]
+            if (mv, ac) != (fields.get("move"), fields.get("act")):
+                fields["move"], fields["act"] = mv, ac
+                b = acts.bench_of(ac, turn)
+                fields["bench_act"] = ("%s / %s" % b) if b else "(unmapped)"
+                try:
+                    lwi = int(round(float(lw)))
+                except (TypeError, ValueError):
+                    lwi = None
+                if lwi is not None and lwi > 0:
+                    fields["length_words"] = lwi
+                else:
+                    fields.pop("length_words", None)
+                diag["length_source"] = "complete_entry"
+                diag["length_from_planner"] = lwi
+            diag["end_act_from_complete_entry"] = True
+        else:
+            diag["end_without_complete_entry"] = True
+    return fields, diag, end
+
+
+def speaker_block_pend(fields):
+    return PP.render_block(fields, (fields.get("still_wanted") or "(nothing named)", ""))

@@ -70,15 +70,15 @@ A2_FORBIDDEN = ("- useful replies", "- best offered so far", "- last reply repea
 A0_REQUIRED = ("- useful replies", "WHAT THEY STILL WANT", "HOW LONG THEY WRITE")
 # E1.6-based arms (task2_env.ARM_ENV): e16 = E1.6 Planner side as generated (a0-like prompt, plus the
 # ACT_FULL per-move band rows); final = v3 checks + the E1.6 switches Final keeps.
-ARMS = ("a0", "a2", "e16", "final")
+ARMS = ("a0", "a2", "e16", "final", "pend")
 V3_ARMS = ("a2", "final")
-E16_ARMS = ("e16", "final")
+E16_ARMS = ("e16", "final", "pend")
 E16_ROWS = "- Disclose: "          # first ACT_FULL band row, rendered only with the band
 
 
 def check_family(arm):
-    """Which prompt/stop checks an arm gets: v3 (a2, final) or original (a0, e16)."""
-    return "a2" if arm in V3_ARMS else "a0"
+    """Which prompt/stop checks an arm gets: v3 (a2, final), pend, or original (a0, e16)."""
+    return "a2" if arm in V3_ARMS else ("pend" if arm == "pend" else "a0")
 JUDGE_STATUSES = ("SATISFIED", "PARTIAL", "NOT", "UNKNOWN")
 SPEAKER_DECISIONS = ("continue", "empty", "speaker_end", "planner_end")
 
@@ -238,6 +238,7 @@ def recompute_system_sha(arm, sepsim_path=None):
         return None
     code = ("import hashlib,sys; sys.path[:0]=[%r,%r]\n" % (os.path.abspath(root), HERE) +
             ("import planner_prompt_v3 as V; s=V.system_prompt_v3()\n" if arm in V3_ARMS else
+             "import planner_prompt_v3 as V; s=V.system_prompt_pend()\n" if arm == "pend" else
              "from sepsim import planner_prompt as PP; s=PP.system_prompt()\n") +
             "print(hashlib.sha256(s.encode()).hexdigest())")
     env = {k: v for k, v in os.environ.items() if not k.startswith("SEPSIM_")}
@@ -265,7 +266,7 @@ def check_meta(meta, arm, fold, rep):
     ap = str(meta.get("act_prior", ""))
     if arm in E16_ARMS:
         rep.ok("e16.meta_tree", "e1r" in str(meta.get("tree", "")), "meta", "tree %r is not the E1.6 tree" % meta.get("tree"))
-    if arm in V3_ARMS:
+    if arm in V3_ARMS + ("pend",):
         rep.ok("a2.meta_act_prior", ap.startswith("nostopclobber"), "meta", "act_prior %r" % ap)
     elif ap:
         rep.ok("a0.meta_act_prior", ap.startswith("off"), "meta", "act_prior %r" % ap)
@@ -331,9 +332,12 @@ def check_structure(rows, arm, rep):
                        "planner_stop not the last step / end_kind %r" % r.get("end_kind"))
                 rep.ok("episode.silent_exit", "block" not in s and "speaker_fit" not in s, w,
                        "Speaker was called on a silent exit")
-        if arm in ("a0", "e16"):
+        if arm in ("a0", "e16", "pend"):
             rep.ok("a0.no_planner_exit", r.get("end_kind") != "planner_stop", where, "%s executed a silent Planner exit" % arm)
-        if arm == "e16":
+        if arm == "pend":
+            rep.ok("pend.human_turns", isinstance(r.get("human_turns"), int) and r["human_turns"] >= 1, where,
+                   "human_turns missing")
+        if arm in ("e16", "pend"):
             # E1.6 PLANNER_END: the first step whose plan ends the session is emitted and is the last step
             first = next((s for s in tr if s.get("ended_planner")), None)
             if first is not None:
@@ -471,6 +475,46 @@ def check_a2(rows, rep, arm="a2"):
     rep.note("a2.judge_outputs", "UNKNOWN %d; with status_probs %d" % (n_unknown, n_probs))
 
 
+PEND_FORBIDDEN = A2_FORBIDDEN + ("GOAL STATUS", E16_ROWS)
+
+
+def check_pend(rows, rep, arm="pend"):
+    """pend: v3 prompt without the goal judge; Planner end = the planned message is the last one."""
+    n_end = n_unparsed = 0
+    for r in rows:
+        for s in r.get("trace") or []:
+            w = "%s s%s t%s" % (str(r.get("conversation_id"))[:12], r.get("seed"), s.get("t"))
+            stat = static_part(s.get("planner_prompt"))
+            bad = [b for b in PEND_FORBIDDEN if b in stat]
+            rep.ok("pend.removed_lines_absent", not bad, w, "found %s" % bad)
+            rep.ok("pend.facts", "- turns so far:" in stat, w, "turn count fact missing")
+            rep.ok("pend.no_goal_judge", s.get("goal_status") is None, w, "goal_status present without a judge")
+            d = s.get("planner_diag") or {}
+            ended = bool(s.get("ended_planner"))
+            if s.get("planner_unparsed"):
+                n_unparsed += 1
+                rep.ok("pend.end_session", not ended, w, "unparsed plan but ended_planner true")
+            else:
+                if "end_session_raw" not in d:
+                    rep.ok("pend.end_session", False, w, "planner_diag.end_session_raw missing")
+                else:
+                    t1_ign = bool(d.get("end_session_t1_ignored"))
+                    rep.ok("pend.end_session", not t1_ign or s.get("t") == 1, w, "end ignored outside turn 1")
+                    rep.ok("pend.end_session", ended == (parsed_end(d["end_session_raw"]) and not t1_ign), w,
+                           "ended_planner %r vs raw %r" % (ended, d["end_session_raw"]))
+                rep.ok("pend.no_length_clamp", d.get("length_clamped") is False, w, "length clamped")
+                if ended:
+                    rep.ok("pend.close_act", s.get("move") == "Complete" or d.get("end_without_complete_entry"), w,
+                           "Planner ended but the act is %r" % s.get("move"))
+                if "block" in s:
+                    pend_line = [l for l in (s["block"] or "").split("\n") if l.startswith("- pending:")]
+                    exp = "- pending: " + (s.get("still_wanted") or "(nothing named)")
+                    rep.ok("pend.pending_line", pend_line == [exp], w, "pending %r != %r" % (pend_line, exp))
+            rep.ok("pend.no_stop_override", d.get("stop_override") is not True, w, "stop override applied")
+            n_end += ended
+    rep.note("pend.end_session", "Planner ends %d; unparsed plans %d" % (n_end, n_unparsed))
+
+
 def check_a0(rows, rep, arm="a0"):
     for r in rows:
         for s in r.get("trace") or []:
@@ -574,7 +618,7 @@ def verify(episodes, meta_path, splits_path, fold, split, arm=None, training=Fal
     check_structure(all_rows, arm, rep)
     sb = speaker_budget or meta.get("speaker_budget") or F.SPEAKER_BUDGET
     check_truncation(all_rows, arm, meta, sb, judge_budget, max_new_warn, rep)
-    (check_a2 if check_family(arm) == "a2" else check_a0)(all_rows, rep, arm)
+    {"a2": check_a2, "pend": check_pend, "a0": check_a0}[check_family(arm)](all_rows, rep, arm)
     if rl_dir:
         check_rl(rl_dir, rollouts, ckpt_pattern, rep)
     return rep

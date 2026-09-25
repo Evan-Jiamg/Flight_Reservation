@@ -25,6 +25,7 @@ import json
 import os
 import random
 import sys
+import threading
 
 V2FIX = {
     "SEPSIM_ANTILEAK": "1", "SEPSIM_NEARCOPY": "1", "SEPSIM_COPY_SCOPE": "both",
@@ -48,8 +49,13 @@ ARM_ENV = {
     "e16": dict(E16_COMMON, SEPSIM_SELF_JUDGE="1", SEPSIM_STOP_LEDGER="1", SEPSIM_ACT_PRIOR="off"),
     # Final: E1.6 + v3 fixes; the goal judge replaces SELF_JUDGE, no override, no band
     "final": dict(E16_COMMON, SEPSIM_SELF_JUDGE="0", SEPSIM_STOP_LEDGER="0", SEPSIM_ACT_PRIOR="nostopclobber"),
+    # pend (user, 2026-09-25): Planner + Ditto + Selector, no goal judge; the Planner judges the goal
+    # itself and its end_session makes the planned message the last one (emitted close, then end)
+    "pend": dict(E16_COMMON, SEPSIM_SELF_JUDGE="0", SEPSIM_STOP_LEDGER="0", SEPSIM_ACT_PRIOR="nostopclobber"),
 }
-V3_ARMS = ("a2", "final")
+V3_ARMS = ("a2", "final")            # goal judge + silent Planner exit
+E16_ARMS = ("e16", "final", "pend")  # built on the E1.6 tree
+EMIT_END_ARMS = ("e16", "pend")      # Planner end = the planned message is the last one
 BENCH = "/tmp2/hchsu/trec2026-usersim-benchmark"
 TREE_V2FIX = "/home/mzjiang/Sep-Simulator"
 TREE_E16 = "/tmp2/mzjiang_usersim/grpo_planner/trees/e1r_cf19400"
@@ -57,7 +63,7 @@ TREE = TREE_V2FIX
 
 
 def tree_of(arm):
-    return TREE_E16 if arm in ("e16", "final") else TREE_V2FIX
+    return TREE_E16 if arm in E16_ARMS else TREE_V2FIX
 WORK = "/tmp2/mzjiang_usersim/task2"
 DITTO = "/tmp2/mzjiang_usersim/models/Ditto-8B"
 T_MAX = 10
@@ -161,9 +167,9 @@ class Task2Env:
         assert (run_v2.ANTILEAK, run_v2.NEARCOPY, run_v2.COPY_SCOPE, run_v2.REDRAW, run_v2.NSAMP,
                 run_v2.SELECTOR, run_v2.LENGTH_SELECT, run_v2.POSITION, run_v2.GUARDRAILS, run_v2.END_PROBE) == \
                (True, True, "both", 4, 3, "length", True, "system", False, False), "v2fix did not bind"
-        expected = frozenset({"nostopclobber"}) if arm in V3_ARMS else frozenset()
+        expected = frozenset({"nostopclobber"}) if arm in V3_ARMS + ("pend",) else frozenset()
         assert acts.prior_mode() == expected, "act prior mode wrong for arm %s" % arm
-        self.e16 = arm in ("e16", "final")
+        self.e16 = arm in E16_ARMS
         if self.e16:
             from sepsim import pipeline as _pl
             assert os.path.abspath(models.__file__).startswith(os.path.abspath(TREE_E16)), models.__file__
@@ -173,7 +179,14 @@ class Task2Env:
                     run_v2.AGENDA_CORROB) == (arm == "e16", True, True, False, False), "E1.6 runner switches"
             assert _pl.prior_annotations([{"annotations": {"x": 1}}], 2) == {}, "NO_ANN did not bind"
         self.arm, self.gpu, self.planner, self.judge = arm, gpu, planner, judge
-        self.system = V3.system_prompt_v3() if arm in V3_ARMS else PP.system_prompt()
+        if arm == "pend":
+            self.system = V3.system_prompt_pend()
+            assert '"goal_met"' in self.system and '"last_reply_helpful"' not in self.system
+        else:
+            self.system = V3.system_prompt_v3() if arm in V3_ARMS else PP.system_prompt()
+        # GPU calls (Planner, goal judge, Ditto) are serialised by this lock so episodes can run in
+        # threads: each GPU call seeds and generates atomically; R0/ledger HTTP calls overlap freely.
+        self.gpu_lock = threading.Lock()
         if arm == "e16":
             assert '"last_reply_helpful"' in self.system and "length_words\": <words if they made THIS move>" in self.system
         if arm == "final":
@@ -242,14 +255,21 @@ class Task2Env:
             gs = None
             v3 = arm in V3_ARMS
             if v3:
-                gs = self.judge.assess(sc_text, hist_u, hist_a) if hist_a else {"status": "NOT ASSESSED", "unmet": []}
+                if hist_a:
+                    with self.gpu_lock:
+                        gs = self.judge.assess(sc_text, hist_u, hist_a)
+                else:
+                    gs = {"status": "NOT ASSESSED", "unmet": []}
                 up = V3.user_prompt_v3(scenario, S["prev_block"], hist_u, hist_a, t, led,
                                        {"status": gs["status"], "unmet": gs.get("unmet", [])}, prev_ann={})
+            elif arm == "pend":
+                up = V3.user_prompt_pend(scenario, S["prev_block"], hist_u, hist_a, t, led, prev_ann={})
             else:
                 up = PP.user_prompt(scenario, S["prev_block"], hist_u, hist_a, t, ledger=led,
                                     prev_ann={}, agenda_view=ag.render(), p_end=None)
             pseed = int(hashlib.sha256(("%s|%d|%d|%d" % (sid, t, replicate, 7)).encode()).hexdigest()[:8], 16)
-            g = planner.generate(self.system, up, planner_temperature, planner_top_p, pseed)
+            with self.gpu_lock:
+                g = planner.generate(self.system, up, planner_temperature, planner_top_p, pseed)
             raw = g["raw"]
             self_judge = None
             if arm == "e16" and t >= 2:
@@ -263,6 +283,8 @@ class Task2Env:
                 led.judge(self_judge["helpful"], self_judge["dataset_quality"])
             if v3:
                 fields, diag, end_session = V3.read_plan_v3(raw, t, scenario, rng, led)
+            elif arm == "pend":
+                fields, diag, end_session = V3.read_plan_pend(raw, t, scenario, rng, led)
             elif arm == "e16":
                 fields, diag = PP.read_plan(raw, t, scenario, rng, led, agenda_open=False)
                 end_session = None
@@ -272,12 +294,13 @@ class Task2Env:
             unparsed = fields is None
             if unparsed:
                 fields = {"move": "Other", "act": "other"}
-            ended = bool(end_session) if v3 else bool(state.ends_session(fields))
+            ended = bool(end_session) if (v3 or arm == "pend") else bool(state.ends_session(fields))
             base = {"planner_prompt": g["prompt_text"], "planner_fit": g["fit"], "planner_raw": raw,
                     "planner_hit_max_new": g["hit_max_new"], "planner_diag": diag,
                     "planner_unparsed": unparsed, "ended_planner": ended,
                     "move": fields.get("move", ""), "act": fields.get("act", ""),
                     "stop_rule": fields.get("stop_rule", "none"), "goal_status": gs, "self_judge": self_judge,
+                    "goal_met": fields.get("goal_met"), "still_wanted": fields.get("still_wanted"),
                     "ledger_before": {"turns": led.turns, "gain_trace": list(led.gain_trace)}}
             if record_generation:
                 base["planner_gen"] = {"prompt_ids": g["prompt_ids"], "gen_ids": g["gen_ids"],
@@ -288,6 +311,8 @@ class Task2Env:
                 block = S["prev_block"]
             elif v3:
                 block = V3.speaker_block_v3(fields, gs)
+            elif arm == "pend":
+                block = V3.speaker_block_pend(fields)
             else:
                 block = PP.render_block(fields, ag.render())
             S["block"] = block
@@ -302,15 +327,17 @@ class Task2Env:
             z1 = self.e16 and t == 1
             T_G, P_G = self.t1_sampling if z1 else (0.0, 1.0)
             T_S, P_S = self.t1_sampling if z1 else (0.7, 0.9)
-            greedy, ge = speaker.say(sc_text, block, hist_u, hist_a, t, seed=pipeline.seed_for(sid, t),
-                                     temperature=T_G, top_p=P_G, avoid=avoid, reject_template=ANTILEAK,
-                                     reject_reuse=NEARCOPY)
-            fit0 = speaker.last_fit
+            with self.gpu_lock:
+                greedy, ge = speaker.say(sc_text, block, hist_u, hist_a, t, seed=pipeline.seed_for(sid, t),
+                                         temperature=T_G, top_p=P_G, avoid=avoid, reject_template=ANTILEAK,
+                                         reject_reuse=NEARCOPY)
+                fit0 = speaker.last_fit
             cands, flags = [greedy], [ge]
             for k in range(run_v2.NSAMP):
-                s_, e_ = speaker.say(sc_text, block, hist_u, hist_a, t, seed=pipeline.seed_for(sid, t, k + 1),
-                                     temperature=T_S, top_p=P_S, avoid=avoid, reject_template=ANTILEAK,
-                                     reject_reuse=NEARCOPY)
+                with self.gpu_lock:
+                    s_, e_ = speaker.say(sc_text, block, hist_u, hist_a, t, seed=pipeline.seed_for(sid, t, k + 1),
+                                         temperature=T_S, top_p=P_S, avoid=avoid, reject_template=ANTILEAK,
+                                         reject_reuse=NEARCOPY)
                 cands.append(s_)
                 flags.append(e_)
             reasons, n_extra, eligible = None, 0, None
@@ -318,9 +345,10 @@ class Task2Env:
                 reasons = [run_v2.guard_reason(c, prior) for c in cands]
                 while all(reasons) and n_extra < run_v2.REDRAW:
                     k = run_v2.NSAMP + n_extra
-                    sx, ex = speaker.say(sc_text, block, hist_u, hist_a, t, seed=pipeline.seed_for(sid, t, k + 1),
-                                         temperature=T_S, top_p=P_S, avoid=avoid, reject_template=ANTILEAK,
-                                         reject_reuse=NEARCOPY)
+                    with self.gpu_lock:
+                        sx, ex = speaker.say(sc_text, block, hist_u, hist_a, t, seed=pipeline.seed_for(sid, t, k + 1),
+                                             temperature=T_S, top_p=P_S, avoid=avoid, reject_template=ANTILEAK,
+                                             reject_reuse=NEARCOPY)
                     cands.append(sx)
                     flags.append(ex)
                     reasons.append(run_v2.guard_reason(sx, prior))
@@ -356,7 +384,7 @@ class Task2Env:
 
         # e16: E1.6 SEPSIM_PLANNER_END -- the Planner's Complete act ends the episode after the
         # closing message it asked for (emitted, no assistant reply). v3 arms exit silently instead.
-        ep = run_episode(T_MAX, None, speak, respond, planner_end=(arm == "e16"))
+        ep = run_episode(T_MAX, None, speak, respond, planner_end=(arm in EMIT_END_ARMS))
         after, last = dict(S["cov"]), (0.0, False)
         for step in ep["trace"]:
             last = after.get(step["t"], last)
@@ -368,4 +396,53 @@ class Task2Env:
                 "end_kind": ep["end_kind"], "turns": ep["emitted_user_turns"], "stop_kind": ep["end_kind"],
                 "ended_by_token": ep["end_kind"] != "t_max",
                 "coverage": round(ledger.coverage(), 4), "complete": ledger.complete(),
-                "n_req": len(self.reqs[conversation_id]["req"]), "ledger": ledger.as_dict(), "trace": ep["trace"]}
+                "n_req": len(self.reqs[conversation_id]["req"]), "ledger": ledger.as_dict(), "trace": ep["trace"],
+                "human_turns": self.human_turns(conversation_id)}
+
+    def human_turns(self, conversation_id):
+        """Number of messages the real person sent in this conversation (the Task 2 turn target)."""
+        from sepsim import pipeline
+        users, _ = pipeline.split_messages(self.recs[conversation_id])
+        return len(users)
+
+    def run_task1(self, conversation_id, seed=0):
+        """Task 1 (teacher-forced) stop decisions of the Planner on a REAL conversation (pend arm).
+
+        Mirrors the E1.6 run_v2 loop: at turn t the history is the real person's first t-1 messages and
+        the real assistant replies; the Planner writes its state (temperature 0) and its end_session is
+        recorded against whether the real person's message t was their last. The Planner's own previous
+        state carries over as in run_v2. Only the Planner runs (no Ditto, no R0): the stop decision is the
+        Planner's alone in this architecture."""
+        if self.arm != "pend":
+            raise ValueError("run_task1 is implemented for the pend arm")
+        from sepsim import persona as P, pipeline, state, stopping
+        import planner_prompt_v3 as V3
+        rec = self.recs[conversation_id]
+        rid, scenario = rec["record_id"], rec["scenario"]
+        users, agents = pipeline.split_messages(rec)
+        n = len(users)
+        rng = random.Random(pipeline.seed_for(rid, 0))
+        led = stopping.StoppingLedger(scenario)
+        prev_block = state.d0(P.initial_stage(scenario.get("goal")))
+        rows = []
+        for t in range(1, n + 1):
+            if t >= 2 and t - 2 < len(agents):
+                at = agents[t - 2]["text"]
+                pt = agents[t - 3]["text"] if t >= 3 and t - 3 < len(agents) else ""
+                led.observe({}, at, pt)
+            hist_u = [u["text"] for u in users[: t - 1]]
+            hist_a = [a["text"] for a in agents[: t - 1]]
+            up = V3.user_prompt_pend(scenario, prev_block, hist_u, hist_a, t, led, prev_ann={})
+            pseed = int(hashlib.sha256(("t1|%s|%d|%d" % (rid, t, seed)).encode()).hexdigest()[:8], 16)
+            with self.gpu_lock:
+                g = self.planner.generate(self.system, up, 0.0, 1.0, pseed)
+            fields, diag, end = V3.read_plan_pend(g["raw"], t, scenario, rng, led)
+            unparsed = fields is None
+            block = prev_block if unparsed else V3.speaker_block_pend(fields)
+            rows.append({"t": t, "n_real": n, "real_final": t == n, "ended_planner": bool(end),
+                         "planner_unparsed": unparsed, "planner_hit_max_new": g["hit_max_new"],
+                         "goal_met": None if unparsed else fields.get("goal_met"),
+                         "planner_fit": g["fit"], "planner_diag": diag})
+            prev_block = block
+        return {"conversation_id": conversation_id, "record_id": rid, "arm": self.arm, "n_real": n,
+                "planner_path": self.planner.path, "planner_adapter": self.planner.adapter, "turns": rows}

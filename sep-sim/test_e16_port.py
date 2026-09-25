@@ -97,26 +97,26 @@ def plan(entries, top_len=40, end=False):
 
 
 def test_final_read_plan_takes_the_drawn_acts_length():
-    entries = [{"move": "Inquire", "act": "ask clarifying question", "p": 1.0, "length_words": 17},
-               {"move": "Complete", "act": "thank and leave", "p": 0.0, "length_words": 4}]
+    entries = [{"move": "Inquire", "act": "ask_more", "p": 1.0, "length_words": 17},
+               {"move": "Complete", "act": "settle", "p": 0.0, "length_words": 4}]
     code = ("import random\nfrom sepsim import stopping\nimport planner_prompt_v3 as V\n"
             "sc = json.loads(%r)\nf, d, e = V.read_plan_v3(%r, 3, sc, random.Random(0), stopping.StoppingLedger(sc))\n"
             "print(json.dumps([f and f.get('length_words'), f and f.get('move'), d.get('length_source'), d.get('length_clamped'), e]))"
             ) % (json.dumps(SCENARIO), plan(entries, top_len=200))
     lw, move, src, clamped, end = run(E1R, T2.ARM_ENV["final"], code)
-    if move == "Inquire":
-        assert (lw, src) == (17, "act_entry")
+    assert move == "Inquire"
+    assert (lw, src) == (17, "act_entry")
     assert clamped is False and end is False
     # a length far outside any band is kept as is (no clamp)
     entries[0]["length_words"] = 900
     code2 = code.replace(plan([dict(entries[0], length_words=17), entries[1]], top_len=200), plan(entries, top_len=200))
     lw2, move2, src2, _, _ = run(E1R, T2.ARM_ENV["final"], code2)
-    if move2 == "Inquire":
-        assert (lw2, src2) == (900, "act_entry")
+    assert move2 == "Inquire"
+    assert (lw2, src2) == (900, "act_entry")
 
 
 def test_final_turn1_end_is_ignored_and_logged():
-    entries = [{"move": "Complete", "act": "thank and leave", "p": 1.0, "length_words": 4}]
+    entries = [{"move": "Complete", "act": "settle", "p": 1.0, "length_words": 4}]
     code = ("import random\nfrom sepsim import stopping\nimport planner_prompt_v3 as V\n"
             "sc = json.loads(%r)\nout = []\n"
             "for t in (1, 3):\n"
@@ -126,6 +126,54 @@ def test_final_turn1_end_is_ignored_and_logged():
     (e1, ign1, raw1), (e3, ign3, raw3) = run(E1R, T2.ARM_ENV["final"], code)
     assert (e1, ign1, raw1) == (False, True, True)
     assert (e3, ign3, raw3) == (True, False, True)
+
+
+SYS_PEND = "import planner_prompt_v3 as V\nprint(json.dumps(V.system_prompt_pend()))"
+
+
+def test_pend_system_prompt():
+    s = run(E1R, T2.ARM_ENV["pend"], SYS_PEND)
+    assert '"goal_met"' in s and '"still_wanted"' in s
+    assert s.count('"end_session"') == 1 and "their LAST one" in s
+    assert "a close need not thank anyone" in s
+    assert '"last_reply_helpful"' not in s and "inside that move's band" not in s
+    assert "leaves now and writes nothing more" not in s          # no silent-exit wording
+
+
+def test_pend_user_prompt_full_goal_no_judge():
+    code = ("from sepsim import stopping, state, persona as P\nimport planner_prompt_v3 as V\n"
+            "sc = json.loads(%r)\nled = stopping.StoppingLedger(sc)\n"
+            "b0 = state.d0(P.initial_stage(sc.get('goal')))\n"
+            "print(json.dumps(V.user_prompt_pend(sc, b0, ['hi'], ['hello'], 2, led, prev_ann={})))") % json.dumps(SCENARIO)
+    up = run(E1R, T2.ARM_ENV["pend"], code)
+    assert "WHAT THEY CAME FOR\nair quality datasets for Taipei\n- context: I am writing a thesis on PM2.5\n" in up
+    assert "GOAL STATUS" not in up and "HOW LONG THEY WRITE" not in up and "- Disclose: " not in up
+    assert "- turns so far:" in up and "WHAT THEY STILL WANT" not in up
+
+
+def full_dist(complete_len=6):
+    return [{"move": "Disclose", "act": "request_dataset", "p": 0.0, "length_words": 30},
+            {"move": "Reveal", "act": "narrow", "p": 0.0, "length_words": 25},
+            {"move": "Inquire", "act": "ask_more", "p": 1.0, "length_words": 17},
+            {"move": "Navigate", "act": "detail", "p": 0.0, "length_words": 15},
+            {"move": "Note", "act": "confirm", "p": 0.0, "length_words": 8},
+            {"move": "Complete", "act": "settle", "p": 0.0, "length_words": complete_len}]
+
+
+def test_pend_read_plan_end_uses_complete_entry():
+    raw = json.loads(plan(full_dist(), end=True))
+    raw.update(goal_met="Yes", still_wanted="  nothing  ")
+    code = ("import random\nfrom sepsim import stopping\nimport planner_prompt_v3 as V\n"
+            "sc = json.loads(%r)\nout = []\n"
+            "for t in (1, 3):\n"
+            "    f, d, e = V.read_plan_pend(%r, t, sc, random.Random(0), stopping.StoppingLedger(sc))\n"
+            "    out.append([e, f['move'], f.get('length_words'), f['goal_met'], f['still_wanted'],\n"
+            "                bool(d.get('end_act_from_complete_entry')), d.get('drawn_before_end')])\n"
+            "print(json.dumps(out))") % (json.dumps(SCENARIO), json.dumps(raw))
+    t1, t3 = run(E1R, T2.ARM_ENV["pend"], code)
+    assert t1[0] is False and t1[1] == "Inquire" and t1[2] == 17        # turn 1: no end, drawn act kept
+    assert t3[0] is True and t3[1] == "Complete" and t3[2] == 6          # close = the Planner's Complete entry
+    assert t3[3] == "yes" and t3[4] == "nothing" and t3[5] is True and t3[6][0] == "Inquire"
 
 
 def test_arm_env_consistency():
