@@ -67,7 +67,10 @@ behaviour is also a finding ("unauthorised design change").
 - Task 1 stop groups on train_all conversations (last message + one earlier, t ≥ 2), G samples,
   reward 1 if end_session agrees with the real person; non-decisions reward 0, no stop mask.
 - D2: auxiliary stop-token supervision on the Task 1 positions, annealed linearly to 0 (over 10
-  updates) once validation Task 1 term_f1 beats the untrained policy's.
+  updates) once validation Task 1 term_f1 beats the untrained policy's. Its weight w_aux is NOT
+  fixed (user, option B): initial value --stop-sup-weight, then tuned by the v4 LLM controller
+  (same factors / bounds [0.01, 5] / rollback) from TRAIN statistics (aux loss, aux vs RL gradient
+  norm, Task 1 train accuracy); effective weight = w_aux x anneal; w_aux = 0 stays off.
 - KL 0.04, LoRA r16. Episodes with a cut R0 reply / lost ledger verdict / emitted capped message
   never enter reward groups.
 - Controller: reuse the existing LLM controller adapted to v4 (discrete factors {0.5, 0.8, 1,

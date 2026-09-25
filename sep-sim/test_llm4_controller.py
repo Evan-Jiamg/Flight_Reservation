@@ -60,6 +60,23 @@ def test_rollback_after_two_worse_decision_points():
     assert cfg["w_cov"] == 1.0 and c.n_rollbacks == 1 and c.pending is None
 
 
+def test_w_aux_is_tuned_not_fixed():
+    """User decision (option B): the stop-supervision weight is one of the controller's knobs."""
+    calls = []
+    c = make(lambda req: calls.append(req) or reply({"factors": {"w_aux": 0.5}}))
+    cfg = c.propose(hist(5))
+    assert cfg["w_aux"] == pytest.approx(0.5)
+    assert "w_aux" in json.loads(calls[0]["messages"][1]["content"])["current"]
+    assert "w_aux" in calls[0]["messages"][0]["content"]
+    for _ in range(10):                                         # halving stops at the lower bound 0.01
+        cfg = c.propose(hist(5))
+    assert cfg["w_aux"] == pytest.approx(0.01)
+    # a run that switched the supervision off (w_aux = 0) is never switched back on by the controller
+    cfg0 = RC.initial_cfg(version="v4", w_aux=0.0)
+    c0 = RC.make_controller("llm", cfg0, transport=lambda req: reply({"factors": {"w_aux": 2.0}}))
+    assert c0.propose(hist(5))["w_aux"] == 0.0
+
+
 def test_rollback_survives_a_change_in_between():
     """Audit 2026-09-25: a change proposed at the first worse point must not reset the pending rollback."""
     c = make(lambda req: reply({"factors": {"w_cov": 2.0}}))

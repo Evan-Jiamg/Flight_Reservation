@@ -368,7 +368,8 @@ class Trainer:
         # pend: reward v4 (D1(b): human length DISTRIBUTION matching) with format constraints on
         # (declared defaults; a --config file may override)
         base_reward = {"version": "v4", "lambda_unparsed": 1.0, "lambda_hit_max_new": 1.0} if a.arm == "pend" else {}
-        cfg0 = RC.initial_cfg(**{**base_reward, **user_cfg.get("reward", {}), "lr": a.lr, "kl_coef": a.kl})
+        cfg0 = RC.initial_cfg(**{**base_reward, **user_cfg.get("reward", {}), "lr": a.lr, "kl_coef": a.kl,
+                                 "w_aux": a.stop_sup_weight})
         self.selection_cfg = copy.deepcopy(cfg0)          # fixed forever: comparable validation scores
         self.acfg = RA.algo_cfg(**user_cfg.get("algo", {}))
         self.controller = RC.make_controller(
@@ -433,10 +434,11 @@ class Trainer:
         q = RR.turn_distribution([e["emitted_user_turns"] for e in episodes], cfg["t_max"], cfg["alpha_smooth"])
         return {"p_h": self.p_h, "q": q}
 
-    def aux_weight(self, u):
-        """D2: full weight until validation Task 1 term_f1 first beats the untrained policy's, then linearly
-        to 0 over --stop-sup-anneal updates."""
-        w = self.a.stop_sup_weight
+    def aux_weight(self, u, cfg):
+        """Effective stop-supervision weight = cfg["w_aux"] (initial --stop-sup-weight, then tuned by the LLM
+        controller from TRAIN statistics) x the D2 anneal: 1 until validation Task 1 term_f1 first beats the
+        untrained policy's, then linearly to 0 over --stop-sup-anneal updates."""
+        w = float(cfg["w_aux"])
         if self.aux_anneal_start is None or self.a.stop_sup_anneal <= 0:
             return w
         return w * max(0.0, 1.0 - (u - self.aux_anneal_start) / float(self.a.stop_sup_anneal))
@@ -729,7 +731,7 @@ class Trainer:
                        "n_not_decisions": sum(1 for x in t1_all if not x.get("decision_valid", True)),
                        "groups_skipped_zero_std": t1_skipped}
         assert all(s_["policy_version"] == pv for s_ in samples), "sample from another policy version"
-        aux, w_aux = [], self.aux_weight(u)
+        aux, w_aux = [], self.aux_weight(u, cfg)
         if w_aux > 0:
             for r in t1rows:
                 x = (r["samples"] or [{}])[0].get("aux")
@@ -747,6 +749,8 @@ class Trainer:
                 "n_dropped_singleton_episodes": n_singletons,
                 "shadow_reward_mean": sum(shadow) / len(shadow), "turn_hist": turn_hist, "p_h": self.p_h,
                 "aux_weight": w_aux, "lr": cfg["lr"], "kl_coef": cfg["kl_coef"],
+                "aux_stats": {k: stats.get(k) for k in ("aux_n", "aux_loss", "aux_grad_norm", "aux_p_correct_before",
+                                                         "aux_p_correct_end")},
                 **{k: stats.get(k) for k in ("loss", "kl", "ratio_mean", "clip_frac", "grad_norm", "n_tokens",
                                               "value_mse", "ratio_init_maxdev")}}
         self.history.append(hist)
@@ -915,7 +919,7 @@ def parse_args(argv=None):
                     help="reported: whether Task 1 term_f1 / premature stay within this of update 0")
     ap.add_argument("--task1-convs", type=int, default=4,
                     help="Task 1 stop groups per update: real TRAIN conversations (last + one earlier message, G samples each); 0 = off")
-    ap.add_argument("--stop-sup-weight", type=float, default=1.0,
+    ap.add_argument("--stop-sup-weight", type=float, default=1.0,  # initial w_aux; the LLM controller tunes it
                     help="auxiliary stop-token supervision on the Task 1 positions (human end/continue); 0 = off (pure GRPO)")
     ap.add_argument("--stop-sup-anneal", type=int, default=10,
                     help="D2: updates over which the stop supervision goes linearly to 0 once validation Task 1 "

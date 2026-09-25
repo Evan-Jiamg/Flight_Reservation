@@ -29,8 +29,10 @@ import time
 
 import rl_reward as RR
 
-TRAIN_DEFAULTS = {"lr": 1e-5, "kl_coef": 0.04}
-TRAIN_BOUNDS = {"lr": (1e-7, 1e-4), "kl_coef": (0.0, 1.0)}
+# w_aux: weight of the auxiliary stop-token supervision on the Task 1 positions (D2 anneals it further);
+# a training knob like lr / kl_coef, not part of the reward (so the shadow / selection reward ignore it)
+TRAIN_DEFAULTS = {"lr": 1e-5, "kl_coef": 0.04, "w_aux": 1.0}
+TRAIN_BOUNDS = {"lr": (1e-7, 1e-4), "kl_coef": (0.0, 1.0), "w_aux": (0.0, 10.0)}
 CFG_BOUNDS = {**TRAIN_BOUNDS, **RR.REWARD_BOUNDS}
 
 DUAL_DEFAULTS = {"eta": 1.0, "budget_unparsed": 0.02, "budget_hit_max_new": 0.02,
@@ -50,7 +52,7 @@ FORBIDDEN_KEY_PARTS = ("valid", "val_", "test", "coverage", "complete")
 HISTORY_KEYS = ("update", "split", "reward_version", "n_episodes", "reward_mean", "reward_std", "components_mean",
                 "end_kind_frac", "n_groups", "n_groups_skipped_zero_std", "loss", "kl", "ratio_mean",
                 "clip_frac", "grad_norm", "n_tokens", "lr", "kl_coef", "value_mse", "ratio_init_maxdev",
-                "shadow_reward_mean", "turn_hist", "p_h")
+                "shadow_reward_mean", "turn_hist", "p_h", "aux_weight", "aux_stats", "task1_train")
 
 
 def sha256(s):
@@ -296,9 +298,10 @@ class LLMController(Controller):
 # "shadow" reward so rounds stay comparable, and rollback after two worse decision points.
 LLM4_DEFAULTS = {"model": "gpt-oss-120b", "every": 5, "window": 5, "rollback_windows": 2,
                  "factors": [0.5, 0.8, 1.0, 1.25, 2.0],
-                 "keys": ["w_cov", "w_dist", "lambda_unparsed", "lambda_hit_max_new"],
+                 "keys": ["w_cov", "w_dist", "lambda_unparsed", "lambda_hit_max_new", "w_aux"],
                  "bounds": {"w_cov": [0.1, 5.0], "w_dist": [0.1, 5.0],
-                            "lambda_unparsed": [0.1, 5.0], "lambda_hit_max_new": [0.1, 5.0]},
+                            "lambda_unparsed": [0.1, 5.0], "lambda_hit_max_new": [0.1, 5.0],
+                            "w_aux": [0.01, 5.0]},
                  "max_tokens": 4000, "timeout_s": 300}
 
 LLM4_SYSTEM = (
@@ -307,7 +310,11 @@ LLM4_SYSTEM = (
     "message is the user's last. Reward = w_cov * coverage (share of the user's requirements the "
     "assistant addressed) + w_dist * dist (log p_human(T) - log q(T): how well the distribution of "
     "conversation lengths T matches real people's) - lambda_unparsed * (share of unreadable plans) "
-    "- lambda_hit_max_new * (share of plans cut by the length cap). You see ONLY statistics of TRAINING "
+    "- lambda_hit_max_new * (share of plans cut by the length cap). Separately, w_aux weights an auxiliary "
+    "supervised loss that pulls the Planner's end_session decision towards the real person's on training "
+    "conversations (it is also annealed to 0 later); compare aux_grad_norm with grad_norm (the RL update) to "
+    "judge whether it dominates or is negligible, and task1_train accuracy to judge whether it is still needed. "
+    "You see ONLY statistics of TRAINING "
     "rollouts, summarised per update, and your earlier decisions with what followed. "
     "For each weight choose one factor from %s (1.0 = keep). Keep changes small unless the statistics "
     "clearly call for them. Reply with ONE JSON object: {\"factors\": {<key>: <factor>, ...}, "
@@ -371,7 +378,10 @@ class LLMFactorController(Controller):
                          "shadow_reward_mean": h.get("shadow_reward_mean"),
                          "coverage": c.get("coverage"), "dist": c.get("dist"), "turns_mean": c.get("turns"),
                          "rate_unparsed": c.get("rate_unparsed"), "rate_hit_max_new": c.get("rate_hit_max_new"),
-                         "kl": h.get("kl")})
+                         "kl": h.get("kl"), "grad_norm": h.get("grad_norm"),
+                         "aux_weight_effective": h.get("aux_weight"), "aux": h.get("aux_stats"),
+                         "task1_train": {k: (h.get("task1_train") or {}).get(k)
+                                         for k in ("acc", "end_at_final", "end_at_nonfinal")}})
         hist = [0] * len((win[-1].get("turn_hist") or []))
         for h in win:
             for i, v in enumerate(h.get("turn_hist") or []):
@@ -435,6 +445,9 @@ class LLMFactorController(Controller):
                 if f not in allowed:
                     raise ValueError("factor %r for %s is not one of %s" % (f, k, allowed))
                 lo, hi = self.opt["bounds"][k]
+                if self.cfg[k] == 0:
+                    applied[k] = {"factor": f, "value": 0.0, "note": "switched off by the run; stays 0"}
+                    continue
                 cfg[k] = min(hi, max(lo, self.cfg[k] * f))
                 applied[k] = {"factor": f, "value": cfg[k]}
             changed = any(abs(cfg[k] - self.cfg[k]) > 1e-12 for k in self.opt["keys"])
