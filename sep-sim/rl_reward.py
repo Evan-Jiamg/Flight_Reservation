@@ -34,6 +34,8 @@ REWARD_DEFAULTS = {
     "version": "v2",
     "w_cov": 1.0,
     "w_len": 1.0,
+    "w_dist": 1.0,
+    "alpha_smooth": 1.0,
     "t_max": 10.0,
     "w_goal": 1.0,
     "w_partial": 0.5,
@@ -49,6 +51,8 @@ REWARD_DEFAULTS = {
 REWARD_BOUNDS = {
     "w_cov": (0.0, 10.0),
     "w_len": (0.0, 10.0),
+    "w_dist": (0.0, 10.0),
+    "alpha_smooth": (0.01, 10.0),
     "t_max": (1.0, 100.0),
     "w_goal": (0.0, 10.0),
     "w_partial": (0.0, 1.0),
@@ -79,8 +83,8 @@ def validate(cfg):
         if not (lo <= v <= hi):
             raise ValueError("reward cfg %s=%r outside declared bounds [%g, %g]" % (k, v, lo, hi))
         out[k] = v
-    if out["version"] not in ("v2", "v3"):
-        raise ValueError("reward cfg version must be v2 or v3, got %r" % (out["version"],))
+    if out["version"] not in ("v2", "v3", "v4"):
+        raise ValueError("reward cfg version must be v2, v3 or v4, got %r" % (out["version"],))
     for k in ("abandon_reasons", "early_stop_statuses"):
         if not isinstance(out[k], (list, tuple)) or not all(isinstance(x, str) for x in out[k]):
             raise ValueError("reward cfg %s must be a list of strings" % k)
@@ -199,18 +203,82 @@ def reward_v3(episode, cfg):
     penalty = sum(cfg["lambda_" + k] * rates[k] for k in CONSTRAINTS)
     total = cfg["w_cov"] * cov - cfg["w_len"] * len_err - penalty
     comps = {"coverage": cov, "len_err": len_err, "turns": turns, "human_turns": human, "turn_target": target,
+             "stop_part": -cfg["w_len"] * len_err,
              "turn_diff": turns - human, "decision_steps": n, "constraint_penalty": penalty}
     comps.update({"rate_" + k: rates[k] for k in CONSTRAINTS})
     return {"total": float(total), "components": comps}
 
 
-def reward(episode, cfg):
-    """Dispatch on cfg['version'] (v2: goal-judge reward; v3: coverage and turn count)."""
-    return reward_v3(episode, cfg) if validate(cfg)["version"] == "v3" else reward_v2(episode, cfg)
+def turn_distribution(turns, t_max, alpha):
+    """Smoothed distribution over conversation lengths 0..t_max (lengths above t_max count as t_max,
+    the protocol's cap): (count + alpha) / (n + alpha * (t_max + 1))."""
+    t_max = int(t_max)
+    c = [0] * (t_max + 1)
+    for x in turns:
+        c[min(max(int(x), 0), t_max)] += 1
+    n = sum(c)
+    return [(v + alpha) / (n + alpha * (t_max + 1)) for v in c]
+
+
+def reward_v4(episode, cfg, ctx):
+    """Reward v4 (user decision D1(b), 2026-09-25): match the human DISTRIBUTION of conversation length.
+
+      dist      log p_h(T) - log q(T), T = emitted turns of this episode (capped at t_max);
+                p_h = smoothed distribution of the real people's number of messages in the TRAIN
+                conversations (ctx["p_h"]); q = smoothed distribution of T over the current update's
+                rollouts (ctx["q"]). E_q[dist] = -KL(q || p_h), so the optimum is q = p_h (the whole
+                distribution, not one length for every conversation).
+      coverage  the ledger's final coverage (declared reward term, as in v3).
+      rate_<k>  constraint rates (unparsed, hit_max_new, no_survivor; judge_unknown 0).
+      total = w_cov*coverage + w_dist*dist - sum_k lambda_k * rate_k
+    components["stop_part"] = w_dist*dist: the part caused by the end decisions (stop credit)."""
+    import math
+    cfg = validate(cfg)
+    trace, n = _steps(episode)
+    if n == 0:
+        raise ValueError("episode without decision steps")
+    t_max = int(cfg["t_max"])
+    p_h, q = ctx["p_h"], ctx["q"]
+    if len(p_h) != t_max + 1 or len(q) != t_max + 1:
+        raise ValueError("distributions must cover 0..t_max")
+    turns = int(episode["emitted_user_turns"])
+    T = min(max(turns, 0), t_max)
+    dist = math.log(p_h[T]) - math.log(q[T])
+    cov = float(episode["coverage"])
+    if not (0.0 <= cov <= 1.0):
+        raise ValueError("coverage %r outside [0, 1]" % cov)
+    counts = {
+        "unparsed": sum(bool(s.get("planner_unparsed")) for s in trace),
+        "hit_max_new": sum(bool(s.get("planner_hit_max_new")) for s in trace),
+        "no_survivor": sum(bool(s.get("no_survivor")) for s in trace),
+        "judge_unknown": 0,
+    }
+    rates = {k: counts[k] / n for k in CONSTRAINTS}
+    penalty = sum(cfg["lambda_" + k] * rates[k] for k in CONSTRAINTS)
+    stop_part = cfg["w_dist"] * dist
+    total = cfg["w_cov"] * cov + stop_part - penalty
+    comps = {"coverage": cov, "dist": dist, "turns": turns, "log_p_h": math.log(p_h[T]), "log_q": math.log(q[T]),
+             "decision_steps": n, "constraint_penalty": penalty, "stop_part": stop_part}
+    if "human_turns" in episode:
+        comps["human_turns"] = int(episode["human_turns"])
+    comps.update({"rate_" + k: rates[k] for k in CONSTRAINTS})
+    return {"total": float(total), "components": comps}
+
+
+def reward(episode, cfg, ctx=None):
+    """Dispatch on cfg['version'] (v2: goal-judge reward; v3: coverage and per-scenario turn count;
+    v4: coverage and the human length distribution -- needs ctx with p_h and q)."""
+    v = validate(cfg)["version"]
+    if v == "v4":
+        if not ctx or "p_h" not in ctx or "q" not in ctx:
+            raise ValueError("reward v4 needs ctx={'p_h': ..., 'q': ...}")
+        return reward_v4(episode, cfg, ctx)
+    return reward_v3(episode, cfg) if v == "v3" else reward_v2(episode, cfg)
 
 
 AGG_KEYS = {"v2": ["goal", "over_continue", "early_stop", "decision_steps"],
-            "v3": ["coverage", "len_err", "turns", "human_turns", "turn_diff", "decision_steps"]}
+            "v3": ["coverage", "len_err", "turns", "human_turns", "turn_diff", "decision_steps"],
+            "v4": ["coverage", "dist", "turns", "decision_steps"]}
 
 
 def aggregate(episodes_with_rewards):
@@ -222,7 +290,8 @@ def aggregate(episodes_with_rewards):
     tot = [r["total"] for _, r in rows]
     m = sum(tot) / len(tot)
     sd = (sum((x - m) ** 2 for x in tot) / len(tot)) ** 0.5
-    ver = "v3" if "len_err" in rows[0][1]["components"] else "v2"
+    c0 = rows[0][1]["components"]
+    ver = "v4" if "dist" in c0 else ("v3" if "len_err" in c0 else "v2")
     keys = AGG_KEYS[ver] + ["rate_" + k for k in CONSTRAINTS]
     comp = {k: sum(float(r["components"][k]) for _, r in rows) / len(rows) for k in keys}
     ends = {}

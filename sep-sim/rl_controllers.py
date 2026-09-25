@@ -49,7 +49,8 @@ LLM_URL = "https://api.openai.com/v1/chat/completions"
 FORBIDDEN_KEY_PARTS = ("valid", "val_", "test", "coverage", "complete")
 HISTORY_KEYS = ("update", "split", "reward_version", "n_episodes", "reward_mean", "reward_std", "components_mean",
                 "end_kind_frac", "n_groups", "n_groups_skipped_zero_std", "loss", "kl", "ratio_mean",
-                "clip_frac", "grad_norm", "n_tokens", "lr", "kl_coef", "value_mse", "ratio_init_maxdev")
+                "clip_frac", "grad_norm", "n_tokens", "lr", "kl_coef", "value_mse", "ratio_init_maxdev",
+                "shadow_reward_mean", "turn_hist", "p_h")
 
 
 def sha256(s):
@@ -95,7 +96,7 @@ def check_history(history):
             raise ValueError("controller history entry is not a train aggregate: split=%r" % h.get("split"))
         # reward v3 uses the TRAIN rollouts' ledger coverage as a declared reward term, so under v3 the
         # train-aggregate key "coverage" is allowed; validation/test keys stay forbidden in every version
-        parts = FORBIDDEN_KEY_PARTS if h.get("reward_version") != "v3" else \
+        parts = FORBIDDEN_KEY_PARTS if h.get("reward_version") not in ("v3", "v4") else \
             tuple(p for p in FORBIDDEN_KEY_PARTS if p != "coverage")
         for k in _walk_keys(h):
             kl = k.lower()
@@ -288,11 +289,185 @@ class LLMController(Controller):
         return {**super().describe(), "llm": self.llm, "llm_bounds": LLM_BOUNDS}
 
 
+# ------------------------------------------------------------------ LLM controller for reward v4
+# User decision (2026-09-25): reuse the LLM controller, adapted to the v4 reward, no baselines for now.
+# Adaptations taken from the literature review (AHRS 2505.02483; ERFSL 2409.02428; LLMZero 2606.18388):
+# discrete multiplicative steps instead of free numbers, a summarised (not raw) train log, a fixed-weight
+# "shadow" reward so rounds stay comparable, and rollback after two worse decision points.
+LLM4_DEFAULTS = {"model": "gpt-oss-120b", "every": 5, "window": 5, "rollback_windows": 2,
+                 "factors": [0.5, 0.8, 1.0, 1.25, 2.0],
+                 "keys": ["w_cov", "w_dist", "lambda_unparsed", "lambda_hit_max_new"],
+                 "bounds": {"w_cov": [0.1, 5.0], "w_dist": [0.1, 5.0],
+                            "lambda_unparsed": [0.1, 5.0], "lambda_hit_max_new": [0.1, 5.0]},
+                 "max_tokens": 4000, "timeout_s": 300}
+
+LLM4_SYSTEM = (
+    "You adjust the reward weights of a reinforcement-learning run. The policy is the Planner of a "
+    "user simulator: each turn it plans the simulated user's next message and decides whether that "
+    "message is the user's last. Reward = w_cov * coverage (share of the user's requirements the "
+    "assistant addressed) + w_dist * dist (log p_human(T) - log q(T): how well the distribution of "
+    "conversation lengths T matches real people's) - lambda_unparsed * (share of unreadable plans) "
+    "- lambda_hit_max_new * (share of plans cut by the length cap). You see ONLY statistics of TRAINING "
+    "rollouts, summarised per update, and your earlier decisions with what followed. "
+    "For each weight choose one factor from %s (1.0 = keep). Keep changes small unless the statistics "
+    "clearly call for them. Reply with ONE JSON object: {\"factors\": {<key>: <factor>, ...}, "
+    "\"rationale\": \"<one sentence>\"}. Keys: %s.")
+
+
+def local_transport(request, base_url, timeout_s=300):
+    """POST an OpenAI-compatible chat request to a local endpoint (no key needed)."""
+    import urllib.request
+    url = base_url.rstrip("/") + "/chat/completions"
+    headers = {"Content-Type": "application/json"}
+    key = os.environ.get("OPENAI_API_KEY")
+    if key and "api.openai.com" in url:
+        headers["Authorization"] = "Bearer " + key
+    req = urllib.request.Request(url, data=json.dumps(request).encode("utf-8"), method="POST", headers=headers)
+    with urllib.request.urlopen(req, timeout=timeout_s) as r:
+        return json.loads(r.read().decode("utf-8"))
+
+
+def first_json_object(text):
+    import re
+    m = re.search(r"\{.*\}", text or "", re.S)
+    if not m:
+        raise ValueError("no JSON object in the reply")
+    return json.loads(m.group(0))
+
+
+class LLMFactorController(Controller):
+    kind = "llm4"
+
+    def __init__(self, cfg0=None, log_path=None, transport=None, **opts):
+        super().__init__(cfg0)
+        self.opt = copy.deepcopy(LLM4_DEFAULTS)
+        self.opt.update(opts)
+        bad = [k for k in self.opt["keys"] if k not in CFG_BOUNDS]
+        if bad:
+            raise ValueError("unknown controller keys %r" % bad)
+        for k in self.opt["keys"]:
+            lo, hi = self.opt["bounds"][k]
+            if not (CFG_BOUNDS[k][0] <= lo <= hi <= CFG_BOUNDS[k][1]):
+                raise ValueError("controller bounds for %s outside the reward bounds" % k)
+        self.log_path = log_path
+        base_url = os.environ.get("CONTROLLER_BASE_URL") or os.environ.get("R0_BASE_URL") or "http://127.0.0.1:8029/v1"
+        self.opt["base_url"] = base_url
+        self.transport = transport or (lambda req: local_transport(req, base_url, self.opt["timeout_s"]))
+        self.pending = None           # {"prev_cfg", "baseline", "bad"} after an applied change
+        self.decisions = []           # [{"at", "factors", "shadow_before"}] shown to the LLM
+        self.n_failures = self.n_rollbacks = 0
+
+    @staticmethod
+    def _mean(xs):
+        xs = [float(x) for x in xs if x is not None]
+        return sum(xs) / len(xs) if xs else None
+
+    def summarise(self, history):
+        win = history[-int(self.opt["window"]):]
+        rows = []
+        for h in win:
+            c = h.get("components_mean") or {}
+            rows.append({"update": h.get("update"), "reward_mean": round(float(h.get("reward_mean", 0.0)), 4),
+                         "shadow_reward_mean": h.get("shadow_reward_mean"),
+                         "coverage": c.get("coverage"), "dist": c.get("dist"), "turns_mean": c.get("turns"),
+                         "rate_unparsed": c.get("rate_unparsed"), "rate_hit_max_new": c.get("rate_hit_max_new"),
+                         "kl": h.get("kl")})
+        hist = [0] * len((win[-1].get("turn_hist") or []))
+        for h in win:
+            for i, v in enumerate(h.get("turn_hist") or []):
+                hist[i] += v
+        return {"per_update": rows, "train_turn_histogram_0_to_tmax": hist,
+                "human_train_length_distribution_0_to_tmax": win[-1].get("p_h")}
+
+    def build_request(self, history):
+        payload = {"train_statistics": self.summarise(check_history(history)),
+                   "current": {k: self.cfg[k] for k in self.opt["keys"]},
+                   "bounds": {k: self.opt["bounds"][k] for k in self.opt["keys"]},
+                   "earlier_decisions": self.decisions[-6:]}
+        return {"model": self.opt["model"], "max_tokens": int(self.opt["max_tokens"]),
+                "messages": [{"role": "system", "content": LLM4_SYSTEM % (self.opt["factors"], ", ".join(self.opt["keys"]))},
+                             {"role": "user", "content": json.dumps(payload, sort_keys=True)}]}
+
+    def _log(self, rec):
+        if self.log_path:
+            with open(self.log_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(rec, sort_keys=True) + "\n")
+
+    def propose(self, history):
+        check_history(history)
+        self.n_proposals += 1
+        every = int(self.opt["every"])
+        if not history or len(history) % every:
+            return copy.deepcopy(self.cfg)
+        u = history[-1].get("update")
+        shadow = self._mean(h.get("shadow_reward_mean") for h in history[-every:])
+        rec = {"time": time.time(), "update": u, "shadow_window_mean": shadow, "cfg_before": {k: self.cfg[k] for k in self.opt["keys"]}}
+        # rollback: the last change made the fixed-weight shadow reward worse at two decision points
+        if self.pending is not None and shadow is not None:
+            self.pending["bad"] = self.pending["bad"] + 1 if shadow < self.pending["baseline"] else 0
+            if self.pending["bad"] >= int(self.opt["rollback_windows"]):
+                self.cfg = validate_cfg(self.pending["prev_cfg"])
+                self.n_rollbacks += 1
+                rec.update(ok=True, rollback=True, cfg_after={k: self.cfg[k] for k in self.opt["keys"]})
+                self.pending = None
+                self._log(rec)
+                return copy.deepcopy(self.cfg)
+        req = self.build_request(history)
+        rec.update(request=req, request_sha256=sha256(json.dumps(req, sort_keys=True)))
+        try:
+            resp = self.transport(req)
+            rec["response_sha256"] = sha256(json.dumps(resp, sort_keys=True))
+            content = resp["choices"][0]["message"].get("content") or ""
+            rec["response_content"] = content[:4000]
+            prop = first_json_object(content)
+            facs = prop.get("factors") or {}
+            if not isinstance(facs, dict):
+                raise ValueError("factors is not an object")
+            allowed = [float(f) for f in self.opt["factors"]]
+            cfg, applied = copy.deepcopy(self.cfg), {}
+            for k in self.opt["keys"]:
+                if k not in facs:
+                    continue
+                f = float(facs[k])
+                if f not in allowed:
+                    raise ValueError("factor %r for %s is not one of %s" % (f, k, allowed))
+                lo, hi = self.opt["bounds"][k]
+                cfg[k] = min(hi, max(lo, self.cfg[k] * f))
+                applied[k] = {"factor": f, "value": cfg[k]}
+            changed = any(abs(cfg[k] - self.cfg[k]) > 1e-12 for k in self.opt["keys"])
+            if changed:
+                self.pending = {"prev_cfg": copy.deepcopy(self.cfg), "baseline": shadow, "bad": 0}
+            self.cfg = validate_cfg(cfg)
+            self.decisions.append({"at_update": u, "factors": {k: v["factor"] for k, v in applied.items()},
+                                   "shadow_reward_before": shadow})
+            rec.update(ok=True, applied=applied, rationale=prop.get("rationale"), changed=changed)
+        except Exception as e:                      # keep the current cfg; count and log
+            self.n_failures += 1
+            rec.update(ok=False, error="%s: %s" % (type(e).__name__, e))
+        rec["cfg_after"] = {k: self.cfg[k] for k in self.opt["keys"]}
+        self._log(rec)
+        return copy.deepcopy(self.cfg)
+
+    def state_dict(self):
+        return {**super().state_dict(), "opt": copy.deepcopy(self.opt), "pending": copy.deepcopy(self.pending),
+                "decisions": copy.deepcopy(self.decisions), "n_failures": self.n_failures, "n_rollbacks": self.n_rollbacks}
+
+    def load_state_dict(self, d):
+        super().load_state_dict(d)
+        self.pending, self.decisions = copy.deepcopy(d.get("pending")), copy.deepcopy(d.get("decisions", []))
+        self.n_failures, self.n_rollbacks = int(d.get("n_failures", 0)), int(d.get("n_rollbacks", 0))
+
+    def describe(self):
+        return {**super().describe(), "llm4": {k: v for k, v in self.opt.items()}}
+
+
 def make_controller(kind, cfg0=None, log_path=None, transport=None, **kw):
     if kind == "fixed":
         return FixedController(cfg0)
     if kind == "dual":
         return DualAscentController(cfg0, **kw)
     if kind == "llm":
+        if cfg0 is not None and cfg0.get("version") == "v4":
+            return LLMFactorController(cfg0, log_path=log_path, transport=transport, **kw)
         return LLMController(cfg0, log_path=log_path, transport=transport, **kw)
     raise ValueError(kind)
