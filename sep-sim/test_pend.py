@@ -79,6 +79,18 @@ def test_parallel_rollouts_equal_serial():
         ua, ub = strip(T.read_jsonl(os.path.join(a, "updates.jsonl"))), strip(T.read_jsonl(os.path.join(b, "updates.jsonl")))
         assert ua == ub
         assert json.load(open(os.path.join(a, "best.json"))) == json.load(open(os.path.join(b, "best.json")))
+        # Task 1 stop groups: same rows serial/parallel, TRAIN conversations only, every update
+        ka = lambda r: (r["update"], r["conversation_id"], r["t"])
+        ta = sorted(strip(T.read_jsonl(os.path.join(a, "rollouts_task1.jsonl"))), key=ka)
+        tb = sorted(strip(T.read_jsonl(os.path.join(b, "rollouts_task1.jsonl"))), key=ka)
+        assert ta == tb and ta
+        sp_ = json.load(open(sp))["folds"][0]
+        assert all(r["conversation_id"] in sp_["train"] and r["conversation_id"] not in sp_["forbidden_for_training"] for r in ta)
+        assert sorted({r["update"] for r in ta}) == [1, 2, 3]
+        for r in ta:
+            assert r["real_final"] == (r["t"] == r["n_real"]) and len(r["samples"]) == 4
+            assert all(x["reward"] == float(x["ended_planner"] == r["real_final"]) for x in r["samples"])
+        assert all(u["train_aggregate"]["task1_train"]["n"] > 0 for u in ua)
         # pend default: reward v3 was used, and validation summaries carry the turn statistics
         assert ua[0]["cfg_used"]["version"] == "v3"
         summ = [v for v in T.read_jsonl(os.path.join(b, "validation.jsonl")) if v["kind"] == "summary"]

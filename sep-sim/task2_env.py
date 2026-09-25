@@ -436,7 +436,36 @@ class Task2Env:
         users, _ = pipeline.split_messages(self.recs[conversation_id])
         return len(users)
 
-    def run_task1(self, conversation_id, seed=0):
+    def task1_prompts(self, conversation_id):
+        """Greedy teacher-forced pass (current policy) -> per turn the exact Planner user prompt, so a
+        Task 1 training group can sample G decisions from the same state the Planner would be in."""
+        res = self.run_task1(conversation_id, keep_prompts=True)
+        return [{"t": r["t"], "n_real": r["n_real"], "real_final": r["real_final"], "user_prompt": r["user_prompt"]}
+                for r in res["turns"]]
+
+    def task1_sample(self, conversation_id, t, user_prompt, real_final, G, temperature, top_p, seed):
+        """G sampled Planner decisions at one real turn; reward 1 if end_session == (message t was the
+        person's last), else 0. Returned in the rollout schema (one step with planner_gen each)."""
+        if self.arm != "pend":
+            raise ValueError("task1_sample is implemented for the pend arm")
+        from sepsim import stopping
+        import planner_prompt_v3 as V3
+        scenario = self.recs[conversation_id]["scenario"]
+        out = []
+        for g in range(G):
+            pseed = int(hashlib.sha256(("t1s|%s|%d|%d|%d" % (conversation_id, t, g, seed)).encode()).hexdigest()[:8], 16)
+            with self.gpu_lock:
+                gen = self.planner.generate(self.system, user_prompt, temperature, top_p, pseed)
+            fields, diag, end = V3.read_plan_pend(gen["raw"], t, scenario, random.Random(pseed),
+                                                  stopping.StoppingLedger(scenario))
+            out.append({"t": t, "replicate": g, "real_final": bool(real_final), "ended_planner": bool(end),
+                        "planner_unparsed": fields is None, "planner_hit_max_new": gen["hit_max_new"],
+                        "reward": float(bool(end) == bool(real_final)),
+                        "planner_gen": {"prompt_ids": gen["prompt_ids"], "gen_ids": gen["gen_ids"],
+                                        "temperature": temperature, "top_p": top_p, "seed": pseed}})
+        return out
+
+    def run_task1(self, conversation_id, seed=0, keep_prompts=False):
         """Task 1 (teacher-forced) stop decisions of the Planner on a REAL conversation (pend arm).
 
         Mirrors the E1.6 run_v2 loop: at turn t the history is the real person's first t-1 messages and
@@ -474,6 +503,8 @@ class Task2Env:
                          "planner_unparsed": unparsed, "planner_hit_max_new": g["hit_max_new"],
                          "goal_met": None if unparsed else fields.get("goal_met"),
                          "planner_fit": g["fit"], "planner_diag": diag})
+            if keep_prompts:
+                rows[-1]["user_prompt"] = up
             prev_block = block
         return {"conversation_id": conversation_id, "record_id": rid, "arm": self.arm, "n_real": n,
                 "planner_path": self.planner.path, "planner_adapter": self.planner.adapter, "turns": rows}

@@ -275,6 +275,29 @@ class FakeEnv:
                 "human_turns": 2 + seed_of("human", conversation_id) % 6}
 
 
+def _fake_task1_prompts(self, conversation_id):
+    n = 2 + seed_of("human", conversation_id) % 6
+    return [{"t": t, "n_real": n, "real_final": t == n, "user_prompt": "fake"} for t in range(1, n + 1)]
+
+
+def _fake_task1_sample(self, conversation_id, t, user_prompt, real_final, G, temperature, top_p, seed):
+    out = []
+    for g in range(G):
+        rng = random.Random(seed_of("fake-t1", conversation_id, t, g, seed))
+        k = 3 if real_final else 1
+        stop = rng.random() < _sig(self.learner.theta[k])
+        out.append({"t": t, "replicate": g, "real_final": bool(real_final), "ended_planner": stop,
+                    "planner_unparsed": False, "planner_hit_max_new": False,
+                    "reward": float(stop == bool(real_final)),
+                    "planner_gen": {"prompt_ids": [k, t], "gen_ids": [int(stop), 7],
+                                    "temperature": temperature, "top_p": top_p, "seed": g}})
+    return out
+
+
+FakeEnv.task1_prompts = _fake_task1_prompts
+FakeEnv.task1_sample = _fake_task1_sample
+
+
 def stub_llm_transport(request):
     """Deterministic offline stand-in for the LLM controller (dry run / tests)."""
     cur = json.loads(request["messages"][1]["content"])["current"]
@@ -291,6 +314,7 @@ class Trainer:
         self.ckpt_root = os.path.join(a.out, "ckpt")
         os.makedirs(self.ckpt_root, exist_ok=True)
         self.p_roll = os.path.join(a.out, "rollouts.jsonl")
+        self.p_roll_t1 = os.path.join(a.out, "rollouts_task1.jsonl")
         self.p_upd = os.path.join(a.out, "updates.jsonl")
         self.p_val = os.path.join(a.out, "validation.jsonl")
         self.p_best = os.path.join(a.out, "best.json")
@@ -467,6 +491,61 @@ class Trainer:
                     rows[k] = r
         return [[rows[(slot, g)] for g in range(a.G)] for slot in range(len(cids))]
 
+    def task1_rollouts(self, u):
+        """Task 1 stop groups on REAL train conversations: for --task1-convs conversations (seeded by u,
+        train split only), at the person's last message and at one earlier message (t >= 2), G sampled
+        Planner decisions from the state the current policy reaches greedily; reward 1 when
+        end_session agrees with the real person (the real last message is the only positive)."""
+        a, pv, psha = self.a, u - 1, self.learner.policy_sha()
+        if a.task1_convs <= 0:
+            return []
+        reuse = {}
+        for r in read_jsonl(self.p_roll_t1):
+            if r["update"] == u and r["policy_version"] == pv and r["policy_sha"] == psha:
+                reuse[(r["conversation_id"], r["t"])] = r
+        rng = random.Random(seed_of(a.seed, "task1", u))
+        pool = sorted(self.split["train"])
+        cids = rng.sample(pool, min(a.task1_convs, len(pool)))
+        jobs = []
+        for cid in cids:
+            assert_train_id(cid, self.split)
+            jobs.append((cid, rng.random()))
+
+        def run_conv(job):
+            cid, x = job
+            prompts = None
+            rows = []
+            n = None
+            for key in list(reuse):
+                if key[0] == cid:
+                    rows.append(reuse[key])
+            if rows:
+                return rows
+            prompts = self.env.task1_prompts(cid)
+            n = len(prompts)
+            pos = [n] + ([2 + int(x * (n - 2))] if n >= 3 else [])
+            for t in pos:
+                pr = prompts[t - 1]
+                assert pr["t"] == t and pr["real_final"] == (t == n)
+                smp = self.env.task1_sample(cid, t, pr["user_prompt"], pr["real_final"], a.G,
+                                            a.temperature, a.top_p, seed_of(a.seed, "t1s", u))
+                row = {"update": u, "conversation_id": cid, "t": t, "n_real": n, "real_final": t == n,
+                       "split": "train", "policy_version": pv, "policy_sha": psha, "samples": smp, "time": time.time()}
+                with self.io_lock:
+                    append_jsonl(self.p_roll_t1, row)
+                rows.append(row)
+            return rows
+
+        out = []
+        if a.rollout_workers <= 1:
+            for job in jobs:
+                out += run_conv(job)
+        else:
+            with ThreadPoolExecutor(max_workers=a.rollout_workers) as ex:
+                for rows in ex.map(run_conv, jobs):
+                    out += rows
+        return sorted(out, key=lambda r: (r["conversation_id"], r["t"]))
+
     # -------------------------------------------------------- one update
     def one_update(self, u):
         t0 = time.time()
@@ -491,10 +570,33 @@ class Trainer:
                 for s in RA.episode_samples(row["episode"], policy_version=row["policy_version"]):
                     s["ret"], s["adv"] = R, A
                     samples.append(s)
+        # Task 1 stop groups (same policy version; one Planner step per sample)
+        t1rows = self.task1_rollouts(u)
+        t1_rewards = [[x["reward"] for x in r["samples"]] for r in t1rows]
+        t1_advs, t1_skipped = RA.advantages_for_groups(t1_rewards, self.a.algo, self.acfg) if t1rows else ([], 0)
+        for r, rs, ad in zip(t1rows, t1_rewards, t1_advs):
+            assert r["policy_version"] == pv and r["policy_sha"] == self.learner.policy_sha(), "off-policy task1 rollout"
+            if ad is None:
+                continue
+            for x, R, A in zip(r["samples"], rs, ad):
+                pseudo = {"conversation_id": r["conversation_id"], "replicate": x["replicate"],
+                          "trace": [{"t": x["t"], "planner_gen": x["planner_gen"]}]}
+                for s in RA.episode_samples(pseudo, policy_version=pv):
+                    s["ret"], s["adv"], s["source"] = R, A, "task1"
+                    samples.append(s)
+        t1_all = [x for r in t1rows for x in r["samples"]]
+        t1_hist = None
+        if t1_all:
+            fin = [x for x in t1_all if x["real_final"]]
+            mid = [x for x in t1_all if not x["real_final"]]
+            t1_hist = {"n": len(t1_all), "acc": sum(x["reward"] for x in t1_all) / len(t1_all),
+                       "end_at_final": (sum(x["ended_planner"] for x in fin) / len(fin)) if fin else None,
+                       "end_at_nonfinal": (sum(x["ended_planner"] for x in mid) / len(mid)) if mid else None,
+                       "groups_skipped_zero_std": t1_skipped}
         assert all(s["policy_version"] == pv for s in samples), "sample from another policy version"
         stats = self.learner.update(samples, cfg, seed=seed_of(self.a.seed, "update", u))
         agg = RR.aggregate(rewarded)
-        hist = {"update": u, "split": "train", "reward_version": cfg["version"], **agg, "n_groups": len(groups), "n_groups_skipped_zero_std": skipped,
+        hist = {"update": u, "split": "train", "reward_version": cfg["version"], "task1_train": t1_hist, **agg, "n_groups": len(groups), "n_groups_skipped_zero_std": skipped,
                 "lr": cfg["lr"], "kl_coef": cfg["kl_coef"],
                 **{k: stats.get(k) for k in ("loss", "kl", "ratio_mean", "clip_frac", "grad_norm", "n_tokens",
                                               "value_mse", "ratio_init_maxdev")}}
@@ -567,14 +669,16 @@ class Trainer:
         if t1 is not None and self.task1_base is None:
             self.task1_base = {"update": u, **t1}
         t1_ok = True if t1 is None else T1.within_tolerance(t1, self.task1_base, a.task1_tol)
+        sel = score + (a.w_sel_task1 * t1["term_f1"] if t1 is not None else 0.0)
         append_jsonl(self.p_val, {"kind": "summary", "update": u, "policy_sha": psha, "split": "validation",
                                   "n_episodes": len(totals), "mean_reward_selection": score,
                                   "turn_stats": turn_stats, "task1": t1, "task1_base": self.task1_base,
                                   "task1_within_tol": t1_ok, "task1_tol": a.task1_tol,
+                                  "selection_score": sel, "w_sel_task1": a.w_sel_task1,
                                   "selection_cfg_sha256": RR.cfg_sha(self.selection_cfg), "time": time.time()})
-        if totals and t1_ok and (self.best is None or score > self.best["mean_reward_selection"]):
+        if totals and (self.best is None or sel > self.best["selection_score"]):
             self.best = {"update": u, "checkpoint": os.path.relpath(self.ckpt_dir(u), a.out).replace("\\", "/"),
-                         "policy_sha": psha, "mean_reward_selection": score,
+                         "policy_sha": psha, "mean_reward_selection": score, "selection_score": sel,
                          "selection_cfg_sha256": RR.cfg_sha(self.selection_cfg)}
             write_json_atomic(self.p_best, self.best)
             # keep the checkpoint's own record of best in sync
@@ -616,7 +720,11 @@ def parse_args(argv=None):
     ap.add_argument("--rollout-workers", type=int, default=1,
                     help="episodes run in threads; GPU calls are serialised inside Task2Env, R0/ledger calls overlap")
     ap.add_argument("--task1-tol", type=float, default=0.05,
-                    help="a checkpoint is selectable only if Task 1 term_f1 / premature are within this of update 0")
+                    help="reported: whether Task 1 term_f1 / premature stay within this of update 0")
+    ap.add_argument("--task1-convs", type=int, default=4,
+                    help="Task 1 stop groups per update: real TRAIN conversations (last + one earlier message, G samples each); 0 = off")
+    ap.add_argument("--w-sel-task1", type=float, default=1.0,
+                    help="checkpoint selection = validation Task 2 reward + this * validation Task 1 term_f1")
     ap.add_argument("--splits", default="/tmp2/mzjiang_usersim/grpo_planner/splits_v1.json")
     ap.add_argument("--algo", choices=RA.ALGOS, default="grpo")
     ap.add_argument("--controller", choices=("fixed", "dual", "llm"), default="fixed")

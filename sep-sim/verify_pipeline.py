@@ -609,7 +609,26 @@ def verify(episodes, meta_path, splits_path, fold, split, arm=None, training=Fal
         rows += load_jsonl(p, rep)
     rollouts = []
     if rl_dir:
-        files = sorted(glob.glob(os.path.join(rl_dir, "rollouts*.jsonl")) + glob.glob(os.path.join(rl_dir, "rollouts", "*.jsonl")))
+        files = sorted(p for p in glob.glob(os.path.join(rl_dir, "rollouts*.jsonl")) + glob.glob(os.path.join(rl_dir, "rollouts", "*.jsonl"))
+                       if not os.path.basename(p).startswith("rollouts_task1"))
+        t1p = os.path.join(rl_dir, "rollouts_task1.jsonl")
+        if os.path.exists(t1p):
+            folds = {int(f["fold"]): f for f in splits["folds"]}
+            f = folds.get(fold, {})
+            train, forb = set(f.get("train", [])), set(f.get("forbidden_for_training", []))
+            t1rows = load_jsonl(t1p, rep)
+            for r in t1rows:
+                w = "task1 %s t%s u%s" % (str(r.get("conversation_id"))[:12], r.get("t"), r.get("update"))
+                rep.ok("leak.task1_train_only", r.get("conversation_id") in train and r.get("conversation_id") not in forb,
+                       w, "Task 1 training group on a non-train conversation")
+                rep.ok("rl.task1_groups", r.get("real_final") == (r.get("t") == r.get("n_real")) and r.get("samples"), w,
+                       "real_final must be exactly t == n_real, with samples")
+                for x in r.get("samples") or []:
+                    g = x.get("planner_gen") or {}
+                    rep.ok("rl.task1_groups", bool(g.get("prompt_ids")) and bool(g.get("gen_ids")) and
+                           x.get("reward") == float(bool(x.get("ended_planner")) == bool(r.get("real_final"))), w,
+                           "sample without generation ids or with a reward that disagrees with the label")
+            rep.note("rl.task1_groups", "%d Task 1 groups" % len(t1rows))
         rep.ok("rl.rollouts_present", bool(files), rl_dir, "no rollouts*.jsonl")
         for p in files:
             rollouts += load_jsonl(p, rep)
