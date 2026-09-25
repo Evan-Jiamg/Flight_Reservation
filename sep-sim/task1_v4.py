@@ -33,6 +33,22 @@ def sha_file(p):
         return hashlib.sha256(f.read()).hexdigest()
 
 
+def check_rl_settings(adapter, settings):
+    """An RL adapter is evaluated only under the settings it was trained with, and only when no init adapter
+    was merged into its base (this CLI loads the LoRA on the plain base)."""
+    for d in (adapter, os.path.dirname(os.path.abspath(adapter.rstrip("/\\")))):
+        p = os.path.join(d, "rl_manifest.json")
+        if os.path.exists(p):
+            m = json.load(open(p, encoding="utf-8"))
+            if m.get("init_adapter"):
+                raise SystemExit("adapter was trained on top of init adapter %s: evaluating it on the plain base is wrong" % m["init_adapter"])
+            diff = {k: (m.get(k), v) for k, v in settings.items() if k in m and m.get(k) != v}
+            if diff:
+                raise SystemExit("adapter trained with other settings than this evaluation: %r" % diff)
+            return m
+    return None
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("--sessions", choices=("all", "fold-validation", "fold-test"), required=True)
@@ -90,7 +106,9 @@ def main(argv=None):
     else:
         sp = json.load(open(a.splits, encoding="utf-8"))
         f = [x for x in sp["folds"] if x["fold"] == a.fold][0]
-        cids = sorted(f["validation" if a.sessions == "fold-validation" else "test"])
+        # Task 1 needs no requirement shards: the test side is test_all (spec); validation stays the
+        # 4 shard sessions used for checkpoint selection
+        cids = sorted(f["validation"] if a.sessions == "fold-validation" else f["test_all"])
         if a.planner_adapter:
             man = None
             # train_planner_rl writes ckpt/uNNNNN/rl_manifest.json next to ckpt/uNNNNN/adapter
@@ -103,6 +121,8 @@ def main(argv=None):
                 raise SystemExit("LEAK GATE: adapter trained on fold %s, scored on fold %s" % (man["fold"], a.fold))
             if man is None:
                 raise SystemExit("LEAK GATE: adapter has no manifest")
+            check_rl_settings(a.planner_adapter, {"arm": "pend", "implicit_profile": a.implicit_profile,
+                                                  "selector": a.selector})
             used = set(man.get("train_scenarios", [])) | set(man.get("train_conversations", [])) | set(man.get("fewshot_pool", []))
             if used & set(cids):
                 raise SystemExit("LEAK GATE: adapter was trained on sessions scored here: %s" % sorted(used & set(cids))[:5])
@@ -140,6 +160,7 @@ def main(argv=None):
         if old.get("settings") != settings or old.get("code_sha256") != code:
             raise SystemExit("resume refused: %s was written with other settings or code; use a new --out" % a.out)
     meta = {"describe": env.describe(), "sessions": a.sessions, "fold": a.fold, "n_sessions": len(cids),
+            "session_ids": list(cids),
             "settings": settings, "code_sha256": code, "started": time.strftime("%Y-%m-%d %H:%M:%S")}
     json.dump(meta, open(mp, "w"), indent=1)
     t0 = time.time()

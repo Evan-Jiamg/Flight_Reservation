@@ -1,19 +1,23 @@
 #!/usr/bin/env python3
-"""Planner RL on Task 2 (GRPO / RLOO / PPO; fixed / dual-ascent / LLM controller).
+"""Planner RL for the pend arm (GRPO; v4 LLM factor controller). Design: ops/AUDIT_SPEC_pend_grpo.md.
 
 Loop (update u = 1, 2, ...; the policy that generates update u's rollouts has policy_version u-1):
   1. sample --scenarios-per-update scenarios (seeded by (seed, u)) from splits[fold]["train"] ONLY;
      every id is asserted to be in train and not in forbidden_for_training;
-  2. G rollouts each: Task2Env(arm="a2").run_episode(..., planner_temperature>0, record_generation=True);
-     each row is appended to rollouts.jsonl with update, policy_version and policy_sha;
-  3. rewards = rl_reward.reward_v2(episode, cfg) with the controller's current cfg;
-  4. advantages (rl_algos, pure python) -> samples (ids exactly as recorded) -> learner.update;
+  2. G rollouts each: Task2Env(arm="pend").run_episode(..., planner_temperature>0, record_generation=True);
+     each row is appended to rollouts.jsonl with update, policy_version and policy_sha; episodes that are
+     not clean (cut R0 reply, lost ledger verdict, emitted capped message, compacted prompt) are dropped;
+  3. rewards = rl_reward.reward(episode, cfg, ctx) -- v4: coverage + log p_h(T) - log q(T) - penalties, p_h
+     from splits[fold]["train_all"], q from this update's clean rollouts;
+  4. advantages normalised once per group, split into the stop part (end_session tokens) and the rest;
+     Task 1 stop groups on train_all conversations + the annealed stop supervision (D2);
      assert every sample was produced by the current policy_version (on-policy);
-  5. checkpoint EVERY update (adapter, optimizer, value head, controller state, RNG states, update index,
-     policy_version, history) atomically; then updates.jsonl;
+  5. checkpoint EVERY update (adapter, optimizer, controller state, RNG states, update index, policy_version,
+     history, rl_manifest.json) atomically; then updates.jsonl;
   6. controller.propose(train aggregates only) -> cfg for the next update;
-  7. every --val-every updates: greedy episodes on splits[fold]["validation"] -> validation.jsonl only;
-     best.json = best checkpoint by mean validation reward under the FIXED initial cfg (selection_cfg).
+  7. every --val-every updates: SAMPLED-Planner episodes (D5) and greedy Task 1 on splits[fold]["validation"]
+     -> validation.jsonl only; best.json = best checkpoint by validation reward under the FIXED initial cfg
+     (selection_cfg) + w * validation Task 1 term_f1 (M2).
 Validation never enters history, reward statistics or the controller; the test ids are never read.
 
 --resume continues from ckpt/LATEST; rollouts of an interrupted update that were produced by the same
@@ -94,12 +98,14 @@ def read_jsonl(path):
         return []
     out = []
     with open(path, encoding="utf-8") as f:
-        for line in f:
-            if line.strip():
-                try:
-                    out.append(json.loads(line))
-                except json.JSONDecodeError:
-                    pass          # a torn last line after a crash; the row is regenerated
+        lines = [l for l in f if l.strip()]
+    for i, line in enumerate(lines):
+        try:
+            out.append(json.loads(line))
+        except json.JSONDecodeError:
+            if i != len(lines) - 1:
+                raise ValueError("%s: undecodable line %d (not the last one): the file is corrupt" % (path, i + 1))
+            # a torn last line after a crash; the row is regenerated
     return out
 
 
@@ -603,20 +609,17 @@ class Trainer:
 
         def run_conv(job):
             cid, x = job
-            prompts = None
-            rows = []
-            n = None
-            for key in list(reuse):
-                if key[0] == cid:
-                    rows.append(reuse[key])
-            if rows:
-                return rows
-            prompts = self.env.task1_prompts(cid)
-            n = len(prompts)
+            n = self.env.human_turns(cid)
             if n < 2:
                 return []                    # turn 1 never ends: a one-message conversation has no stop decision
             pos = [n] + ([2 + int(x * (n - 2))] if n >= 3 else [])
-            for t in pos:
+            rows = [reuse[(cid, t)] for t in pos if (cid, t) in reuse]
+            missing = [t for t in pos if (cid, t) not in reuse]
+            if not missing:
+                return rows
+            prompts = self.env.task1_prompts(cid)
+            assert len(prompts) == n
+            for t in missing:
                 pr = prompts[t - 1]
                 assert pr["t"] == t and pr["real_final"] == (t == n)
                 smp = self.env.task1_sample(cid, t, pr["user_prompt"], pr["real_final"], a.G,
@@ -651,6 +654,7 @@ class Trainer:
         # reward group (its reward would be wrong); a group left with < 2 episodes has no baseline
         groups = [[row for row in grp if row["episode"]["clean"]] for grp in groups_all]
         n_unclean = sum(len(g0) - len(g1) for g0, g1 in zip(groups_all, groups))
+        n_singletons = sum(1 for g in groups if len(g) == 1)       # a lone clean episode has no baseline
         groups = [g for g in groups if len(g) >= 2]
         clean_eps = [row["episode"] for grp in groups for row in grp]
         if not clean_eps:
@@ -674,10 +678,14 @@ class Trainer:
             # stop credit assignment: the length term (v3 |T - target|, v4 log p_h(T) - log q(T)) is caused
             # only by the end_session decisions, so its group advantage goes to the end_session value tokens
             # of every decision step; coverage and the format constraints keep the sequence-level advantage
-            seq_groups = [[R - S for R, S in zip(rs, sp)] for rs, sp in zip(rew_groups, stop_groups)]
-            advs, _ = RA.advantages_for_groups(seq_groups, self.a.algo, self.acfg)
-            advs_stop, _ = RA.advantages_for_groups(stop_groups, self.a.algo, self.acfg)
-            skipped = sum(1 for a1, a2 in zip(advs, advs_stop) if a1 is None and a2 is None)
+            # normalised once by the group's std of the TOTAL reward (not per part), so w_cov / w_dist and
+            # the controller's factors keep their effect on the gradient
+            advs, advs_stop = [], []
+            for rs, sp in zip(rew_groups, stop_groups):
+                a1, a2 = RA.split_group_advantages(rs, sp, self.acfg["adv_eps"], self.acfg["min_group_std"])
+                advs.append(a1)
+                advs_stop.append(a2)
+            skipped = sum(1 for a1 in advs if a1 is None)
         else:
             advs, skipped = RA.advantages_for_groups(rew_groups, self.a.algo, self.acfg)
             advs_stop = [None] * len(groups)
@@ -734,6 +742,7 @@ class Trainer:
             turn_hist[min(max(int(e["emitted_user_turns"]), 0), tm)] += 1
         hist = {"update": u, "split": "train", "reward_version": cfg["version"], "task1_train": t1_hist, **agg,
                 "n_groups": len(groups), "n_groups_skipped_zero_std": skipped, "n_unclean_episodes": n_unclean,
+                "n_dropped_singleton_episodes": n_singletons,
                 "shadow_reward_mean": sum(shadow) / len(shadow), "turn_hist": turn_hist, "p_h": self.p_h,
                 "aux_weight": w_aux, "lr": cfg["lr"], "kl_coef": cfg["kl_coef"],
                 **{k: stats.get(k) for k in ("loss", "kl", "ratio_mean", "clip_frac", "grad_norm", "n_tokens",
@@ -773,7 +782,7 @@ class Trainer:
             cid, s = job
             r = done.get((cid, s))
             if r is None or r["policy_sha"] != psha:
-                ep = self.env.run_episode(cid, seed=s, replicate=s, planner_temperature=a.val_temperature,
+                ep = self.env.run_episode(cid, seed=s, replicate=0, planner_temperature=a.val_temperature,
                                           planner_top_p=a.val_top_p, record_generation=False)
                 r = {"kind": "episode", "update": u, "policy_sha": psha, "conversation_id": cid, "seed": s,
                      "split": "validation", "episode": ep, "time": time.time()}
@@ -811,6 +820,10 @@ class Trainer:
         t1 = T1.task1_stop_metrics([r["task1"] for r in t1rows]) if t1rows else None
         if t1 is not None and self.task1_base is None:
             self.task1_base = {"update": u, **t1}
+            sp = os.path.join(self.ckpt_dir(self.update_done), "state.json")
+            st = json.load(open(sp))
+            st["task1_base"] = self.task1_base         # persisted now: a crash in update 1 must not lose it
+            write_json_atomic(sp, st)
         if t1 is not None and self.aux_anneal_start is None and u > self.task1_base["update"] \
                 and t1["term_f1"] > self.task1_base["term_f1"]:
             self.aux_anneal_start = u            # D2: from here the stop supervision goes linearly to 0
@@ -909,7 +922,8 @@ def parse_args(argv=None):
                     help="checkpoint selection = validation Task 2 reward + this * validation Task 1 term_f1")
     ap.add_argument("--splits", default="/tmp2/mzjiang_usersim/grpo_planner/splits_v1.json")
     ap.add_argument("--algo", choices=RA.ALGOS, default="grpo")
-    ap.add_argument("--controller", choices=("fixed", "dual", "llm"), default="fixed")
+    ap.add_argument("--controller", choices=("fixed", "dual", "llm"), default="llm",
+                    help="spec: llm (the v4 factor controller); fixed/dual need --ablation")
     ap.add_argument("--planner-path")
     ap.add_argument("--planner-dtype", default="bfloat16")
     ap.add_argument("--planner-nf4", action="store_true")
@@ -947,6 +961,12 @@ def parse_args(argv=None):
     if a.stop_credit and a.algo != "grpo":
         ap.error("--stop-credit 1 is implemented for grpo")
     off = {k: getattr(a, k) for k in SPEC if getattr(a, k) != SPEC[k]}
+    if a.controller != "llm":
+        off["controller"] = a.controller
+    if a.config:
+        ver = (json.load(open(a.config, encoding="utf-8")).get("reward") or {}).get("version", "v4")
+        if ver != "v4":
+            off["reward.version"] = ver
     if off and not a.ablation:
         ap.error("settings %r differ from the pend spec %r; name the ablation with --ablation" % (off, SPEC))
     if not (a.val_temperature > 0):

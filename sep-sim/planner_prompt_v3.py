@@ -406,7 +406,7 @@ def read_plan_pend(raw, turn, scenario, rng, ledger):
                 p = float(e.get("p", 0) or 0)
             except (TypeError, ValueError):
                 p = 0.0
-            if mv not in ("Complete", "Other") and p > 0:
+            if mv != "Complete" and p > 0:
                 rest.append((p, mv, ac, e.get("length_words")))
         diag["complete_without_end"] = [fields.get("move"), fields.get("act")]
         if rest:
@@ -431,6 +431,8 @@ def read_plan_pend(raw, turn, scenario, rng, ledger):
             else:
                 fields.pop("length_words", None)     # never keep the Complete entry's length
             diag["complete_redrawn_to"] = [mv, ac]
+        else:
+            diag["complete_kept_no_alternative"] = True   # no non-Complete entry with p > 0: counted by verify
     fields["last_message"] = bool(end)
     return fields, diag, end
 
@@ -438,8 +440,9 @@ def read_plan_pend(raw, turn, scenario, rng, ledger):
 LAST_MESSAGE_LINE = "\n- this is their last message: they close the conversation with it and then leave"
 
 
-def speaker_block_pend(fields):
+def speaker_block_pend(fields, last_line=True):
+    """The block for the Speaker; last_line=False gives the Planner's own state (no Speaker-only line)."""
     blk = PP.render_block(fields, (fields.get("still_wanted") or "(nothing named)", ""))
-    if fields.get("last_message"):
+    if last_line and fields.get("last_message"):
         blk += LAST_MESSAGE_LINE            # the closing signal is explicit, not only implied by the act
     return blk

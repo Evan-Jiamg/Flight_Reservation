@@ -137,10 +137,10 @@ def main(argv=None):
                        w, r.get("greedy_ended"), r.get("speaker_ended"), prev_dec))
             se = r.get("samples_speaker_ended")
             if isinstance(se, list):
-                rep.ok("M2", [bool(x) or prev_dec for x in se] == [bool(x) for x in (r.get("samples_ended") or [])], w,
-                       "samples_ended does not follow M2")
+                rep.ok("M2", [bool(x) or prev_dec for x in se] == [bool(x) for x in (r.get("samples_ended") or [])],
+                       "%s samples_ended does not follow M2" % w)
             prev_dec = bool(r.get("planner_ends_session"))
-            rep.ok("planner_diag", isinstance(r.get("planner_diag"), dict), w, "planner_diag missing")
+            rep.ok("planner_diag", isinstance(r.get("planner_diag"), dict), "%s planner_diag missing" % w)
             check_fits(rep, w, r, pb, sb)
             reasons = r.get("guard_reasons") or []
             elig = [i for i, x in enumerate(reasons) if not x]
@@ -157,6 +157,13 @@ def main(argv=None):
                     rep.ok("leakage.fewshot", goal_of.get(ex_cid) != goal_of.get(cid), "%s example shares the goal" % w)
                     rep.ok("leakage.fewshot", persona_of.get(ex_cid) != persona_of.get(cid), "%s example shares the persona" % w)
                     rep.ok("leakage.fewshot", ex_cid not in forbidden, "%s example from validation/test %s" % (w, ex_cid[:10]))
+    if "session_ids" in meta:
+        missing = sorted(set(meta["session_ids"]) - set(by))
+        extra = sorted(set(by) - set(meta["session_ids"]))
+        rep.ok("structure", not missing, "%d scored session(s) have no rows: %s" % (len(missing), [c[:10] for c in missing[:5]]))
+        rep.ok("structure", not extra, "%d row conversation(s) not in the scored list" % len(extra))
+    else:
+        rep.ok("structure", False, "meta has no session_ids: cannot check that every session was generated")
     if n_steps and n_hit / n_steps > a.max_new_warn:
         rep.warn.append("planner max_new hits %d/%d" % (n_hit, n_steps))
     if n_unp:

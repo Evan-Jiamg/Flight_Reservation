@@ -436,7 +436,12 @@ class LLMFactorController(Controller):
                 applied[k] = {"factor": f, "value": cfg[k]}
             changed = any(abs(cfg[k] - self.cfg[k]) > 1e-12 for k in self.opt["keys"])
             if changed:
-                self.pending = {"prev_cfg": copy.deepcopy(self.cfg), "baseline": shadow, "bad": 0}
+                if self.pending is not None and self.pending["bad"] > 0:
+                    # an earlier change is still under suspicion: keep ITS last-good cfg, baseline and count, so
+                    # a second worse point rolls back to before it even though the LLM changed something between
+                    pass
+                else:
+                    self.pending = {"prev_cfg": copy.deepcopy(self.cfg), "baseline": shadow, "bad": 0}
             self.cfg = validate_cfg(cfg)
             self.decisions.append({"at_update": u, "factors": {k: v["factor"] for k, v in applied.items()},
                                    "shadow_reward_before": shadow})

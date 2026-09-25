@@ -9,9 +9,10 @@ Everything that decides behaviour lives here, once, so evaluation and RL cannot 
                 generate(system, user, temperature, top_p, seed) -> dict(raw, prompt_ids, gen_ids, fit)
   * Speaker     FitDittoSpeaker (D5 fix), frozen, v2fix guards and selector line for line.
   * Judge       goal_judge.GoalJudge (a2 only), frozen.
-  * arms        a0 = original Planner prompt/read_plan (override on); Planner end logged only.
-                a2 = v3 system/user prompt, read_plan_v3 (stop = end_session, no length clamp),
-                     judge GOAL STATUS, silent Planner exit.
+  * arms        pend (the method, user 2026-09-25) = E1.6 tree, no annotations, no goal judge; the Planner
+                     judges the goal and its end_session makes the planned message the last one (emitted
+                     close); Implicit Profile, per-slot few-shot, Borda selector (see ops/AUDIT_SPEC_pend_grpo.md).
+                e16 = the E1.6 baseline as generated; a0 / a2 / final = older arms kept for comparison only.
 The env never reads outcome data or dataset-wide statistics; leak gates live in the callers.
 
 Episode rows have the schema written by rollout_ditto_v3.py (so analyzers, derivations and the
@@ -98,7 +99,7 @@ JUDGE_RETRY_TOKENS = int(os.environ.get("JUDGE_RETRY_TOKENS", "8000"))   # one r
 # ledger call of an episode is made on that episode's thread, so a thread-local dict attributes each
 # incident to exactly one episode (the *_total counters on the clients stay process-wide).
 _EP = threading.local()
-EPISODE_COUNTERS = ("r0_len_retries", "r0_len_truncated", "r0_ctx_fit",
+EPISODE_COUNTERS = ("r0_len_retries", "r0_len_truncated", "r0_ctx_fit", "r0_empty",
                     "judge_empty", "judge_unparseable", "judge_retries")
 
 
@@ -128,14 +129,29 @@ def rl_masks(planner, g, unparsed, diag, t):
     ok = not unparsed and not g.get("hit_max_new") and t >= 2 and diag.get("end_session_valid") is True \
         and not diag.get("end_session_t1_ignored") and not diag.get("cut_by_max_new")
     sm = planner.stop_mask(g["gen_ids"]) if ok else None
+    if sm is not None:
+        raw = diag.get("end_session_raw")
+        want = "true" if (raw is True or str(raw).strip().lower() == "true") else "false"
+        txt = planner.tok.decode([x for x, m in zip(g["gen_ids"], sm) if m], skip_special_tokens=False)
+        if want not in txt.lower():
+            diag["stop_mask_mismatch"] = True      # the first match is not the parsed value: no stop credit
+            sm = None
     nm = None if g.get("hit_max_new") else planner.field_mask(g["gen_ids"], "profile_note")
     return sm, nm
 
 
+def step_compacted(step):
+    """True when the Planner prompt or any Speaker candidate prompt of this step was compacted (history
+    dropped to fit): never allowed for pend (verify FAILs; the episode leaves the reward groups)."""
+    if (step.get("planner_fit") or {}).get("compacted"):
+        return True
+    return any((f or {}).get("compacted") for f in (step.get("speaker_fits") or []))
+
+
 def episode_clean(counts):
     """An episode may enter a reward group only if no R0 reply was cut and no ledger verdict was lost."""
-    return counts.get("r0_len_truncated", 0) == 0 and counts.get("judge_empty", 0) == 0 \
-        and counts.get("judge_unparseable", 0) == 0
+    return counts.get("r0_len_truncated", 0) == 0 and counts.get("r0_empty", 0) == 0 \
+        and counts.get("judge_empty", 0) == 0 and counts.get("judge_unparseable", 0) == 0
 
 
 def prompt_tokens_from_error(msg):
@@ -161,8 +177,16 @@ def make_tracking_r0(R0Client):
             super().__init__(*a, **kw)
             self.gpt5 = bool(getattr(self, "gpt5_dialect", False))
             self.ctx = None if self.gpt5 else R0_CONTEXT
-            self.n_len_retries = self.n_len_truncated = self.n_ctx_fit = 0
+            self.n_len_retries = self.n_len_truncated = self.n_ctx_fit = self.n_empty_final = 0
             self._tlock = threading.Lock()
+
+        def reply(self, *a, **kw):
+            out = super().reply(*a, **kw)
+            if not (out or "").strip():            # still empty after the client's own budget ladder
+                with self._tlock:
+                    self.n_empty_final += 1
+                _ep_count("r0_empty")
+            return out
 
 
         def _post_fit(self, body):
@@ -671,6 +695,9 @@ class Task2Env:
                 led.judge(self_judge["helpful"], self_judge["dataset_quality"])
             if v3:
                 fields, diag, end_session = V3.read_plan_v3(raw, t, scenario, rng, led)
+            elif arm == "pend" and g["hit_max_new"]:
+                # a cut output is not a plan: it is not read at all (no stopping-ledger gain, no act-RNG draw)
+                fields, diag, end_session = None, {"cut_by_max_new": True}, False
             elif arm == "pend":
                 fields, diag, end_session = V3.read_plan_pend(raw, t, scenario, rng, led)
             elif arm == "e16":
@@ -720,14 +747,16 @@ class Task2Env:
             elif v3:
                 block = V3.speaker_block_v3(fields, gs)
             elif arm == "pend":
-                block = V3.speaker_block_pend(fields)
+                block = V3.speaker_block_pend(fields, last_line=False)
             else:
                 block = PP.render_block(fields, ag.render())
             # S["block"] is the Planner's own state for the next turn: never the Speaker-only additions
+            # (the last-message line, the notes, the examples)
             S["block"] = block
             if arm == "pend":
+                spk = block if unparsed else V3.speaker_block_pend(fields, last_line=True)
                 return self._pend_generate(base, block, fields, S, t, sid, sc_text, hist_u, hist_a,
-                                           conversation_id, scenario, unparsed)
+                                           conversation_id, scenario, unparsed, spk_block=spk)
             examples = []
             # ---- generation block: line for line the same as rollout_stop_sft.py / run_v2 ----
             ANTILEAK, NEARCOPY = run_v2.ANTILEAK, run_v2.NEARCOPY
@@ -799,7 +828,8 @@ class Task2Env:
                 "rid": rid, "scenario": scenario}
 
 
-    def _pend_generate(self, base, block, fields, S, t, sid, sc_text, hist_u, hist_a, cid, scenario, unparsed):
+    def _pend_generate(self, base, block, fields, S, t, sid, sc_text, hist_u, hist_a, cid, scenario, unparsed,
+                       spk_block=None):
         """pend generation stage. Same guards and schedule as the other arms (greedy + NSAMP samples at
         (0.7, 0.9); on turn 1 all sampled at the Ditto card, E1.6 Z1; up to REDRAW extra draws when every
         candidate fails), plus (user design, 2026-09-25):
@@ -823,6 +853,7 @@ class Task2Env:
         T_S, P_S = self.t1_sampling if z1 else (0.7, 0.9)
         notes = list(S["ip_notes"]) if self.ip else []
         persona = scenario.get("persona")
+        state_block, block = block, (spk_block if spk_block is not None else block)   # block = Speaker base
 
         def examples_for(variant):
             return self.fewshot.select(cid, persona, t, variant=variant) if self.fewshot else []
@@ -927,7 +958,8 @@ class Task2Env:
                 return -1
             return f.get("final_tokens") if f.get("compacted") else f.get("original_tokens", -1)
         worst = max(range(len(fits)), key=lambda i: fit_tokens(fits[i]))
-        return {**base, "user": cands[idx], "ended_speaker": bool(flags[idx]), "block": block, "t1_sampled": z1,
+        return {**base, "user": cands[idx], "ended_speaker": bool(flags[idx]), "block": state_block, "t1_sampled": z1,
+                "speaker_block_base": block if block != state_block else None,
                 "guard_reasons": reasons, "guard_extra": n_extra, "dup_redraws": dup_redraws,
                 "no_survivor": eligible is None, "no_survivor_fallback": fallback,
                 "emitted_capped": bool(hits[idx]), "selected_index": idx, "n_candidates": len(cands),
@@ -950,7 +982,8 @@ class Task2Env:
         finally:
             counts = episode_end()
         capped = sum(1 for s in ep["trace"] if s.get("emitted_capped"))
-        clean = episode_clean(counts) and capped == 0 and ep["emitted_user_turns"] > 0
+        compacted = sum(1 for s in ep["trace"] if step_compacted(s))
+        clean = episode_clean(counts) and capped == 0 and compacted == 0 and ep["emitted_user_turns"] > 0
         after, last = dict(S["cov"]), (0.0, False)
         for step in ep["trace"]:
             last = after.get(step["t"], last)
@@ -969,7 +1002,8 @@ class Task2Env:
                 "r0_len_retries_total": self.r0.n_len_retries, "r0_len_truncated_total": self.r0.n_len_truncated,
                 "r0_ctx_fit_total": self.r0.n_ctx_fit,
                 # this episode's own incidents; an unclean episode never enters a reward group
-                "episode_counters": counts, "emitted_capped_steps": capped, "clean": clean,
+                "episode_counters": counts, "emitted_capped_steps": capped, "compacted_steps": compacted,
+                "clean": clean,
                 "human_turns": self.human_turns(conversation_id)}
 
     def task1_generate(self, conversation_id, seed=0, keep_prompts=False):
@@ -1000,6 +1034,8 @@ class Task2Env:
             st = speak(t)
             if st.get("planner_stop"):
                 raise RuntimeError("silent Planner exit has no Task 1 utterance; use an emit-end arm")
+            if step_compacted(st):
+                raise RuntimeError("Task 1 %s turn %d: a prompt was compacted (history dropped)" % (conversation_id, t))
             cands, ends, idx = st["candidates"], st["candidates_ended"], st["selected_index"]
             samples = [c for i, c in enumerate(cands) if i != idx]
             s_blank = [bool(e) for i, e in enumerate(ends) if i != idx]
@@ -1049,6 +1085,8 @@ class Task2Env:
         st = speak(k + 1)
         if st.get("planner_stop"):
             raise RuntimeError("silent Planner exit has no Task 1 utterance; use an emit-end arm")
+        if step_compacted(st):
+            raise RuntimeError("Task 1 %s K+1: a prompt was compacted (history dropped)" % conversation_id)
         blank = bool(st["ended_speaker"])
         k1 = {"record_id": rec["record_id"], "conversation_id": conversation_id, "gold_k": k, "turn_index": k + 1,
               "intent_variant": rows[0]["intent_variant"] + "_k1" if rows else "k1",
@@ -1083,8 +1121,8 @@ class Task2Env:
             raise ValueError("task1_prompts is implemented for the pend arm")
         rows, _ = self.task1_generate(conversation_id, keep_prompts=True)
         n = len(rows)
-        return [{"t": r["turn_index"], "n_real": n, "real_final": r["turn_index"] == n, "user_prompt": r["planner_prompt"]}
-                for r in rows]
+        return [{"t": r["turn_index"], "n_real": n, "real_final": r["turn_index"] == n, "user_prompt": r["planner_prompt"],
+                 "planner_fit": r.get("planner_fit")} for r in rows]
 
     def task1_sample(self, conversation_id, t, user_prompt, real_final, G, temperature, top_p, seed):
         """G sampled Planner decisions at one real turn t >= 2 (turn 1 cannot end, so it teaches nothing about
@@ -1106,17 +1144,19 @@ class Task2Env:
                                  "top_p": top_p, "seed": sd} for sd in seeds])
         for g in range(G):
             pseed, gen = seeds[g], gens[g]
-            fields, diag, end = V3.read_plan_pend(gen["raw"], t, scenario, random.Random(pseed),
-                                                  stopping.StoppingLedger(scenario))
-            if gen["hit_max_new"] and fields is not None:
-                diag = dict(diag or {}, cut_by_max_new=True)
-                fields, end = None, False
+            if (gen.get("fit") or {}).get("compacted"):
+                raise RuntimeError("Task 1 group %s t%d: Planner prompt compacted (history dropped)" % (conversation_id, t))
+            if gen["hit_max_new"]:
+                fields, diag, end = None, {"cut_by_max_new": True}, False
+            else:
+                fields, diag, end = V3.read_plan_pend(gen["raw"], t, scenario, random.Random(pseed),
+                                                      stopping.StoppingLedger(scenario))
             unparsed = fields is None
             sm, nm = rl_masks(self.planner, gen, unparsed, diag, t)
             valid = sm is not None
             out.append({"t": t, "replicate": g, "real_final": bool(real_final), "ended_planner": bool(end),
                         "planner_unparsed": unparsed, "planner_hit_max_new": gen["hit_max_new"],
-                        "decision_valid": valid, "planner_diag": diag,
+                        "decision_valid": valid, "planner_diag": diag, "planner_fit": gen.get("fit"),
                         "reward": float(valid and bool(end) == bool(real_final)),
                         "planner_gen": {"prompt_ids": gen["prompt_ids"], "gen_ids": gen["gen_ids"], "stop_mask": sm,
                                         "note_mask": nm, "hit_max_new": gen["hit_max_new"],
@@ -1147,7 +1187,8 @@ class Task2Env:
                  "planner_unparsed": bool(r.get("planner_unparsed")),
                  "planner_hit_max_new": bool(r.get("planner_hit_max_new")),
                  "goal_met": r.get("goal_met"), "planner_diag": r.get("planner_diag"),
-                 "planner_fit": r.get("planner_fit")}
+                 "planner_fit": r.get("planner_fit"), "speaker_fits": r.get("speaker_fits"),
+                 "speaker_hit_max_new": r.get("speaker_hit_max_new"), "emitted_capped": r.get("emitted_capped")}
             if keep_prompts:
                 x["user_prompt"] = r["planner_prompt"]
             turns.append(x)

@@ -248,7 +248,8 @@ def reward_v4(episode, cfg, ctx):
     if not (0.0 <= cov <= 1.0):
         raise ValueError("coverage %r outside [0, 1]" % cov)
     counts = {
-        "unparsed": sum(bool(s.get("planner_unparsed")) for s in trace),
+        # a capped plan is also unparsed: it pays lambda_hit_max_new only, not both
+        "unparsed": sum(bool(s.get("planner_unparsed")) and not bool(s.get("planner_hit_max_new")) for s in trace),
         "hit_max_new": sum(bool(s.get("planner_hit_max_new")) for s in trace),
         "no_survivor": sum(bool(s.get("no_survivor")) for s in trace),
         "judge_unknown": 0,

@@ -60,6 +60,17 @@ def test_rollback_after_two_worse_decision_points():
     assert cfg["w_cov"] == 1.0 and c.n_rollbacks == 1 and c.pending is None
 
 
+def test_rollback_survives_a_change_in_between():
+    """Audit 2026-09-25: a change proposed at the first worse point must not reset the pending rollback."""
+    c = make(lambda req: reply({"factors": {"w_cov": 2.0}}))
+    c.propose(hist(5, shadow=[0.5] * 5))                        # change 1: w_cov 1 -> 2, baseline 0.5
+    c.transport = lambda req: reply({"factors": {"w_dist": 2.0}})
+    cfg = c.propose(hist(10, shadow=[0.5] * 5 + [0.3] * 5))     # worse once, and the LLM changes w_dist
+    assert cfg["w_dist"] == 2.0 and c.pending["bad"] == 1 and c.pending["prev_cfg"]["w_cov"] == 1.0
+    cfg = c.propose(hist(15, shadow=[0.5] * 5 + [0.3] * 10))    # worse twice -> back to before change 1
+    assert cfg["w_cov"] == 1.0 and cfg["w_dist"] == 1.0 and c.n_rollbacks == 1
+
+
 def test_rejects_validation_keys_and_state_roundtrip():
     c = make(lambda req: reply({"factors": {}}))
     bad = hist(5)

@@ -532,8 +532,9 @@ def check_pend(rows, rep, arm="pend"):
         rep.ok("pend.zero_turns", (r.get("emitted_user_turns") or 0) > 0, w, "episode with no emitted message")
         if "clean" in r or "episode_counters" in r:
             c = r.get("episode_counters") or {}
-            exp = (c.get("r0_len_truncated", 0) == 0 and c.get("judge_empty", 0) == 0 and c.get("judge_unparseable", 0) == 0
-                   and not r.get("emitted_capped_steps") and (r.get("emitted_user_turns") or 0) > 0)
+            exp = (c.get("r0_len_truncated", 0) == 0 and c.get("r0_empty", 0) == 0 and c.get("judge_empty", 0) == 0
+                   and c.get("judge_unparseable", 0) == 0 and not r.get("emitted_capped_steps")
+                   and not r.get("compacted_steps") and (r.get("emitted_user_turns") or 0) > 0)
             rep.ok("pend.clean_flag", r.get("clean") is exp, w, "clean %r but counters %r" % (r.get("clean"), c))
         else:
             rep.ok("pend.clean_flag", False, w, "episode has no clean flag / per-episode counters")
@@ -575,8 +576,9 @@ def check_pend(rows, rep, arm="pend"):
                 if IP.duplicate_of(c, cands[:i]):
                     rep.ok("pend.duplicates_flagged", bool(reasons[i]), w, "candidate %d duplicates an earlier one unflagged" % i)
                     n_dup_left += 1
-            rep.ok("pend.state_clean", not IP.leaks_scaffold(s.get("block") or ""), w,
-                   "Speaker-only lines (notes / examples) leaked into the Planner's state")
+            rep.ok("pend.state_clean", not IP.leaks_scaffold(s.get("block") or "")
+                   and "this is their last message" not in (s.get("block") or ""), w,
+                   "Speaker-only lines (notes / examples / last-message line) leaked into the Planner's state")
             elig = [i for i, x in enumerate(reasons) if not x]
             if elig:
                 rep.ok("pend.selected_eligible", s["selected_index"] in elig, w,
@@ -584,6 +586,10 @@ def check_pend(rows, rep, arm="pend"):
     name = "trunc.speaker_max_new"
     rep._c(name)
     (rep.warn if n_hit_any else rep.note)(name, "Speaker cap hits: %d of %d candidates, %d selected" % (n_hit_any, n_cand, n_hit_sel))
+    n_kept = sum(1 for r in rows for s in (r.get("trace") or []) if (s.get("planner_diag") or {}).get("complete_kept_no_alternative"))
+    name = "pend.complete_kept"
+    rep._c(name)
+    (rep.warn if n_kept else rep.note)(name, "Complete act kept while not ending (no alternative entry): %d" % n_kept)
     name = "pend.duplicates_left"
     rep._c(name)
     (rep.warn if n_dup_left else rep.note)(name, "duplicate candidates left after redraws: %d" % n_dup_left)
@@ -737,6 +743,14 @@ def verify(episodes, meta_path, splits_path, fold, split, arm=None, training=Fal
     if rl_dir:
         check_rl(rl_dir, rollouts, ckpt_pattern, rep)
         check_rl_selection(rl_dir, splits, fold, rep)
+        vp = os.path.join(rl_dir, "validation.jsonl")
+        if os.path.exists(vp):
+            # the episodes that drive best.json get the same structure / truncation / pend checks
+            vrows = load_jsonl(vp, rep)
+            if vrows:
+                check_structure(vrows, arm, rep)
+                check_truncation(vrows, arm, meta, sb, judge_budget, max_new_warn, rep)
+                {"a2": check_a2, "pend": check_pend, "a0": check_a0}[check_family(arm)](vrows, rep, arm)
     return rep
 
 

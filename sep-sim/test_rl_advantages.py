@@ -32,6 +32,24 @@ def test_group_advantages():
         raise AssertionError
 
 
+def test_split_advantages_keep_weights():
+    """Stop credit: the two parts sum to the plain GRPO advantage, and scaling the length weight changes them
+    (the audit found per-part normalisation made w_dist inert)."""
+    cov = [0.2, 0.5, 0.9, 0.4]
+    dist = [-1.0, 0.3, -0.2, 0.8]
+    outs = []
+    for w in (0.1, 1.0, 5.0):
+        R = [c + w * d for c, d in zip(cov, dist)]
+        S = [w * d for d in dist]
+        a_seq, a_stop = RA.split_group_advantages(R, S)
+        plain = RA.group_advantages(R)
+        assert all(abs(x + y - z) < 1e-9 for x, y, z in zip(a_seq, a_stop, plain))
+        outs.append(a_stop)
+    assert outs[0] != outs[1] != outs[2]
+    assert abs(outs[2][0]) > abs(outs[0][0])          # a larger w_dist puts more of the advantage on the stop tokens
+    assert RA.split_group_advantages([1.0, 1.0], [0.0, 0.5]) == (None, None)
+
+
 def test_rloo_ppo_normalize():
     a = RA.rloo_advantages([1.0, 2.0, 6.0])
     assert [round(x, 12) for x in a] == [1.0 - 4.0, 2.0 - 3.5, 6.0 - 1.5]
@@ -101,7 +119,7 @@ def make_splits(d):
 def args(splits, out, *extra, controller="dual", updates=5):
     return ["--dry-run", "--fold", "0", "--splits", splits, "--out", out, "--updates", str(updates),
             "--G", "4", "--scenarios-per-update", "3", "--val-every", "2", "--val-seeds", "0", "1",
-            "--controller", controller] + list(extra)
+            "--controller", controller] + (["--ablation", "test-" + controller] if controller != "llm" else []) + list(extra)
 
 
 def strip(rows):

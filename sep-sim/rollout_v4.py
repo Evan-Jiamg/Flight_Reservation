@@ -50,6 +50,22 @@ def check_manifest(path, fold, split_fold, what):
     return {"manifest": path, "sha256": sha_file(path), "n_train_scenarios": len(train)}
 
 
+def check_rl_settings(adapter, settings):
+    """An RL adapter is evaluated only under the settings it was trained with, and only when no init adapter
+    was merged into its base (this CLI loads the LoRA on the plain base)."""
+    for d in (adapter, os.path.dirname(os.path.abspath(adapter.rstrip("/\\")))):
+        p = os.path.join(d, "rl_manifest.json")
+        if os.path.exists(p):
+            m = json.load(open(p, encoding="utf-8"))
+            if m.get("init_adapter"):
+                raise SystemExit("adapter was trained on top of init adapter %s: evaluating it on the plain base is wrong" % m["init_adapter"])
+            diff = {k: (m.get(k), v) for k, v in settings.items() if k in m and m.get(k) != v}
+            if diff:
+                raise SystemExit("adapter trained with other settings than this evaluation: %r" % diff)
+            return m
+    return None
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--arm", choices=("a0", "a2", "e16", "final", "pend"), required=True)
@@ -120,6 +136,8 @@ def main():
         if found is None:
             raise SystemExit("LEAK GATE: planner adapter has no manifest; cannot verify its training data")
         gate["planner_adapter"] = found
+        check_rl_settings(args.planner_adapter, {"arm": args.arm, "implicit_profile": args.implicit_profile,
+                                                 "fewshot": args.fewshot, "selector": args.selector})
     print("leak gate OK", json.dumps(gate), flush=True)
 
     from task2_env import Task2Env, PlannerLM, setup_environment, make_fewshot_pool

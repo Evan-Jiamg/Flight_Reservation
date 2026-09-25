@@ -83,6 +83,24 @@ def group_advantages(rewards, eps=1e-6, min_std=1e-8):
     return [(r - m) / (s + eps) for r in rewards]
 
 
+def split_group_advantages(rewards, stop_parts, eps=1e-6, min_std=1e-8):
+    """GRPO with stop credit, normalised ONCE: A_i = (R_i - mean R) / std(R) is split into the part
+    caused by the length term S (-> end_session tokens) and the rest (-> every token):
+        A_stop_i = (S_i - mean S) / std(R),   A_seq_i = ((R_i - S_i) - mean(R - S)) / std(R),
+    so A_stop + A_seq = the plain GRPO advantage and the reward weights keep their effect.
+    -> (A_seq, A_stop) or (None, None) when the group has (near) zero spread."""
+    if len(rewards) != len(stop_parts):
+        raise ValueError("rewards / stop parts length mismatch")
+    if len(rewards) < 2:
+        raise ValueError("a GRPO group needs at least 2 episodes")
+    s = pstd(rewards)
+    if s <= min_std:
+        return None, None
+    rest = [r - q for r, q in zip(rewards, stop_parts)]
+    ms, mr = mean(stop_parts), mean(rest)
+    return [(x - mr) / (s + eps) for x in rest], [(x - ms) / (s + eps) for x in stop_parts]
+
+
 def rloo_advantages(rewards):
     """Leave-one-out baseline: A_i = R_i - mean of the other G-1 rewards."""
     g = len(rewards)
