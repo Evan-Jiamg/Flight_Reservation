@@ -7,7 +7,8 @@ class FakeTok:
     def apply_chat_template(self, msgs, tokenize=False, add_generation_prompt=True):
         return "".join("<%s>%s" % (m["role"], m["content"]) for m in msgs) + "<assistant>"
 
-    def __call__(self, text):
+    def __call__(self, text, add_special_tokens=True):
+        assert add_special_tokens is False, "judge code must not add a second BOS"
         return {"input_ids": list(range(len(text) // 4))}
 
 

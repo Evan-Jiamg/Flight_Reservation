@@ -88,6 +88,9 @@ def main():
     model = get_peft_model(model, LoraConfig(r=16, lora_alpha=32, lora_dropout=0.05, bias="none",
                                              task_type="CAUSAL_LM",
                                              target_modules=["q_proj", "k_proj", "v_proj", "o_proj"]))
+    for p in model.parameters():          # LoRA weights and Adam states in fp32 (base stays bf16)
+        if p.requires_grad:
+            p.data = p.data.float()
 
     def encode(s):
         msgs, _ = GJ.fit_messages(tok, s["scenario_text"], s["hist_u"], s["hist_a"])
@@ -96,8 +99,8 @@ def main():
                                        tokenize=False, add_generation_prompt=False)
         if not full.startswith(prompt):
             raise ValueError("chat template does not extend the generation prompt")
-        p_ids = tok(prompt)["input_ids"]
-        ids = tok(full)["input_ids"]
+        p_ids = tok(prompt, add_special_tokens=False)["input_ids"]     # template carries any BOS
+        ids = tok(full, add_special_tokens=False)["input_ids"]
         assert ids[:len(p_ids)] == p_ids
         return ids, len(p_ids)
 
@@ -140,7 +143,7 @@ def main():
         for s in heldout:
             msgs, _ = GJ.fit_messages(tok, s["scenario_text"], s["hist_u"], s["hist_a"])
             enc = tok(tok.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True),
-                      return_tensors="pt").to(dev)
+                      return_tensors="pt", add_special_tokens=False).to(dev)
             out = model.generate(**enc, max_new_tokens=GJ.MAX_NEW, do_sample=False,
                                  pad_token_id=tok.pad_token_id or tok.eos_token_id)
             raw = tok.decode(out[0][enc["input_ids"].shape[1]:], skip_special_tokens=True)

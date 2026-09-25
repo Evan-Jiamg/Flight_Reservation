@@ -7,7 +7,7 @@ import sys
 S = sys.argv[1] if len(sys.argv) > 1 else "/tmp2/mzjiang_usersim/grpo_planner/dev_v3/smoke"
 REMOVED = ("- useful replies", "- best offered so far", "- last reply repeated the previous offer",
            "stopping condition", "WHAT THEY STILL WANT", "unhelpful replies before frustration governs",
-           "- condition met first")
+           "- condition met first", "HOW LONG THEY WRITE", "- band:")
 
 
 def static(p):
@@ -17,7 +17,8 @@ def static(p):
 def check_a0(ep):
     for s in ep["trace"]:
         p = static(s["planner_prompt"])
-        assert "- useful replies" in p and "WHAT THEY STILL WANT" in p, "a0 must keep the original prompt"
+        assert "- useful replies" in p and "WHAT THEY STILL WANT" in p and "HOW LONG THEY WRITE" in p, \
+            "a0 must keep the original prompt"
         assert "GOAL STATUS" not in p and s.get("goal_status") is None
         assert s["planner_fit"]["compacted"] is False
         if s["decision"] == "continue":
@@ -38,6 +39,12 @@ def check_a2(ep):
         assert "- status: %s" % s["goal_status"]["status"] in p
         if s["t"] > 1:
             assert "raw" in s["goal_status"] and s["goal_status"]["status"] in ("SATISFIED", "PARTIAL", "NOT", "UNKNOWN")
+        d = s.get("planner_diag") or {}
+        if not s.get("planner_unparsed"):
+            # stop decision = the Planner's end_session; no override, no length clamp
+            assert s["ended_planner"] == (d.get("end_session_raw") is True or
+                                          str(d.get("end_session_raw")).strip().lower() == "true")
+            assert d.get("stop_override") in (None, False) and d.get("length_clamped") is False
         if s["decision"] == "continue":
             unmet = s["goal_status"].get("unmet") or []
             exp = ("the whole request (nothing has been answered yet)" if s["t"] == 1 else

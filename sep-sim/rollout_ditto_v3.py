@@ -134,6 +134,8 @@ def main():
         raise SystemExit("a0 needs --scenarios")
     scen, gate_info = leak_gate(args)
     log("leak gate OK", json.dumps(gate_info))
+    # a0 keeps the original Planner (stop override ON); a2 turns it OFF and decides by end_session
+    os.environ["SEPSIM_ACT_PRIOR"] = "nostopclobber" if args.arm == "a2" else "off"
 
     from sepsim import (agenda as AG, models, persona as P, pipeline,  # noqa: E402
                         planner_prompt as PP, state, stopping)
@@ -146,7 +148,10 @@ def main():
             run_v2.SELECTOR, run_v2.LENGTH_SELECT, run_v2.POSITION, run_v2.GUARDRAILS, run_v2.END_PROBE) == \
            (True, True, "both", 4, 3, "length", True, "system", False, False), "v2fix did not bind"
     from sepsim import acts
-    assert "nostopclobber" not in acts.prior_mode(), "stop override must be ON (D1)"
+    if args.arm == "a0":
+        assert acts.prior_mode() == frozenset(), "a0 must run the original Planner (override ON)"
+    else:
+        assert acts.prior_mode() == frozenset({"nostopclobber"}), "a2 must run with the override OFF"
 
     recs = {}
     for l in open(CORPUS, encoding="utf-8"):
@@ -194,17 +199,20 @@ def main():
             "judge_adapter_sha256": sha_file(os.path.join(args.judge_adapter, "adapter_model.safetensors"))
             if judge else None,
             "r0_model": r0.model, "r0_effort": r0.reasoning_effort, "r0_cache": "off",
-            "ledger_judge_model": ledger_judge.model, "v2fix": V2FIX, "act_prior": "off (stop override on)",
+            "ledger_judge_model": ledger_judge.model, "v2fix": V2FIX,
+            "act_prior": ("nostopclobber: override off; stop = Planner end_session; length unclamped"
+                          if args.arm == "a2" else "off: original read_plan (override on, length clamp)"),
             "planner_exit": "silent" if args.arm == "a2" else "not executed (logged only)",
             "planner_budget": F.PLANNER_BUDGET, "speaker_budget": F.SPEAKER_BUDGET,
             "versions": {"torch": torch.__version__, "transformers": transformers.__version__,
                          "peft": peft.__version__},
             "started": time.strftime("%Y-%m-%d %H:%M:%S")}
+    SYS = V3.system_prompt_v3() if args.arm == "a2" else PP.system_prompt()
+    meta["system_prompt_sha256"] = hashlib.sha256(SYS.encode()).hexdigest()
+    meta["goal_judge_system_sha256"] = hashlib.sha256(GJ.SYSTEM.encode()).hexdigest() if judge else None
     with open(os.path.join(args.out_dir, "run_meta_%s_rep%d.json" % (args.arm, args.replicate)), "w") as f:
         json.dump(meta, f, indent=1)
     log("META", json.dumps(meta))
-
-    SYS = PP.system_prompt()
     t0, n_done = time.time(), 0
 
     def one_episode(sc, seed):
@@ -233,11 +241,16 @@ def main():
                                     prev_ann={}, agenda_view=ag.render(), p_end=None)
             up_fit, pfit = F.fit_planner_user(planner_raw_tok, SYS, up)
             raw = planner.raw_with(SYS, up_fit)
-            fields, diag = PP.read_plan(raw, t, scenario, rng, led)
+            if args.arm == "a2":
+                fields, diag, end_session = V3.read_plan_v3(raw, t, scenario, rng, led)
+            else:
+                fields, diag = PP.read_plan(raw, t, scenario, rng, led)
+                end_session = None
             unparsed = fields is None
             if unparsed:
                 fields = {"move": "Other", "act": "other"}
-            ended = bool(state.ends_session(fields))
+            # a2: the Planner's own end_session decision; a0: the original act-based signal (logged only)
+            ended = bool(end_session) if args.arm == "a2" else bool(state.ends_session(fields))
             base = {"planner_prompt": up_fit, "planner_fit": pfit, "planner_raw": raw,
                     "planner_diag": diag, "planner_unparsed": unparsed, "ended_planner": ended,
                     "move": fields.get("move", ""), "act": fields.get("act", ""),

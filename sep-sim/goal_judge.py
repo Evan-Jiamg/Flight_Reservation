@@ -63,7 +63,7 @@ def fit_messages(tok, scenario_text, hist_u, hist_a, budget=JUDGE_BUDGET):
     """Return (messages, info) within budget, dropping oldest exchanges if needed."""
     def n_tokens(msgs):
         text = tok.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
-        return len(tok(text)["input_ids"])
+        return len(tok(text, add_special_tokens=False)["input_ids"])
     msgs = messages(scenario_text, hist_u, hist_a)
     n = n_tokens(msgs)
     if n <= budget:
@@ -143,7 +143,8 @@ class GoalJudge:
             self.load()
         msgs, info = fit_messages(self.tok, scenario_text, hist_u, hist_a)
         text = self.tok.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
-        enc = self.tok(text, return_tensors="pt")
+        # the chat template already carries any BOS (Llama-3.1 does); never add a second one
+        enc = self.tok(text, return_tensors="pt", add_special_tokens=False)
         enc.pop("token_type_ids", None)
         dev = next(self.model.parameters()).device
         enc = enc.to(dev)
