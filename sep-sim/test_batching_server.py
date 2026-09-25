@@ -45,7 +45,22 @@ def main():
     log("1 planner greedy identical %d/%d (first divergence %s); prompt ids identical %s; single %.1fs batch %.1fs" % (
         same, len(ups), same_prefix, all(a["prompt_ids"] == b["prompt_ids"] for a, b in zip(single, batch)), t_single, t_batch))
     assert all(a["prompt_ids"] == b["prompt_ids"] for a, b in zip(single, batch))
-    assert same >= len(ups) - 1, "batched greedy Planner diverges from single on more than one prompt"
+    # a divergence must be a numerical near-tie, not a batching bug: at the first differing position, the
+    # UNPADDED single-sequence model must give both tokens (single's and batch's) almost the same log-prob
+    import torch
+    import rl_algos as RA
+    for a, b, j in zip(single, batch, same_prefix):
+        if j is None:
+            continue
+        ids = torch.tensor([a["prompt_ids"] + a["gen_ids"][:j]], device=next(planner.model.parameters()).device)
+        with torch.no_grad():
+            lp = torch.log_softmax(planner.model(input_ids=ids).logits[0, -1].float(), -1)
+        ta, tb = a["gen_ids"][j], b["gen_ids"][j]
+        gap = abs(float(lp[ta] - lp[tb]))
+        log("   divergence at %d: logp single-token %.3f batch-token %.3f gap %.3f" % (j, float(lp[ta]), float(lp[tb]), gap))
+        assert j >= 8, "divergence in the first tokens: position/padding bug"
+        assert gap < 0.5, "batched greedy picked a clearly worse token (gap %.3f): not a numerical tie" % gap
+    _ = RA
     eos = planner.eos_ids()
     for b in batch:
         assert b["hit_max_new"] or b["gen_ids"][-1] in eos, "batched output not cut at the end token"
