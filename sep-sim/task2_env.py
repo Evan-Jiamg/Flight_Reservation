@@ -180,6 +180,61 @@ class PlannerLM:
             mask[k] = 1
         return mask
 
+    def eos_ids(self):
+        gc = getattr(self.model, "generation_config", None)
+        e = getattr(gc, "eos_token_id", None) if gc is not None else None
+        if e is None:
+            e = self.tok.eos_token_id
+        return set(e if isinstance(e, (list, tuple)) else [e])
+
+    def generate_batch(self, items):
+        """Batched generate: items share temperature/top_p (the Batcher groups them). Per item the result
+        has the same fields as generate(); prompt_ids are the item's own unpadded ids, gen_ids run up to
+        and including the first end token (as a single generate stops there)."""
+        import torch
+        import fit_prompts as F
+        if not items:
+            return []
+        t0, p0 = items[0]["temperature"], items[0]["top_p"]
+        assert all(it["temperature"] == t0 and it["top_p"] == p0 for it in items), "mixed sampling settings in a batch"
+        prompts = []
+        for it in items:
+            user_fit, fit = F.fit_planner_user(self.tok, it["system"], it["user"], budget=self.budget)
+            text = self.tok.apply_chat_template([{"role": "system", "content": it["system"]},
+                                                 {"role": "user", "content": user_fit}],
+                                                tokenize=False, add_generation_prompt=True)
+            ids = self.tok(text, add_special_tokens=False)["input_ids"]
+            if len(ids) > self.budget:
+                raise AssertionError("Planner prompt %d > budget %d after fitting" % (len(ids), self.budget))
+            prompts.append((user_fit, fit, ids))
+        L = max(len(p[2]) for p in prompts)
+        pad = self.tok.pad_token_id
+        dev = next(self.model.parameters()).device
+        input_ids = torch.tensor([[pad] * (L - len(p[2])) + p[2] for p in prompts], dtype=torch.long, device=dev)
+        attn = torch.tensor([[0] * (L - len(p[2])) + [1] * len(p[2]) for p in prompts], dtype=torch.long, device=dev)
+        kw = dict(max_new_tokens=self.max_new, pad_token_id=pad)
+        if t0 and t0 > 0:
+            torch.manual_seed(int(items[0]["seed"]))
+            kw.update(do_sample=True, temperature=t0, top_p=p0)
+        else:
+            kw.update(do_sample=False)
+        with torch.no_grad():
+            out = self.model.generate(input_ids=input_ids, attention_mask=attn, **kw)
+        eos = self.eos_ids()
+        res = []
+        for i, (user_fit, fit, ids) in enumerate(prompts):
+            row = out[i][L:].tolist()
+            cut = next((j for j, x in enumerate(row) if x in eos), None)
+            gen = row[: cut + 1] if cut is not None else row
+            while gen and cut is None and gen[-1] == pad and pad not in eos:
+                gen.pop()
+            self.n_calls += 1
+            res.append({"raw": self.tok.decode(gen, skip_special_tokens=True), "prompt_text": user_fit,
+                        "prompt_ids": list(ids), "gen_ids": gen,
+                        "fit": {**fit, "prompt_tokens": len(ids), "budget": self.budget, "batched": len(items)},
+                        "hit_max_new": cut is None and len(gen) >= self.max_new})
+        return res
+
     def stop_target(self, gen_ids, mask, want_end):
         """Supervision target for the end_session value: the policy's own prefix up to the value, and the
         value tokens re-encoded with the human's decision (true at the real last message, else false)."""
@@ -224,7 +279,8 @@ class PlannerLM:
 
 
 class Task2Env:
-    def __init__(self, arm, gpu, planner, judge=None, ditto_path=DITTO, corpus="/home/mzjiang/v5-latency/data.jsonl"):
+    def __init__(self, arm, gpu, planner, judge=None, ditto_path=DITTO, corpus="/home/mzjiang/v5-latency/data.jsonl",
+                 batch=False, max_batch=8):
         if arm not in ARM_ENV:
             raise ValueError(arm)
         if arm in V3_ARMS and judge is None:
@@ -287,6 +343,44 @@ class Task2Env:
         self.speaker = FitDitto(path=ditto_path, gpu=gpu, position=run_v2.POSITION).load()
         # E1.6 Z1 (T1_SAMPLE): turn 1 is sampled at the speaker checkpoint's own card values
         self.t1_sampling = self.speaker.card_sampling() if self.e16 else None
+        # cross-episode dynamic batching (threads submit, one GPU call per batch); off = one by one
+        self.planner_batcher = self.speaker_batcher = None
+        if batch:
+            import batching
+            if not hasattr(self.speaker, "say_batch"):
+                raise RuntimeError("batching needs the E1.6 Ditto speaker (say_batch)")
+            self.planner_batcher = batching.Batcher(planner.generate_batch, self.gpu_lock,
+                                                    key=lambda it: (it["temperature"], it["top_p"]),
+                                                    max_batch=max_batch, name="planner-batcher")
+            self.speaker_batcher = batching.Batcher(self.speaker.say_batch, self.gpu_lock,
+                                                    max_batch=2 * max_batch, name="speaker-batcher")
+
+    def _plan(self, system, user, temperature, top_p, seed):
+        if self.planner_batcher is not None:
+            return self.planner_batcher({"system": system, "user": user, "temperature": temperature,
+                                         "top_p": top_p, "seed": seed})
+        with self.gpu_lock:
+            return self.planner.generate(system, user, temperature, top_p, seed)
+
+    def _plan_many(self, items):
+        if self.planner_batcher is not None:
+            return self.planner_batcher.map(items)
+        return [self._plan(it["system"], it["user"], it["temperature"], it["top_p"], it["seed"]) for it in items]
+
+    def _say_many(self, reqs):
+        """-> [(text, ended, fit)] in request order."""
+        if self.speaker_batcher is not None:
+            return self.speaker_batcher.map(reqs)
+        out = []
+        for r in reqs:
+            with self.gpu_lock:
+                txt, e = self.speaker.say(r["scenario_text"], r["block"], r["hist_u"], r["hist_a"], r["turn"],
+                                          seed=r["seed"], temperature=r["temperature"], top_p=r["top_p"],
+                                          avoid=r["avoid"], reject_template=r["reject_template"],
+                                          reject_reuse=r["reject_reuse"])
+                fit = self.speaker.last_fit
+            out.append((txt, e, fit))
+        return out
 
     def describe(self):
         import fit_prompts as F
@@ -303,7 +397,9 @@ class Task2Env:
                 "judge_reasoning_effort": self.judge_effort if self.ledger_judge.gpt5 else "server default (not sent)",
                 "ledger_judge_min_tokens": self.ledger_judge.floor, "ledger_judge_empty": self.ledger_judge.n_empty,
                 "act_prior": os.environ["SEPSIM_ACT_PRIOR"], "v2fix": V2FIX, "t_max": T_MAX,
-                "tree": tree_of(self.arm), "arm_env": ARM_ENV[self.arm], "t1_sampling": self.t1_sampling}
+                "tree": tree_of(self.arm), "arm_env": ARM_ENV[self.arm], "t1_sampling": self.t1_sampling,
+                "batching": None if self.planner_batcher is None else {
+                    "planner": self.planner_batcher.max_batch, "speaker": self.speaker_batcher.max_batch}}
 
     def _session(self, conversation_id, seed, replicate=0, planner_temperature=0.0, planner_top_p=1.0,
                  record_generation=False, with_ledger=True):
@@ -346,8 +442,7 @@ class Task2Env:
                 up = PP.user_prompt(scenario, S["prev_block"], hist_u, hist_a, t, ledger=led,
                                     prev_ann={}, agenda_view=ag.render(), p_end=None)
             pseed = int(hashlib.sha256(("%s|%d|%d|%d" % (sid, t, replicate, 7)).encode()).hexdigest()[:8], 16)
-            with self.gpu_lock:
-                g = planner.generate(self.system, up, planner_temperature, planner_top_p, pseed)
+            g = self._plan(self.system, up, planner_temperature, planner_top_p, pseed)
             raw = g["raw"]
             self_judge = None
             if arm == "e16" and t >= 2:
@@ -405,28 +500,20 @@ class Task2Env:
             z1 = self.e16 and t == 1
             T_G, P_G = self.t1_sampling if z1 else (0.0, 1.0)
             T_S, P_S = self.t1_sampling if z1 else (0.7, 0.9)
-            with self.gpu_lock:
-                greedy, ge = speaker.say(sc_text, block, hist_u, hist_a, t, seed=pipeline.seed_for(sid, t),
-                                         temperature=T_G, top_p=P_G, avoid=avoid, reject_template=ANTILEAK,
-                                         reject_reuse=NEARCOPY)
-                fit0 = speaker.last_fit
-            cands, flags = [greedy], [ge]
-            for k in range(run_v2.NSAMP):
-                with self.gpu_lock:
-                    s_, e_ = speaker.say(sc_text, block, hist_u, hist_a, t, seed=pipeline.seed_for(sid, t, k + 1),
-                                         temperature=T_S, top_p=P_S, avoid=avoid, reject_template=ANTILEAK,
-                                         reject_reuse=NEARCOPY)
-                cands.append(s_)
-                flags.append(e_)
+            def req(seed, temp, top_p):
+                return {"scenario_text": sc_text, "block": block, "hist_u": list(hist_u), "hist_a": list(hist_a),
+                        "turn": t, "seed": seed, "temperature": temp, "top_p": top_p, "avoid": avoid,
+                        "reject_template": ANTILEAK, "reject_reuse": NEARCOPY}
+            first = self._say_many([req(pipeline.seed_for(sid, t), T_G, P_G)] +
+                                   [req(pipeline.seed_for(sid, t, k + 1), T_S, P_S) for k in range(run_v2.NSAMP)])
+            fit0 = first[0][2]
+            cands, flags = [x[0] for x in first], [x[1] for x in first]
             reasons, n_extra, eligible = None, 0, None
             if run_v2.GUARDS_ON:
                 reasons = [run_v2.guard_reason(c, prior) for c in cands]
                 while all(reasons) and n_extra < run_v2.REDRAW:
                     k = run_v2.NSAMP + n_extra
-                    with self.gpu_lock:
-                        sx, ex = speaker.say(sc_text, block, hist_u, hist_a, t, seed=pipeline.seed_for(sid, t, k + 1),
-                                             temperature=T_S, top_p=P_S, avoid=avoid, reject_template=ANTILEAK,
-                                             reject_reuse=NEARCOPY)
+                    sx, ex, _ = self._say_many([req(pipeline.seed_for(sid, t, k + 1), T_S, P_S)])[0]
                     cands.append(sx)
                     flags.append(ex)
                     reasons.append(run_v2.guard_reason(sx, prior))
@@ -567,10 +654,12 @@ class Task2Env:
         import planner_prompt_v3 as V3
         scenario = self.recs[conversation_id]["scenario"]
         out = []
+        seeds = [int(hashlib.sha256(("t1s|%s|%d|%d|%d" % (conversation_id, t, g, seed)).encode()).hexdigest()[:8], 16)
+                 for g in range(G)]
+        gens = self._plan_many([{"system": self.system, "user": user_prompt, "temperature": temperature,
+                                 "top_p": top_p, "seed": sd} for sd in seeds])
         for g in range(G):
-            pseed = int(hashlib.sha256(("t1s|%s|%d|%d|%d" % (conversation_id, t, g, seed)).encode()).hexdigest()[:8], 16)
-            with self.gpu_lock:
-                gen = self.planner.generate(self.system, user_prompt, temperature, top_p, pseed)
+            pseed, gen = seeds[g], gens[g]
             fields, diag, end = V3.read_plan_pend(gen["raw"], t, scenario, random.Random(pseed),
                                                   stopping.StoppingLedger(scenario))
             out.append({"t": t, "replicate": g, "real_final": bool(real_final), "ended_planner": bool(end),
@@ -615,8 +704,7 @@ class Task2Env:
             hist_a = [a["text"] for a in agents[: t - 1]]
             up = V3.user_prompt_pend(scenario, prev_block, hist_u, hist_a, t, led, prev_ann={})
             pseed = int(hashlib.sha256(("t1|%s|%d|%d" % (rid, t, seed)).encode()).hexdigest()[:8], 16)
-            with self.gpu_lock:
-                g = self.planner.generate(self.system, up, 0.0, 1.0, pseed)
+            g = self._plan(self.system, up, 0.0, 1.0, pseed)
             fields, diag, end = V3.read_plan_pend(g["raw"], t, scenario, rng, led)
             unparsed = fields is None
             block = prev_block if unparsed else V3.speaker_block_pend(fields)

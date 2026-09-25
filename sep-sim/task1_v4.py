@@ -40,6 +40,8 @@ def main(argv=None):
     ap.add_argument("--planner-adapter", default="")
     ap.add_argument("--gpu", type=int, default=1)
     ap.add_argument("--workers", type=int, default=4)
+    ap.add_argument("--batch", type=int, choices=(0, 1), default=1)
+    ap.add_argument("--max-batch", type=int, default=8)
     ap.add_argument("--out", required=True, help="generations .jsonl")
     ap.add_argument("--final", action="store_true")
     ap.add_argument("--limit", type=int, default=0)
@@ -50,7 +52,7 @@ def main(argv=None):
     setup_environment("pend")
     from sepsim import pipeline
     planner = PlannerLM(a.planner_path, a.gpu, adapter=a.planner_adapter or None)
-    env = Task2Env("pend", a.gpu, planner, judge=None)
+    env = Task2Env("pend", a.gpu, planner, judge=None, batch=bool(a.batch), max_batch=a.max_batch)
     finished = [cid for cid, r in env.recs.items()
                 if any(m.get("is_final") is True for m in r.get("chat_messages", []))]
     if a.sessions == "all":
