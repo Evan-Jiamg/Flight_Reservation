@@ -32,6 +32,13 @@ LEGACY_CAPS = (7000, 8000, 12000)
 SPEAKER_OMISSION_NOTE = "\n\n[Earlier turns of this conversation are omitted; the most recent ones follow.]"
 
 
+def dtype_kwarg(value):
+    """from_pretrained's dtype argument: `dtype` from transformers 4.56, `torch_dtype` before."""
+    import transformers
+    major, minor = (int(x) for x in transformers.__version__.split(".")[:2])
+    return {"dtype": value} if (major, minor) >= (4, 56) else {"torch_dtype": value}
+
+
 class TokProxy:
     """Tokenizer wrapper that disables the legacy right-side truncation caps."""
 

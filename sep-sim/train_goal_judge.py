@@ -81,7 +81,8 @@ def main():
     torch.manual_seed(args.seed)
     tok = AutoTokenizer.from_pretrained(args.base)
     dev = "cuda:%d" % args.gpu
-    model = AutoModelForCausalLM.from_pretrained(args.base, dtype=getattr(torch, args.dtype),
+    from fit_prompts import dtype_kwarg
+    model = AutoModelForCausalLM.from_pretrained(args.base, **dtype_kwarg(getattr(torch, args.dtype)),
                                                  device_map={"": args.gpu}, low_cpu_mem_usage=True)
     model.gradient_checkpointing_enable()
     model.enable_input_require_grads()

@@ -119,9 +119,9 @@ class GoalJudge:
     def load(self):
         import torch
         from transformers import AutoModelForCausalLM, AutoTokenizer
+        from fit_prompts import dtype_kwarg
         dt = getattr(torch, self.dtype)
-        kw = {"dtype": dt, "low_cpu_mem_usage": True,
-              "device_map": self.device_map or {"": self.gpu}}
+        kw = {"low_cpu_mem_usage": True, "device_map": self.device_map or {"": self.gpu}, **dtype_kwarg(dt)}
         if self.load_4bit:
             from transformers import BitsAndBytesConfig
             kw["quantization_config"] = BitsAndBytesConfig(
