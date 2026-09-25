@@ -349,7 +349,7 @@ def check_structure(rows, arm, rep):
                 if "block" in s:
                     rep.ok("e16.t1_sample", s.get("t1_sampled") == (s.get("t") == 1), "%s t%s" % (where, s.get("t")),
                            "t1_sampled %r on t%s" % (s.get("t1_sampled"), s.get("t")))
-                if arm == "final":
+                if arm in ("final", "pend"):
                     rep.ok("final.no_self_judge", s.get("self_judge") is None, "%s t%s" % (where, s.get("t")),
                            "SELF_JUDGE fed the ledger in final")
                 elif s.get("t", 0) >= 2 and not s.get("planner_unparsed"):

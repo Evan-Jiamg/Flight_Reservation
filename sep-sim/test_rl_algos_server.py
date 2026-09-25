@@ -178,7 +178,10 @@ def main():
 
     # ---- 10 stop credit: sequence advantage 0, stop advantage +1 on ONE token -> that token's log-prob rises
     s0 = dict(fresh(samples)[0])
-    k = min(2, len(s0["gen_ids"]) - 1)
+    # the most uncertain generated token: a near-certain JSON token (logp ~ 0) carries no gradient
+    lp0 = logps(model, [s0])[0]
+    k = int(lp0.argmin())
+    assert float(lp0[k]) < -0.05, "no uncertain token in the sample (min logp %.3g)" % float(lp0[k])
     s0.update(adv=0.0, adv_stop=1.0, stop_mask=[1 if i == k else 0 for i in range(len(s0["gen_ids"]))])
     before = logps(model, [s0])[0]
     lr10 = RA.TorchLearner(model, "grpo", {"minibatches": 1, "epochs": 1}, lr=1e-4, seed=0)
@@ -192,7 +195,7 @@ def main():
         raise SystemExit("a stop_mask of the wrong length was accepted")
     except AssertionError:
         pass
-    log("10 ok: stop-credit token log-prob +%.3g; wrong-length mask refused" % dk)
+    log("10 ok: stop-credit token (t=%d, logp %.3g) log-prob +%.3g; wrong-length mask refused" % (k, float(before[k]), dk))
 
     # ---- 9 PPO smoke (optional algorithm)
     ppo = RA.TorchLearner(model, "ppo", {}, lr=1e-5, seed=0)
