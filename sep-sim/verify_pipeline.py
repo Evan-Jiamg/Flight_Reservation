@@ -224,7 +224,7 @@ def load_meta(path, rep):
     return meta
 
 
-def recompute_system_sha(arm, sepsim_path=None):
+def recompute_system_sha(arm, sepsim_path=None, implicit_profile=False):
     """sha256 of the system prompt the arm must use, computed in a clean subprocess (the env var
     SEPSIM_ACT_PRIOR has to be set before sepsim is imported). None when sepsim is not importable."""
     import task2_env as T2   # constants only; no torch at import
@@ -238,7 +238,8 @@ def recompute_system_sha(arm, sepsim_path=None):
         return None
     code = ("import hashlib,sys; sys.path[:0]=[%r,%r]\n" % (os.path.abspath(root), HERE) +
             ("import planner_prompt_v3 as V; s=V.system_prompt_v3()\n" if arm in V3_ARMS else
-             "import planner_prompt_v3 as V; s=V.system_prompt_pend()\n" if arm == "pend" else
+             ("import planner_prompt_v3 as V; s=V.system_prompt_pend(implicit_profile=%r)\n" % bool(implicit_profile))
+             if arm == "pend" else
              "from sepsim import planner_prompt as PP; s=PP.system_prompt()\n") +
             "print(hashlib.sha256(s.encode()).hexdigest())")
     env = {k: v for k, v in os.environ.items() if not k.startswith("SEPSIM_")}
@@ -680,7 +681,7 @@ def verify(episodes, meta_path, splits_path, fold, split, arm=None, training=Fal
     rep.note("io.rows", "%d episodes, %d rl rollouts" % (len(rows), len(rollouts)))
     check_meta(meta, arm, fold, rep)
     if expected_sha is None:
-        expected_sha = recompute_system_sha(arm, sepsim_path)
+        expected_sha = recompute_system_sha(arm, sepsim_path, implicit_profile=bool(meta.get("implicit_profile")))
         if expected_sha:
             rep.note("%s.system_prompt_sha" % arm, "expected sha recomputed from sepsim")
     check_system_sha(meta, arm, expected_sha, rep)

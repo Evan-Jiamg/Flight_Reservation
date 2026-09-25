@@ -287,9 +287,9 @@ def rules_block_pend():
 
 
 CRITIQUE_FIELD = '"critique": "<one sentence on what your previous state got wrong, judged against what happened>",\n'
-PROFILE_NOTE_FIELD = (' "profile_note": "<one or two sentences: how THIS person\'s writing differs from the message you '
-                      'last produced for them (length, tone, phrasing, what they ask) and what to do differently; '
-                      'empty on their first message>",\n')
+PROFILE_NOTE_FIELD = (' "profile_note": "<one or two sentences about HOW THIS PERSON WRITES that the message you last '
+                      'produced for them got wrong (length, tone, casing, phrasing, how directly they ask); describe '
+                      'their writing only, not what the assistant should do; empty on their first message>",\n')
 
 
 def system_prompt_pend(implicit_profile=False):

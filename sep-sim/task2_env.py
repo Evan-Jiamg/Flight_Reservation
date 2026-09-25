@@ -607,8 +607,8 @@ class Task2Env:
             note = ""
             if self.ip and t >= 2 and not unparsed:
                 note = IP.clean_note(fields.get("profile_note"))
-                if note:
-                    S["ip_notes"].append(note)
+                if note and not (S["ip_notes"] and IP.norm_text(S["ip_notes"][-1]) == IP.norm_text(note)):
+                    S["ip_notes"].append(note)          # an exact repeat of the last note adds nothing
             base = {"planner_prompt": g["prompt_text"], "planner_fit": g["fit"], "planner_raw": raw,
                     "planner_hit_max_new": g["hit_max_new"], "planner_diag": diag,
                     "planner_unparsed": unparsed, "ended_planner": ended,
@@ -794,7 +794,9 @@ class Task2Env:
         n_extra = 0
         while all(reasons) and n_extra < run_v2.REDRAW:
             j = n0 + n_extra
-            ex = examples_for(1000 + j)
+            # every candidate failed: redraw WITHOUT examples, so a Speaker that copies the examples
+            # (seen in the smoke: all 8 first-turn candidates copied a prompt-like example) can still pass
+            ex = []
             blk = block_for(ex)
             o = self._say_many([req(pipeline.seed_for(sid, t, j + 1), T_S, P_S, blk)])[0]
             cands.append(o[0])
