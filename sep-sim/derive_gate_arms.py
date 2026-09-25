@@ -41,6 +41,33 @@ def derive(episode, p_by_t, threshold, arm):
     return row
 
 
+def derive_planner_exit(episode, arm="a1_planner_exit"):
+    """A1: the no-gate episode as if the Planner's first session-ending act had ended it
+    SILENTLY (task2_episode planner_stop semantics): the user leaves at step t_p without
+    writing, so emitted = t_p - 1 and coverage/complete are the values after step t_p - 1.
+    Exact because nothing before t_p depends on whether t_p ends the episode."""
+    row = copy.deepcopy(episode)
+    for step in row["trace"]:
+        step.pop("gate_prompt", None)
+        step.pop("planner_prompt", None)
+    row.update(arm=arm, derived_from="no-gate truncation at first ended_planner (silent exit)")
+    tp = next((s["t"] for s in row["trace"] if s.get("ended_planner")), None)
+    if tp is None:
+        return row
+    kept = [s for s in row["trace"] if s["t"] < tp]
+    assert all(s["decision"] == "continue" for s in kept), "truncation before a terminal step"
+    cov, comp = (kept[-1]["coverage_after"], kept[-1]["complete_after"]) if kept else (0.0, False)
+    at = [s for s in row["trace"] if s["t"] == tp][0]
+    stop = {"t": tp, "decision": "planner_stop", "planner_stop": True, "emitted": False, "user": "",
+            "agent": None, "ended_planner": True, "stop_rule": at.get("stop_rule"),
+            "move": at.get("move"), "act": at.get("act"),
+            "coverage_after": cov, "complete_after": comp}
+    row.update(trace=kept + [stop], emitted_user_turns=tp - 1, turns=tp - 1, decision_steps=tp,
+               end_kind="planner_stop", stop_kind="planner_stop", ended_by_token=True,
+               coverage=cov, complete=comp, ledger=None)
+    return row
+
+
 def outcome(row):
     return {"prob": 1.0, "emitted_user_turns": row["emitted_user_turns"],
             "decision_steps": row["decision_steps"], "coverage": row["coverage"],

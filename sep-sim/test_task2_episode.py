@@ -76,6 +76,49 @@ def test_gate_first_step_and_threshold_boundary():
     assert ep2["end_kind"] == "t_max"
 
 
+def planner_script(stop_at, script):
+    """speak() that returns a silent Planner exit at step stop_at."""
+    def speak(t):
+        if t == stop_at:
+            return {"planner_stop": True, "ended_planner": True, "stop_rule": "satiation"}
+        text, end_s, end_p = script[t - 1]
+        return {"user": text, "ended_speaker": end_s, "ended_planner": end_p}
+    return speak
+
+
+def test_planner_silent_exit():
+    env = Env()
+    ep = run_episode(10, None, planner_script(4, [("u", False, False)] * 10), env.respond)
+    assert ep["end_kind"] == "planner_stop"
+    assert ep["emitted_user_turns"] == 3 and ep["decision_steps"] == 4
+    assert [t for t, _ in env.r0_calls] == [1, 2, 3]
+    last = ep["trace"][-1]
+    assert last["decision"] == "planner_stop" and last["user"] == "" and last["agent"] is None
+    assert last["emitted"] is False
+
+
+def test_planner_silent_exit_first_step():
+    env = Env()
+    ep = run_episode(10, None, planner_script(1, [("u", False, False)] * 10), env.respond)
+    assert ep["end_kind"] == "planner_stop" and ep["emitted_user_turns"] == 0 and env.r0_calls == []
+
+
+def test_planner_stop_with_text_is_rejected():
+    def speak(t):
+        return {"planner_stop": True, "user": "bye"}
+    try:
+        run_episode(10, None, speak, Env().respond)
+    except ValueError:
+        return
+    raise AssertionError("utterance on a silent exit must raise")
+
+
+def test_gate_precedes_planner():
+    env = Env()
+    ep = run_episode(10, gate_at(2), planner_script(3, [("u", False, False)] * 10), env.respond)
+    assert ep["end_kind"] == "stop_gate" and ep["emitted_user_turns"] == 1
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_"):

@@ -81,3 +81,40 @@ assert abs(acc["stop"] / n - p_stop) < 0.01
 zero = derive_hazard(base, {t: 0.0 for t in range(1, 11)}, "z")
 assert zero["emitted_user_turns"] == base["emitted_user_turns"] and zero["coverage"] == base["coverage"]
 print("hazard expectation == Monte Carlo online gate: ok", round(hz["emitted_user_turns"], 3))
+
+# ---- A1: silent Planner exit derived from a no-gate run == online planner_stop run ----
+from derive_gate_arms import derive_planner_exit  # noqa: E402
+
+
+def planner_run(script, cov, end_at, silent):
+    """end_at: set of steps where the Planner's act is session-ending."""
+    def speak(t):
+        text, end = script[t - 1]
+        if silent and t in end_at:
+            return {"planner_stop": True, "ended_planner": True, "user": ""}
+        return {"user": text, "ended_speaker": end, "ended_planner": t in end_at}
+    state_ = {}
+
+    def respond(t, text):
+        return "r%d" % t
+    ep = run_episode(10, None, speak, respond)
+    last = (0.0, False)
+    for s in ep["trace"]:
+        if s["decision"] == "continue":
+            last = cov[s["t"] - 1]
+        s["coverage_after"], s["complete_after"] = last
+    ep.update(conversation_id="c", seed=0, coverage=last[0], complete=last[1])
+    return ep
+
+
+for end_at in ({4}, {1}, {6, 7}, set(), {10}):
+    base = planner_run(script, cov, end_at, silent=False)      # no-gate: Planner end only logged
+    online = planner_run(script, cov, end_at, silent=True)
+    d = derive_planner_exit(base)
+    for k in ("emitted_user_turns", "decision_steps", "end_kind", "coverage", "complete"):
+        assert d[k] == online[k], (end_at, k, d[k], online[k])
+# a speaker end before the Planner's end act: derivation leaves the episode unchanged
+early = [("a", False), ("bye", True)] + [("x", False)] * 8
+b = planner_run(early, cov, {5}, silent=False)
+assert derive_planner_exit(b)["end_kind"] == "speaker_end"
+print("A1 silent planner exit derivation == online planner_stop: ok")

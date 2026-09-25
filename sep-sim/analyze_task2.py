@@ -28,7 +28,8 @@ import random
 from collections import defaultdict
 from math import sqrt
 
-END_KINDS = ("stop_gate", "empty", "speaker_end", "planner_end", "t_max")
+END_KINDS = ("stop_gate", "planner_stop", "empty", "speaker_end", "planner_end", "t_max")
+W1_SUPPORT = range(0, 16)
 LEGACY_KIND = {"end_token": "speaker_end", "planner": "planner_end"}
 HUMAN = {}
 
@@ -84,6 +85,26 @@ def value(row, name):
     return total
 
 
+def w1_to_human(rows):
+    """Wasserstein-1 between the simulated emitted-turn distribution of `rows` (each episode's
+    outcome distribution, equal episode weights) and the human K of the same episodes'
+    scenarios. Distribution-level timing metric (audit D8): it does not require the simulated
+    conversation to stop at the SAME turn as the human one did with a different agent."""
+    sim = defaultdict(float)
+    hum = defaultdict(float)
+    n = len(rows)
+    for r in rows:
+        for o in outcomes(r):
+            sim[int(round(o["emitted_user_turns"]))] += o["prob"] / n
+        hum[HUMAN[r["conversation_id"]]] += 1.0 / n
+    fs = fh = total = 0.0
+    for t in W1_SUPPORT:
+        fs += sim.get(t, 0.0)
+        fh += hum.get(t, 0.0)
+        total += abs(fs - fh)
+    return total
+
+
 def metrics():
     base = ("emitted_user_turns", "decision_steps", "coverage", "complete")
     human = ("turn_error", "abs_turn_error") if HUMAN else ()
@@ -100,6 +121,7 @@ def summary(rows):
         s[name + "_mean"] = sum(value(r, name) for r in values) / n
     if HUMAN:
         s["human_turns_mean"] = sum(HUMAN[r["conversation_id"]] for r in values) / n
+        s["w1_to_human"] = w1_to_human(values)
     return s
 
 
@@ -123,6 +145,16 @@ def paired(a, b, n_boot=4000, seed=20260924):
         result[name] = {"mean_difference_new_minus_base": mean, "scenario_se": se,
                         "scenario_bootstrap_95": [draws[int(.025 * n_boot)],
                                                   draws[int(.975 * n_boot) - 1]]}
+    if HUMAN:
+        # W1 is not a mean of per-scenario differences; bootstrap it over the same scenario draws
+        rows_a = {s: [a[k] for k in by_scenario[s]] for s in scen}
+        rows_b = {s: [b[k] for k in by_scenario[s]] for s in scen}
+        point = w1_to_human(sum(rows_b.values(), [])) - w1_to_human(sum(rows_a.values(), []))
+        draws = sorted(w1_to_human([r for i in idx for r in rows_b[scen[i]]]) -
+                       w1_to_human([r for i in idx for r in rows_a[scen[i]]]) for idx in boot_idx)
+        result["w1_to_human"] = {"difference_new_minus_base": point,
+                                 "scenario_bootstrap_95": [draws[int(.025 * n_boot)],
+                                                           draws[int(.975 * n_boot) - 1]]}
     return result
 
 

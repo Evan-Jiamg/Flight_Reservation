@@ -42,6 +42,27 @@ def main():
     assert all(v["mean_difference_new_minus_base"] == 0 for k, v in z["paired"].items() if isinstance(v, dict))
     print("analyze_task2 ok", o["paired"]["emitted_user_turns"])
 
+    # W1 to human: corpus where every scenario's human K is known
+    corpus = os.path.join(d, "corpus.jsonl")
+    with open(corpus, "w") as f:
+        for c in range(6):
+            msgs = [{"participant_name": "user"}] * 4 + [{"participant_name": "agent"}] * 4
+            f.write(json.dumps({"conversation_id": "c%d" % c, "chat_messages": msgs}) + "\n")
+    with open(os.path.join(d, "k4.jsonl"), "w") as f:      # every episode emits exactly K=4 turns
+        for c in range(6):
+            for s in (0, 1):
+                f.write(json.dumps(ep("c%d" % c, s, "k4", 4, "planner_stop", .5, False)) + "\n")
+    with open(os.path.join(d, "k6.jsonl"), "w") as f:      # every episode emits 6 turns
+        for c in range(6):
+            for s in (0, 1):
+                f.write(json.dumps(ep("c%d" % c, s, "k6", 6, "t_max", .5, False)) + "\n")
+    w = run("analyze_task2.py", "--base", os.path.join(d, "k6.jsonl"), "--new", os.path.join(d, "k4.jsonl"),
+            "--corpus", corpus)
+    assert w["new"]["w1_to_human"] == 0.0 and abs(w["base"]["w1_to_human"] - 2.0) < 1e-9, w["base"]
+    assert abs(w["paired"]["w1_to_human"]["difference_new_minus_base"] + 2.0) < 1e-9
+    assert w["new"]["end_planner_stop_mean"] == 1.0
+    print("w1_to_human ok")
+
     with open(os.path.join(d, "pred.jsonl"), "w") as f:
         # session r0 stops early at t=1; r1 exact; r2 never
         for rid, ps in (("r0", [.9, .2, .8]), ("r1", [.1, .2, .7]), ("r2", [.1, .1, .1])):
