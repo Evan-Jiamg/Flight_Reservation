@@ -1,53 +1,37 @@
 # PLAN（Project Operating Mode：可斷點續跑的主計畫）
 
-最後更新：2026-09-25 15:10（Asia/Taipei）。每輪重大變更後更新本檔與 `TASKS.md`。
+最後更新：2026-09-25 19:05（Asia/Taipei）。
 
-## Goal（使用者 2026-09-25 定案）
-以 **E1.6**（最新版 E1，已解決 E1 在 Task 1 的問題）為基礎，修掉 E1.6 既有的架構缺陷，並加上 **RL 訓練**，讓 **Task 2 指標（含回合數）重新接近真人**。Speaker 用 **Ditto-8B**（移植 E1.6 的 Planner 端）。**零 data leakage**。
+## Goal（使用者定案）
+在 E1.6 已經解決 E1 問題的基礎上，讓 **Task 2 指標（尤其回合數）接近真人**，同時 **Task 1 指標不退化**。方法以 **GRPO RL** 為主，**零 data leakage**。
 
-- E1.6 = `/home/mzjiang/Sep-1st-Simulator-e1r` @ `cf19400`（沒有未提交修改），設定見 `endfix/stage_e16.sh`。唯讀副本放在 `grpo_planner/trees/e1r_cf19400`（附 SHA256SUMS）。
-- E1.6 當時用的是 UserLM-8b，而且 **從來沒有 Task 2 rollout**；目前 Task 2 的數字（8.44 回合 vs 真人 4.45）是 v2fix 的。
-- E1.6 的 config z123 是看過評估語料分數後才選的：**報告時必須揭露**。
+## 架構：`pend` arm（Planner + Ditto + Selector，No Annotation，不用 goal judge）
+- Planner = **Qwen3-4B-Instruct-2507** + LoRA（使用者要求縮小；伺服器上現成、原生 262K context、非思考版）。
+- E1.6 樹 `trees/e1r_cf19400` + 修正：override 關、只呈現 Task 2 為真的事實、完整 goal（topic+context）、沒有 band/clamp（保留每個 act 各自的長度）、prompt 不截斷、patience 由 Planner 判斷。
+- Planner 輸出 `goal_met` / `still_wanted`，`end_session=true` = 這一句是最後一句：act 取自 Planner 自己的 Complete 項目，Ditto 寫收尾（不必道謝），送出後結束（E1/E1.6 的 PLANNER_END 語意）；第 1 回合不能結束。
+- Ditto 的 pending = Planner 的 `still_wanted`。
 
-## Only two systems are compared（同一個 Task2Env，同一份 split）
-| 系統 | arm | 內容 |
-|---|---|---|
-| **Baseline：E1.6 in Task 2** | `e16` | E1.6 Planner 端照原樣：NO_ANN（載入時就剝除標註）、ACT_FULL、SELF_JUDGE + STOP_LEDGER + override、PLANNER_END（Complete act 說完這句就結束）、T1_SAMPLE；Ditto；截斷修正 |
-| **Final** | `final` | E1.6 + 缺陷修正（D1 override 關、D2 只留 Task 2 為真的事實、D3/D4 改由目標判斷器提供 GOAL STATUS、D5 不截斷、D10、patience 由 Planner 自己決定、長度沒有 band 也不 clamp，但保留 ACT_FULL「每個 act 各自的長度」）+ `end_session` 靜默離開 + 判斷器 unmet 傳給 Ditto + **GRPO RL**（Planner LoRA，只用 train） |
+## 環境（要揭露）
+- OpenAI 額度用完 → R0（Task Agent）與 requirement-ledger 判斷器改用 **gpt-oss-120b**（hcwang 在 245 GPU0 的 vLLM，port 8019）。benchmark client 在這個 dialect 不送 reasoning_effort（伺服器預設）。
+- Ledger 判斷器 `max_tokens=200` 在推理型模型下會回空答案（coverage 永遠 0）→ 非 gpt-5 dialect 下限提高到 4000，空回應會計數，verify 在 ledger 從未記到任何需求時判為失敗。
 
-另外報告「RL 前」的中間點（`final` arm、尚未 RL），用來歸因。
+## GRPO（`train_planner_rl.py --arm pend`）
+- Task 2 rollout：每次更新 4 個 train 情境 × G=4；reward v3 = coverage − |模擬回合 − 真人回合| / 10 − 格式違規（unparsed、hit_max_new，λ=1）。
+- **Stop credit**：回合差的 advantage 只作用在每一步 `end_session` 的值 token；coverage/格式的 advantage 作用在整段。
+- **Task 1 停止組**：每次更新抽 4 段 train_all 的真實對話，在真人最後一回合和一個較早回合各取 G 個 Planner 決策，reward = 和真人是否結束一致（只作用在 `end_session` token）。
+- **停止 token 輔助監督**（權重 1）：未訓練的 Planner 在真實對話上從不結束，GRPO 組內標準差為 0、學不到 → 加上人類停止標籤的監督項（報告要寫成 GRPO + 輔助監督，不稱純 RL）。
+- KL 0.04（對未訓練的原始模型），lr 1e-5，T=0.7 / top_p=0.8（Qwen3 官方值）。
+- 選 checkpoint：validation 的 Task 2 reward + Task 1 term_f1（權重 1，事先定好）。
+- 跨 episode 的批次生成（Planner、Ditto）：驗證過 padded 與 unpadded 的 log-prob 平均差 0.007，差距 >0.5 的 token 佔 0%。
 
-**E1.6 裡沒有移植、需要揭露的部分：**
-- 只適用 UserLM 的開關（ROLESTOP 以外）：INTENT_PROSE、NEXTSTEP_INLINE、INTENT_CACHE、ENDGATE。Ditto 沒有 end token，這些關閉；`ditto_e16.DittoSpeaker.load` 在它們被打開時會直接報錯。
-- ROLESTOP 的 Ditto 對應版本：`<|im_start|>` 也當停止 token。
-- T1_SAMPLE 的溫度改用 Ditto checkpoint 自己的 `generation_config`（T=0.7、top_p=0.8），E1.6 用的是 UserLM 卡片上的 1.0／0.8。
-- SELF_JUDGE、STOP_LEDGER 只留在 Baseline；Final 以判斷器取代它們。
+## Splits（`splits_v1.json`，官方 goal+persona 三折）
+fold2：train 14（Task 2）/ train_all 17（Task 1）、validation 4、test 5（test_all 9）。語料只有 56 段已完成的 session；PRISM/MultiWOZ 是 benchmark 的 OOD 測試集，不拿來訓練。
 
-## Metrics
-- **主要（Task 2，對真人）：** 模擬回合數與真人回合數的平均差與分佈 W1；coverage；complete。
-- **守門：** Final 對 Baseline，coverage 差 ≥ −0.02，complete 最多少 1 集。
-- **Task 1 不退化：** teacher-forced 的 Act TVD、transition JSD、intent adherence，對照 E1.6 + Ditto。
-- **泛化：** MultiWOZ（只評估判斷器）。
+## 評估
+- Task 1：`task1_v4.py`（teacher-forced，56 段 + K+1），用 E1.6 當時的同一條指令評分（`score_method.py --no-llm` + `reduce_k1.py`），和 E1.6 並列比較。
+- Task 2：validation / test 回合數 vs 真人（平均差、W1）、coverage、complete，對照 E1 的 32B 數據（保留，不重跑；R0 環境不同要註明）。
 
-## Splits（`grpo_planner/splits_v1.json`）
-| 分割 | fold0 / 1 / 2 | 用途 |
-|---|---|---|
-| train | 14 / 12 / 14 | 判斷器 SFT、RL rollout、所有統計 |
-| validation | 1 / 4 / 4 | 只用於選 checkpoint |
-| test | 9 / 5 / 5 | 方法凍結後只跑一次（`--final`） |
-
-## Steps
-| 步驟 | 內容 |
-|---|---|
-| 0 | E1.6 移植（`ditto_e16.py`、`task2_env` 的 e16/final、v3 的 ACT_FULL、verify）→ 245 smoke（進行中） |
-| 1 | 標籤（Llama-70B，進行中）→ κ 交叉檢查 → 判斷器 SFT × 3 折 |
-| 2 | 小 Planner 測試（進行中）：Qwen2.5-7B、Llama-3.1-8B，並用 **同一 prompt 的 32B NF4** 當參考。v3 teacher-forced 200 步，看 Planner 是否及時結束；過關者再做 Task 2 rollout（`final` arm）與 32B 比較 |
-| 3 | Baseline `e16` rollout（validation；test 等 Final 凍結後一起跑）＋ Pipeline 驗證 + GRPO 可行性（每折 5 次更新） |
-| 4 | GRPO 正式訓練（三折，reward v2） |
-| 5 | Validation 選 checkpoint → Test 只跑一次（Baseline vs Final）+ Task 1 不退化 + MultiWOZ |
-
-## GPU
-245 GPU1（H100 97GB）是唯一能跑 Ditto／bf16 的卡；GPU0 是 hcwang 的 vLLM，不動。244 是 V100（沒有 bf16，也沒有 Ditto），用來跑判斷器 SFT 與評估的非 Ditto 部分。
-
-## ETA
-約 **9/28**。RL 是最長的一段，約 1–1.5 天；245 GPU1 同時只能跑 1–2 個 rollout worker。
+## 時程
+- 9/25 18:58 GRPO fold2 開始（30 次更新，每 5 次 validation）；每次更新時間待實測後校正。
+- 9/25 約 21:00 Task 1 未訓練基準出爐。
+- 之後：選 checkpoint → Task 1 完整評估（訓練後）→ test 一次 → 視時間補 fold0/fold1。
