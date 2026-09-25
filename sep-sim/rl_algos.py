@@ -304,11 +304,14 @@ class TorchLearner:
             for s, a in zip(samples, adv):
                 s["adv"] = a
 
-    def update(self, samples, cfg, seed):
-        """cfg: controller cfg (lr, kl_coef). -> stats dict."""
+    def update(self, samples, cfg, seed, aux=None):
+        """cfg: controller cfg (lr, kl_coef). aux: optional stop-token supervision examples
+        {prompt_ids, prefix_ids, target_ids, want_end, weight}. -> stats dict."""
         import torch
-        if not samples:
+        if not samples and not aux:
             return {"n_samples": 0, "n_tokens": 0, "skipped_update": True}
+        if not samples:
+            samples = []
         for g in self.optimizer.param_groups:
             if g["name"] == "policy":
                 g["lr"] = cfg["lr"]
@@ -371,12 +374,35 @@ class TorchLearner:
                 self.optimizer.step()
                 st["optimizer_steps"] += 1
         self.optimizer.zero_grad(set_to_none=True)
+        if aux:
+            # auxiliary stop-token supervision (after the on-policy GRPO steps, so it never touches the
+            # ratio check): -log p(the human's end_session value | prompt + the policy's own prefix)
+            _set_mode(self.model, self.acfg["forward_mode"])
+            n_t = sum(len(x["target_ids"]) for x in aux)
+            p_before = []
+            for x in aux:
+                lp, _ = token_logprobs(self.model, list(x["prompt_ids"]) + list(x["prefix_ids"]),
+                                       x["target_ids"], 1.0)
+                p_before.append(float(lp.detach().sum().exp()))
+                loss = -float(x["weight"]) * lp.sum() / n_t
+                loss.backward()
+                st["aux_loss"] = st.get("aux_loss", 0.0) + float(loss.detach())
+            gn = torch.nn.utils.clip_grad_norm_(params, self.acfg["max_grad_norm"])
+            st["aux_grad_norm"] = float(gn)
+            self.optimizer.step()
+            self.optimizer.zero_grad(set_to_none=True)
+            st["optimizer_steps"] += 1
+            st["aux_n"] = len(aux)
+            st["aux_p_correct_before"] = sum(p_before) / len(p_before)
+            st["aux_p_correct_end"] = (sum(p for p, x in zip(p_before, aux) if x["want_end"]) /
+                                       max(1, sum(1 for x in aux if x["want_end"])))
         self.model.eval()
         n_mb = max(1, st["optimizer_steps"])
-        st.update(n_tokens=tok_seen, kl=st["kl"] / tok_seen, ratio_mean=st["ratio_mean"] / tok_seen,
-                  clip_frac=st["clip_frac"] / tok_seen, loss=st["loss"] / n_mb,
-                  grad_norm=max(st["grad_norm"]),
-                  value_mse=st["value_mse"] / (len(samples) * int(self.acfg["epochs"])) if self.algo == "ppo" else None)
+        tok_div = max(1, tok_seen)          # 0 only for an aux-only update
+        st.update(n_tokens=tok_seen, kl=st["kl"] / tok_div, ratio_mean=st["ratio_mean"] / tok_div,
+                  clip_frac=st["clip_frac"] / tok_div, loss=st["loss"] / n_mb,
+                  grad_norm=max(st["grad_norm"]) if st["grad_norm"] else 0.0,
+                  value_mse=st["value_mse"] / max(1, len(samples) * int(self.acfg["epochs"])) if self.algo == "ppo" else None)
         for s in samples:          # free tensors
             for k in ("old_logp", "ref_logp", "hidden"):
                 s.pop(k, None)

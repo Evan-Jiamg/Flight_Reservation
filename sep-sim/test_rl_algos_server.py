@@ -197,6 +197,21 @@ def main():
         pass
     log("10 ok: stop-credit token (t=%d, logp %.3g) log-prob +%.3g; wrong-length mask refused" % (k, float(before[k]), dk))
 
+    # ---- 11 auxiliary stop supervision: an aux-only update raises p(target tokens | prompt + prefix)
+    s1 = fresh(samples)[1]
+    cut = max(1, len(s1["gen_ids"]) // 2)
+    x = {"prompt_ids": s1["prompt_ids"], "prefix_ids": s1["gen_ids"][:cut], "target_ids": s1["gen_ids"][cut:cut + 2],
+         "want_end": True, "weight": 1.0}
+    lp_b = RA.token_logprobs(model, list(x["prompt_ids"]) + list(x["prefix_ids"]), x["target_ids"], 1.0)[0].sum().item()
+    lr11 = RA.TorchLearner(model, "grpo", {}, lr=1e-4, seed=0)
+    st11 = lr11.update([], {"lr": 1e-4, "kl_coef": 0.0}, seed=7, aux=[x])
+    model.eval()
+    import torch as _t
+    with _t.no_grad():
+        lp_a = RA.token_logprobs(model, list(x["prompt_ids"]) + list(x["prefix_ids"]), x["target_ids"], 1.0)[0].sum().item()
+    assert st11["aux_n"] == 1 and lp_a > lp_b, (lp_b, lp_a, st11)
+    log("11 ok: aux-only update raised target logp %.4g -> %.4g" % (lp_b, lp_a))
+
     # ---- 9 PPO smoke (optional algorithm)
     ppo = RA.TorchLearner(model, "ppo", {}, lr=1e-5, seed=0)
     stp = ppo.update(fresh(samples), {"lr": 1e-5, "kl_coef": 0.0}, seed=4)

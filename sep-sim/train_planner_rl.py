@@ -184,9 +184,32 @@ class FakeLearner:
             for s, a in zip(samples, adv):
                 s["adv"] = a
 
-    def update(self, samples, cfg, seed):
-        if not samples:
+    def update(self, samples, cfg, seed, aux=None):
+        if not samples and not aux:
             return {"n_samples": 0, "n_tokens": 0, "skipped_update": True}
+        if not samples:
+            out = {"n_samples": 0, "n_tokens": 0, "loss": 0.0, "kl": 0.0, "ratio_mean": 1.0, "clip_frac": 0.0,
+                   "grad_norm": 0.0, "ratio_init_maxdev": 0.0, "optimizer_steps": 0}
+            self._aux_step(aux, cfg, out)
+            return out
+        st = self._update(samples, cfg, seed)
+        if aux:
+            self._aux_step(aux, cfg, st)
+        return st
+
+    def _aux_step(self, aux, cfg, st):
+        lr = cfg["lr"] * self.lr_scale
+        ps = []
+        for x in aux:
+            k = x["prompt_ids"][0]
+            p = _sig(self.theta[k])
+            ps.append(p if x["target_ids"][0] == 1 else 1 - p)
+            grad = (1 - p) if x["target_ids"][0] == 1 else -p
+            self.theta[k] += lr * float(x["weight"]) * grad / len(aux)
+        st["aux_n"], st["aux_p_correct_before"] = len(aux), sum(ps) / len(ps)
+        st["optimizer_steps"] = st.get("optimizer_steps", 0) + 1
+
+    def _update(self, samples, cfg, seed):
         self.prepare(samples)
         lr, eps = cfg["lr"] * self.lr_scale, self.acfg["clip_eps"]
         maxdev, steps, ratios = 0.0, 0, []
@@ -293,6 +316,8 @@ def _fake_task1_sample(self, conversation_id, t, user_prompt, real_final, G, tem
                     "reward": float(stop == bool(real_final)),
                     "planner_gen": {"prompt_ids": [k, t], "gen_ids": [int(stop), 7], "stop_mask": [1, 0],
                                     "temperature": temperature, "top_p": top_p, "seed": g}})
+    out[0]["aux"] = {"prompt_ids": [k, t], "prefix_ids": [], "target_ids": [int(bool(real_final))],
+                     "want_end": bool(real_final)}
     return out
 
 
@@ -613,7 +638,14 @@ class Trainer:
                        "end_at_nonfinal": (sum(x["ended_planner"] for x in mid) / len(mid)) if mid else None,
                        "groups_skipped_zero_std": t1_skipped}
         assert all(s["policy_version"] == pv for s in samples), "sample from another policy version"
-        stats = self.learner.update(samples, cfg, seed=seed_of(self.a.seed, "update", u))
+        aux = []
+        if self.a.stop_sup_weight > 0:
+            for r in t1rows:
+                x = (r["samples"] or [{}])[0].get("aux")
+                if x is not None:
+                    assert x["want_end"] == r["real_final"], "stop-supervision label disagrees with the human"
+                    aux.append(dict(x, weight=self.a.stop_sup_weight))
+        stats = self.learner.update(samples, cfg, seed=seed_of(self.a.seed, "update", u), aux=aux or None)
         agg = RR.aggregate(rewarded)
         hist = {"update": u, "split": "train", "reward_version": cfg["version"], "task1_train": t1_hist, **agg, "n_groups": len(groups), "n_groups_skipped_zero_std": skipped,
                 "lr": cfg["lr"], "kl_coef": cfg["kl_coef"],
@@ -742,6 +774,8 @@ def parse_args(argv=None):
                     help="reported: whether Task 1 term_f1 / premature stay within this of update 0")
     ap.add_argument("--task1-convs", type=int, default=4,
                     help="Task 1 stop groups per update: real TRAIN conversations (last + one earlier message, G samples each); 0 = off")
+    ap.add_argument("--stop-sup-weight", type=float, default=1.0,
+                    help="auxiliary stop-token supervision on the Task 1 positions (human end/continue); 0 = off (pure GRPO)")
     ap.add_argument("--stop-credit", type=int, choices=(0, 1), default=1,
                     help="1: turn-count and Task 1 advantages act only on the end_session value tokens")
     ap.add_argument("--w-sel-task1", type=float, default=1.0,

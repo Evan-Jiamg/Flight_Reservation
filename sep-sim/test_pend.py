@@ -75,6 +75,43 @@ def test_stop_mask_marks_only_the_value_tokens():
     assert _mask(['{"act": "x"}']) is None                       # field absent -> no stop credit
 
 
+class _Tok2(_Tok):
+    def __call__(self, text, add_special_tokens=False):
+        return {"input_ids": [self.vocab.index(text)]}
+
+
+def test_stop_target_swaps_the_value_only():
+    import types
+    import task2_env as T2
+    pieces = ['{"end_session":', ' false', ',', ' true']
+    obj = types.SimpleNamespace(tok=_Tok2(pieces))
+    tgt = T2.PlannerLM.stop_target(obj, [0, 1, 2], [0, 1, 0], want_end=True)
+    assert tgt == {"prefix_ids": [0], "target_ids": [3], "want_end": True}
+    tgt = T2.PlannerLM.stop_target(obj, [0, 1, 2], [0, 1, 0], want_end=False)
+    assert tgt == {"prefix_ids": [0], "target_ids": [1], "want_end": False}
+    assert T2.PlannerLM.stop_target(obj, [0, 1, 2], None, want_end=True) is None
+
+
+def test_stop_supervision_moves_the_stop_policy():
+    """GRPO Task 1 groups are all-or-nothing at the start (zero spread -> skipped); the auxiliary
+    stop supervision still moves p(end | last message) up and p(end | earlier message) down."""
+    d = tempfile.mkdtemp()
+    try:
+        sp = make_splits(d)
+        on, off = os.path.join(d, "on"), os.path.join(d, "off")
+        run_ok(args(sp, on, updates=4, controller="fixed"))
+        run_ok(args(sp, off, "--stop-sup-weight", "0", updates=4, controller="fixed"))
+        th = lambda o: json.load(open(os.path.join(o, "ckpt", "u00004", "fake_learner.json")))["theta"]
+        t_on, t_off = th(on), th(off)
+        assert t_on[3] > t_off[3], "final-message end logit did not rise with stop supervision"
+        assert t_on[1] < t_off[1], "earlier-message end logit did not fall with stop supervision"
+        ups = T.read_jsonl(os.path.join(on, "updates.jsonl"))
+        assert all(u["learner_stats"].get("aux_n", 0) > 0 for u in ups)
+        assert all("aux_n" not in u["learner_stats"] for u in T.read_jsonl(os.path.join(off, "updates.jsonl")))
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
 def conv(n, ends):
     return {"turns": [{"t": t, "real_final": t == n, "ended_planner": t in ends, "planner_unparsed": False}
                       for t in range(1, n + 1)]}

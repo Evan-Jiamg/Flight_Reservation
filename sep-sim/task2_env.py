@@ -180,6 +180,21 @@ class PlannerLM:
             mask[k] = 1
         return mask
 
+    def stop_target(self, gen_ids, mask, want_end):
+        """Supervision target for the end_session value: the policy's own prefix up to the value, and the
+        value tokens re-encoded with the human's decision (true at the real last message, else false)."""
+        import re
+        if not mask or 1 not in mask:
+            return None
+        i = mask.index(1)
+        j = len(mask) - 1 - mask[::-1].index(1)
+        span = self.tok.decode(list(gen_ids[i:j + 1]), skip_special_tokens=False)
+        new = re.sub(r"(?i)true|false", "true" if want_end else "false", span, count=1)
+        if new == span and not re.search(r"(?i)true|false", span):
+            return None
+        ids = self.tok(new, add_special_tokens=False)["input_ids"]
+        return {"prefix_ids": list(gen_ids[:i]), "target_ids": list(ids), "want_end": bool(want_end)}
+
     def generate(self, system, user, temperature=0.0, top_p=1.0, seed=0):
         import torch
         import fit_prompts as F
@@ -563,6 +578,12 @@ class Task2Env:
                         "reward": float(bool(end) == bool(real_final)),
                         "planner_gen": {"prompt_ids": gen["prompt_ids"], "gen_ids": gen["gen_ids"], "stop_mask": self.planner.stop_mask(gen["gen_ids"]),
                                         "temperature": temperature, "top_p": top_p, "seed": pseed}})
+        # one stop-supervision example per position: the first sample whose end_session value was found
+        for x in out:
+            tgt = self.planner.stop_target(x["planner_gen"]["gen_ids"], x["planner_gen"]["stop_mask"], real_final)
+            if tgt is not None:
+                out[0]["aux"] = dict(tgt, prompt_ids=list(x["planner_gen"]["prompt_ids"]))
+                break
         return out
 
     def run_task1(self, conversation_id, seed=0, keep_prompts=False):
