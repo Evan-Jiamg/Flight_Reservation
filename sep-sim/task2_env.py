@@ -1,0 +1,284 @@
+# -*- coding: utf-8 -*-
+"""Task2Env: one reusable Task 2 environment for evaluation rollouts AND RL (Planner is the policy).
+
+Everything that decides behaviour lives here, once, so evaluation and RL cannot drift apart:
+  * PlannerLM   any causal LM (32B NF4, or a smaller 7-9B/20B model), optional LoRA adapter
+                (trainable for RL). Prompts are fitted (fit_prompts, never truncated) to
+                min(fit_prompts.PLANNER_BUDGET, model context - max_new - margin). Tokenized with
+                add_special_tokens=False (the chat template carries any BOS).
+                generate(system, user, temperature, top_p, seed) -> dict(raw, prompt_ids, gen_ids, fit)
+  * Speaker     FitDittoSpeaker (D5 fix), frozen, v2fix guards and selector line for line.
+  * Judge       goal_judge.GoalJudge (a2 only), frozen.
+  * arms        a0 = original Planner prompt/read_plan (override on); Planner end logged only.
+                a2 = v3 system/user prompt, read_plan_v3 (stop = end_session, no length clamp),
+                     judge GOAL STATUS, silent Planner exit.
+The env never reads outcome data or dataset-wide statistics; leak gates live in the callers.
+
+Episode rows have the schema written by rollout_ditto_v3.py (so analyzers, derivations and the
+pipeline verifier apply unchanged) plus, when record_generation=True, per step
+"planner_gen": {"prompt_ids", "gen_ids", "temperature", "top_p", "seed"} for RL.
+"""
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import random
+import sys
+
+V2FIX = {
+    "SEPSIM_ANTILEAK": "1", "SEPSIM_NEARCOPY": "1", "SEPSIM_COPY_SCOPE": "both",
+    "SEPSIM_NSAMP": "3", "SEPSIM_SELECTOR": "length", "SEPSIM_LENGTH_SELECT": "1",
+    "SEPSIM_POSITION": "system", "SEPSIM_END_PROBE": "0", "SEPSIM_GUARDRAILS": "0",
+}
+BENCH = "/tmp2/hchsu/trec2026-usersim-benchmark"
+TREE = "/home/mzjiang/Sep-Simulator"
+WORK = "/tmp2/mzjiang_usersim/task2"
+DITTO = "/tmp2/mzjiang_usersim/models/Ditto-8B"
+T_MAX = 10
+PLANNER_MAX_NEW = 600
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+
+
+def setup_environment(arm):
+    """Must run before sepsim / run_v2 are imported."""
+    for k, v in V2FIX.items():
+        os.environ[k] = v
+    os.environ.pop("SEPSIM_REDRAW", None)
+    os.environ["SEPSIM_ARM"] = "sepsim_v2fix"
+    os.environ["SEPSIM_PLANNER_END"] = "0"
+    os.environ["SEPSIM_ACT_PRIOR"] = "nostopclobber" if arm == "a2" else "off"
+    for p in (HERE, TREE, os.path.join(TREE, "scripts"), os.path.join(BENCH, "tools")):
+        if p not in sys.path:
+            sys.path.insert(0, p)
+    sys.modules.setdefault("torchvision", None)
+    sys.modules.setdefault("torchaudio", None)
+
+
+class PlannerLM:
+    def __init__(self, path, gpu, nf4=False, dtype="bfloat16", adapter=None, trainable=False,
+                 max_new=PLANNER_MAX_NEW):
+        import torch
+        from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+        import fit_prompts as F
+        self.path, self.gpu, self.max_new = path, gpu, max_new
+        self.tok = AutoTokenizer.from_pretrained(path)
+        if self.tok.pad_token_id is None:
+            self.tok.pad_token = self.tok.eos_token
+        kw = {"low_cpu_mem_usage": True, "device_map": {"": gpu}}
+        if nf4:
+            kw["quantization_config"] = BitsAndBytesConfig(
+                load_in_4bit=True, bnb_4bit_compute_dtype=getattr(torch, dtype if dtype != "auto" else "bfloat16"),
+                bnb_4bit_quant_type="nf4", bnb_4bit_use_double_quant=True)
+        else:
+            kw.update(F.dtype_kwarg("auto" if dtype == "auto" else getattr(torch, dtype)))
+        self.model = AutoModelForCausalLM.from_pretrained(path, **kw)
+        if adapter:
+            from peft import PeftModel
+            self.model = PeftModel.from_pretrained(self.model, adapter, is_trainable=trainable)
+        if not trainable:
+            self.model.eval()
+        cfg = getattr(self.model, "config", None)
+        ctx = getattr(cfg, "max_position_embeddings", None) or 32768
+        self.context = int(ctx)
+        self.budget = min(F.PLANNER_BUDGET, self.context - max_new - F.MARGIN)
+        self.adapter = adapter
+        self.n_calls = 0
+
+    def generate(self, system, user, temperature=0.0, top_p=1.0, seed=0):
+        import torch
+        import fit_prompts as F
+        user_fit, fit = F.fit_planner_user(self.tok, system, user, budget=self.budget)
+        text = self.tok.apply_chat_template([{"role": "system", "content": system},
+                                             {"role": "user", "content": user_fit}],
+                                            tokenize=False, add_generation_prompt=True)
+        enc = self.tok(text, return_tensors="pt", add_special_tokens=False)
+        n = int(enc["input_ids"].shape[1])
+        if n > self.budget:
+            raise AssertionError("Planner prompt %d > budget %d after fitting" % (n, self.budget))
+        enc = enc.to(next(self.model.parameters()).device)
+        kw = dict(max_new_tokens=self.max_new, pad_token_id=self.tok.pad_token_id)
+        if temperature and temperature > 0:
+            torch.manual_seed(seed)
+            kw.update(do_sample=True, temperature=temperature, top_p=top_p)
+        else:
+            kw.update(do_sample=False)
+        with torch.no_grad():
+            out = self.model.generate(**enc, **kw)
+        gen = out[0][n:]
+        self.n_calls += 1
+        return {"raw": self.tok.decode(gen, skip_special_tokens=True), "prompt_text": user_fit,
+                "prompt_ids": enc["input_ids"][0].tolist(), "gen_ids": gen.tolist(),
+                "fit": {**fit, "prompt_tokens": n, "budget": self.budget},
+                "hit_max_new": int(gen.shape[0]) >= self.max_new}
+
+
+class Task2Env:
+    def __init__(self, arm, gpu, planner, judge=None, ditto_path=DITTO, corpus="/home/mzjiang/v5-latency/data.jsonl"):
+        if arm not in ("a0", "a2"):
+            raise ValueError(arm)
+        if arm == "a2" and judge is None:
+            raise ValueError("a2 needs a goal judge")
+        setup_environment(arm)
+        from sepsim import acts, models, planner_prompt as PP
+        import run_v2
+        from r0_client import R0Client
+        from metrics.judge import Judge
+        import fit_prompts as F
+        import planner_prompt_v3 as V3
+        assert (run_v2.ANTILEAK, run_v2.NEARCOPY, run_v2.COPY_SCOPE, run_v2.REDRAW, run_v2.NSAMP,
+                run_v2.SELECTOR, run_v2.LENGTH_SELECT, run_v2.POSITION, run_v2.GUARDRAILS, run_v2.END_PROBE) == \
+               (True, True, "both", 4, 3, "length", True, "system", False, False), "v2fix did not bind"
+        expected = frozenset({"nostopclobber"}) if arm == "a2" else frozenset()
+        assert acts.prior_mode() == expected, "act prior mode wrong for arm %s" % arm
+        self.arm, self.gpu, self.planner, self.judge = arm, gpu, planner, judge
+        self.system = V3.system_prompt_v3() if arm == "a2" else PP.system_prompt()
+        self.recs = {}
+        for l in open(corpus, encoding="utf-8"):
+            if l.strip():
+                r = json.loads(l)
+                self.recs[r["conversation_id"]] = r
+        self.reqs = json.load(open(os.path.join(BENCH, "data/req_shards_v1.json")))
+        self.ledger_judge = Judge(reasoning_effort="minimal", verbose=False, cache_dir=os.path.join(WORK, "judge_cache"))
+        self.r0 = R0Client()
+        FitDitto = F.make_fit_ditto_speaker(models.DittoSpeaker)
+        self.speaker = FitDitto(path=ditto_path, gpu=gpu, position=run_v2.POSITION).load()
+
+    def describe(self):
+        import fit_prompts as F
+        return {"arm": self.arm, "planner": self.planner.path, "planner_adapter": self.planner.adapter,
+                "planner_budget": self.planner.budget, "speaker_budget": F.SPEAKER_BUDGET,
+                "system_prompt_sha256": hashlib.sha256(self.system.encode()).hexdigest(),
+                "goal_judge": (self.judge.model_path, self.judge.adapter) if self.judge else None,
+                "r0_model": self.r0.model, "ledger_judge_model": self.ledger_judge.model,
+                "act_prior": os.environ["SEPSIM_ACT_PRIOR"], "v2fix": V2FIX, "t_max": T_MAX}
+
+    def run_episode(self, conversation_id, seed, replicate=0, planner_temperature=0.0, planner_top_p=1.0,
+                    record_generation=False):
+        from sepsim import agenda as AG, persona as P, pipeline, planner_prompt as PP, state, stopping
+        import run_v2
+        from r0_client import Ledger
+        import planner_prompt_v3 as V3
+        from task2_episode import run_episode
+        arm, planner, speaker = self.arm, self.planner, self.speaker
+        rec = self.recs[conversation_id]
+        rid = rec["record_id"]
+        scenario = rec["scenario"]
+        sc_text = pipeline.scenario_text(rec)
+        sid = "%s#s%d" % (rid, seed)
+        rng = random.Random(pipeline.seed_for(sid, 0))
+        led = stopping.StoppingLedger(scenario)
+        ag = AG.Agenda(AG.terms_of(" ".join([str((scenario.get("goal") or {}).get("topic", "")),
+                                             str((scenario.get("goal") or {}).get("context", ""))]), 8))
+        ledger = Ledger(self.reqs[conversation_id]["req"], judge=self.ledger_judge)
+        S = {"hist_u": [], "hist_a": [], "prev_block": state.d0(P.initial_stage(scenario.get("goal"))),
+             "block": None, "cov": []}
+
+        def speak(t):
+            hist_u, hist_a = S["hist_u"], S["hist_a"]
+            gs = None
+            if arm == "a2":
+                gs = self.judge.assess(sc_text, hist_u, hist_a) if hist_a else {"status": "NOT ASSESSED", "unmet": []}
+                up = V3.user_prompt_v3(scenario, S["prev_block"], hist_u, hist_a, t, led,
+                                       {"status": gs["status"], "unmet": gs.get("unmet", [])}, prev_ann={})
+            else:
+                up = PP.user_prompt(scenario, S["prev_block"], hist_u, hist_a, t, ledger=led,
+                                    prev_ann={}, agenda_view=ag.render(), p_end=None)
+            pseed = int(hashlib.sha256(("%s|%d|%d|%d" % (sid, t, replicate, 7)).encode()).hexdigest()[:8], 16)
+            g = planner.generate(self.system, up, planner_temperature, planner_top_p, pseed)
+            raw = g["raw"]
+            if arm == "a2":
+                fields, diag, end_session = V3.read_plan_v3(raw, t, scenario, rng, led)
+            else:
+                fields, diag = PP.read_plan(raw, t, scenario, rng, led)
+                end_session = None
+            unparsed = fields is None
+            if unparsed:
+                fields = {"move": "Other", "act": "other"}
+            ended = bool(end_session) if arm == "a2" else bool(state.ends_session(fields))
+            base = {"planner_prompt": g["prompt_text"], "planner_fit": g["fit"], "planner_raw": raw,
+                    "planner_hit_max_new": g["hit_max_new"], "planner_diag": diag,
+                    "planner_unparsed": unparsed, "ended_planner": ended,
+                    "move": fields.get("move", ""), "act": fields.get("act", ""),
+                    "stop_rule": fields.get("stop_rule", "none"), "goal_status": gs,
+                    "ledger_before": {"turns": led.turns, "gain_trace": list(led.gain_trace)}}
+            if record_generation:
+                base["planner_gen"] = {"prompt_ids": g["prompt_ids"], "gen_ids": g["gen_ids"],
+                                       "temperature": planner_temperature, "top_p": planner_top_p, "seed": pseed}
+            if arm == "a2" and ended:
+                return {**base, "planner_stop": True, "user": ""}
+            if unparsed:
+                block = S["prev_block"]
+            elif arm == "a2":
+                block = V3.speaker_block_v3(fields, gs)
+            else:
+                block = PP.render_block(fields, ag.render())
+            S["block"] = block
+            # ---- generation block: line for line the same as rollout_stop_sft.py / run_v2 ----
+            ANTILEAK, NEARCOPY = run_v2.ANTILEAK, run_v2.NEARCOPY
+            avoid = hist_u if run_v2.GUARDRAILS else None
+            prior = list(hist_u) + (list(hist_a) if run_v2.COPY_SCOPE == "both" else [])
+            if run_v2.GUARDS_ON:
+                avoid = prior
+            greedy, ge = speaker.say(sc_text, block, hist_u, hist_a, t, seed=pipeline.seed_for(sid, t),
+                                     temperature=0.0, avoid=avoid, reject_template=ANTILEAK, reject_reuse=NEARCOPY)
+            fit0 = speaker.last_fit
+            cands, flags = [greedy], [ge]
+            for k in range(run_v2.NSAMP):
+                s_, e_ = speaker.say(sc_text, block, hist_u, hist_a, t, seed=pipeline.seed_for(sid, t, k + 1),
+                                     temperature=0.7, top_p=0.9, avoid=avoid, reject_template=ANTILEAK,
+                                     reject_reuse=NEARCOPY)
+                cands.append(s_)
+                flags.append(e_)
+            reasons, n_extra, eligible = None, 0, None
+            if run_v2.GUARDS_ON:
+                reasons = [run_v2.guard_reason(c, prior) for c in cands]
+                while all(reasons) and n_extra < run_v2.REDRAW:
+                    k = run_v2.NSAMP + n_extra
+                    sx, ex = speaker.say(sc_text, block, hist_u, hist_a, t, seed=pipeline.seed_for(sid, t, k + 1),
+                                         temperature=0.7, top_p=0.9, avoid=avoid, reject_template=ANTILEAK,
+                                         reject_reuse=NEARCOPY)
+                    cands.append(sx)
+                    flags.append(ex)
+                    reasons.append(run_v2.guard_reason(sx, prior))
+                    n_extra += 1
+                eligible = [i for i, r in enumerate(reasons) if not r] or None
+            idx = run_v2.choose(cands, fields.get("length_words"), None, eligible)
+            return {**base, "user": cands[idx], "ended_speaker": bool(flags[idx]), "block": block,
+                    "guard_reasons": reasons, "guard_extra": n_extra,
+                    "no_survivor": reasons is not None and eligible is None,
+                    "selected_index": idx, "n_candidates": len(cands), "speaker_fit": fit0}
+
+        def respond(t, text):
+            S["hist_u"].append(text)
+            msgs = []
+            for i, u in enumerate(S["hist_u"]):
+                msgs.append({"role": "user", "content": u})
+                if i < len(S["hist_a"]):
+                    msgs.append({"role": "assistant", "content": S["hist_a"][i]})
+            reply = self.r0.reply(msgs)
+            prev_reply = S["hist_a"][-1] if S["hist_a"] else ""
+            S["hist_a"].append(reply)
+            ledger.update(t, text, reply)
+            led.observe({}, reply, prev_reply)
+            ag.retire_satisfied(reply, {})
+            if AG.looks_like_new_offer(reply, prev_reply):
+                ag.reset_on_new_offer()
+            S["prev_block"] = S["block"]
+            S["cov"].append((t, (round(ledger.coverage(), 4), bool(ledger.complete()))))
+            return reply
+
+        ep = run_episode(T_MAX, None, speak, respond)
+        after, last = dict(S["cov"]), (0.0, False)
+        for step in ep["trace"]:
+            last = after.get(step["t"], last)
+            step["coverage_after"], step["complete_after"] = last
+        return {"conversation_id": conversation_id, "record_id": rid, "seed": seed, "arm": arm,
+                "replicate": replicate, "speaker_kind": "ditto", "planner_path": planner.path,
+                "planner_adapter": planner.adapter, "planner_temperature": planner_temperature,
+                "emitted_user_turns": ep["emitted_user_turns"], "decision_steps": ep["decision_steps"],
+                "end_kind": ep["end_kind"], "turns": ep["emitted_user_turns"], "stop_kind": ep["end_kind"],
+                "ended_by_token": ep["end_kind"] != "t_max",
+                "coverage": round(ledger.coverage(), 4), "complete": ledger.complete(),
+                "n_req": len(self.reqs[conversation_id]["req"]), "ledger": ledger.as_dict(), "trace": ep["trace"]}
