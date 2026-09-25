@@ -298,6 +298,10 @@ def system_prompt_pend(implicit_profile=False):
     s = _replace_once(s, NEW_STOP_FIELDS, NEW_STOP_FIELDS_PEND)
     if implicit_profile:
         s = _replace_once(s, CRITIQUE_FIELD, CRITIQUE_FIELD + PROFILE_NOTE_FIELD)
+        # the Speaker now also receives the notes and a few example messages: say so
+        s = _replace_once(s, "and it sees only the state you write.",
+                          "and it sees the state you write, your notes on how this person writes, and a few "
+                          "real messages from other people with a similar style.")
     return s
 
 
@@ -389,8 +393,53 @@ def read_plan_pend(raw, turn, scenario, rng, ledger):
             diag["end_act_from_complete_entry"] = True
         else:
             diag["end_without_complete_entry"] = True
+    elif fields.get("move") == "Complete":
+        # the reverse inconsistency: a Complete (closing) act drawn while the Planner decided to go on.
+        # Redraw the act from the Planner's own NON-Complete entries (renormalised), so the message and
+        # the decision agree (approved by the user 2026-09-25; recorded in diag).
+        rest = []
+        for e in (d.get("act_distribution") or []):
+            if not isinstance(e, dict):
+                continue
+            mv, ac = acts.normalise(str(e.get("move", "")), str(e.get("act", "")))
+            try:
+                p = float(e.get("p", 0) or 0)
+            except (TypeError, ValueError):
+                p = 0.0
+            if mv not in ("Complete", "Other") and p > 0:
+                rest.append((p, mv, ac, e.get("length_words")))
+        diag["complete_without_end"] = [fields.get("move"), fields.get("act")]
+        if rest:
+            x = (rng or __import__("random")).random() * sum(r[0] for r in rest)
+            acc = 0.0
+            pick = rest[-1]
+            for r in rest:
+                acc += r[0]
+                if x <= acc:
+                    pick = r
+                    break
+            _, mv, ac, lw = pick
+            fields["move"], fields["act"] = mv, ac
+            b = acts.bench_of(ac, turn)
+            fields["bench_act"] = ("%s / %s" % b) if b else "(unmapped)"
+            try:
+                lwi = int(round(float(lw)))
+            except (TypeError, ValueError):
+                lwi = None
+            if lwi is not None and lwi > 0:
+                fields["length_words"] = lwi
+            else:
+                fields.pop("length_words", None)     # never keep the Complete entry's length
+            diag["complete_redrawn_to"] = [mv, ac]
+    fields["last_message"] = bool(end)
     return fields, diag, end
 
 
+LAST_MESSAGE_LINE = "\n- this is their last message: they close the conversation with it and then leave"
+
+
 def speaker_block_pend(fields):
-    return PP.render_block(fields, (fields.get("still_wanted") or "(nothing named)", ""))
+    blk = PP.render_block(fields, (fields.get("still_wanted") or "(nothing named)", ""))
+    if fields.get("last_message"):
+        blk += LAST_MESSAGE_LINE            # the closing signal is explicit, not only implied by the act
+    return blk

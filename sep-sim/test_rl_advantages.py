@@ -211,8 +211,11 @@ def test_dry_run_fixed_and_llm_controllers_run():
         upd = T.read_jsonl(os.path.join(o1, "updates.jsonl"))
         assert upd[0]["cfg_used"] == upd[1]["cfg_used"]                     # fixed: nothing moves
         o2 = os.path.join(d, "llm")
-        run_ok(args(sp, o2, controller="llm", updates=2))
-        assert len(T.read_jsonl(os.path.join(o2, "llm_controller.jsonl"))) == 2
+        run_ok(args(sp, o2, controller="llm", updates=5))
+        # v4 reward -> the factor controller: one decision every 5 updates, factors from the allowed set
+        log = T.read_jsonl(os.path.join(o2, "llm_controller.jsonl"))
+        assert len(log) == 1 and log[0]["ok"] and log[0]["changed"]
+        assert all(v["factor"] == 1.25 for v in log[0]["applied"].values())
     finally:
         shutil.rmtree(d, ignore_errors=True)
 

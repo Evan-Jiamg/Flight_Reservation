@@ -164,7 +164,7 @@ def load_jsonl(path, rep):
                 try:
                     r = json.loads(line)
                     rep.ok("io.parse", True)
-                    if r.get("kind") == "summary":
+                    if r.get("kind") in ("summary", "task1"):
                         continue
                     if isinstance(r.get("episode"), dict) and "trace" in r["episode"]:
                         ep = dict(r["episode"])
@@ -377,6 +377,8 @@ def check_truncation(rows, arm, meta, speaker_budget, judge_budget, max_new_warn
             rep.ok("trunc.planner", n is not None and b is not None and n <= b, w,
                    "prompt_tokens %s budget %s" % (n, b))
             n_pc += bool(pf.get("compacted"))
+            if arm == "pend":
+                rep.ok("trunc.planner_compacted", not pf.get("compacted"), w, "Planner prompt compacted (history dropped)")
             if "planner_hit_max_new" in s:
                 n_hit_known += 1
                 n_hit += bool(s["planner_hit_max_new"])
@@ -389,6 +391,17 @@ def check_truncation(rows, arm, meta, speaker_budget, judge_budget, max_new_warn
                     rep.ok("trunc.speaker", tok is not None and tok <= speaker_budget, w,
                            "speaker tokens %s budget %s" % (tok, speaker_budget))
                     n_sc += bool(sf.get("compacted"))
+                    if arm == "pend":
+                        fits = s.get("speaker_fits")
+                        rep.ok("trunc.speaker_fits_recorded", isinstance(fits, list) and len(fits) == len(s.get("candidates") or []),
+                               w, "per-candidate speaker_fits missing")
+                        for j, f in enumerate(fits or []):
+                            f = f or {}
+                            tk = f.get("final_tokens") if f.get("compacted") else f.get("original_tokens")
+                            rep.ok("trunc.speaker", tk is not None and tk <= speaker_budget, w,
+                                   "candidate %d speaker tokens %s budget %s" % (j, tk, speaker_budget))
+                            rep.ok("trunc.speaker_compacted", not f.get("compacted"), w,
+                                   "candidate %d Speaker prompt compacted (history dropped)" % j)
             gs = s.get("goal_status")
             if arm in V3_ARMS and isinstance(gs, dict) and gs.get("status") != "NOT ASSESSED":
                 pt = gs.get("prompt_tokens")
@@ -514,6 +527,32 @@ def check_pend(rows, rep, arm="pend"):
             rep.ok("pend.no_stop_override", d.get("stop_override") is not True, w, "stop override applied")
             n_end += ended
     rep.note("pend.end_session", "Planner ends %d; unparsed plans %d" % (n_end, n_unparsed))
+    for r in rows:
+        w = "%s s%s" % (str(r.get("conversation_id"))[:12], r.get("seed"))
+        rep.ok("pend.zero_turns", (r.get("emitted_user_turns") or 0) > 0, w, "episode with no emitted message")
+        if "clean" in r or "episode_counters" in r:
+            c = r.get("episode_counters") or {}
+            exp = (c.get("r0_len_truncated", 0) == 0 and c.get("judge_empty", 0) == 0 and c.get("judge_unparseable", 0) == 0
+                   and not r.get("emitted_capped_steps") and (r.get("emitted_user_turns") or 0) > 0)
+            rep.ok("pend.clean_flag", r.get("clean") is exp, w, "clean %r but counters %r" % (r.get("clean"), c))
+        else:
+            rep.ok("pend.clean_flag", False, w, "episode has no clean flag / per-episode counters")
+        for s in r.get("trace") or []:
+            ws = "%s t%s" % (w, s.get("t"))
+            rep.ok("trunc.emitted_capped", not s.get("emitted_capped"), ws, "a capped (cut) message was emitted")
+            g = s.get("planner_gen")
+            if isinstance(g, dict):
+                d = s.get("planner_diag") or {}
+                decision = (not s.get("planner_unparsed") and not g.get("hit_max_new") and s.get("t", 0) >= 2
+                            and d.get("end_session_valid") is True and not d.get("end_session_t1_ignored"))
+                if not decision:
+                    rep.ok("rl.stop_mask_gated", g.get("stop_mask") is None, ws,
+                           "stop credit on a step that is not a decision (unparsed / capped / turn 1 / invalid)")
+                for key in ("stop_mask", "note_mask"):
+                    m = g.get(key)
+                    if m is not None:
+                        rep.ok("rl.mask_length", len(m) == len(g.get("gen_ids") or []) and 1 in m, ws,
+                               "%s length %d != %d generated tokens (or empty)" % (key, len(m), len(g.get("gen_ids") or [])))
     # generation-stage checks (fields written by Task2Env._pend_generate)
     import implicit_profile as IP
     n_hit_sel = n_hit_any = n_cand = n_dup_left = 0
@@ -665,11 +704,16 @@ def verify(episodes, meta_path, splits_path, fold, split, arm=None, training=Fal
                        w, "Task 1 training group on a non-train conversation")
                 rep.ok("rl.task1_groups", r.get("real_final") == (r.get("t") == r.get("n_real")) and r.get("samples"), w,
                        "real_final must be exactly t == n_real, with samples")
+                rep.ok("rl.task1_groups", (r.get("t") or 0) >= 2, w, "Task 1 stop group at turn 1 (cannot end)")
                 for x in r.get("samples") or []:
                     g = x.get("planner_gen") or {}
+                    valid = x.get("decision_valid", True)
+                    exp = float(valid and bool(x.get("ended_planner")) == bool(r.get("real_final")))
                     rep.ok("rl.task1_groups", bool(g.get("prompt_ids")) and bool(g.get("gen_ids")) and
-                           x.get("reward") == float(bool(x.get("ended_planner")) == bool(r.get("real_final"))), w,
+                           x.get("reward") == exp, w,
                            "sample without generation ids or with a reward that disagrees with the label")
+                    if not valid:
+                        rep.ok("rl.stop_mask_gated", g.get("stop_mask") is None, w, "stop mask on a non-decision sample")
             rep.note("rl.task1_groups", "%d Task 1 groups" % len(t1rows))
         rep.ok("rl.rollouts_present", bool(files), rl_dir, "no rollouts*.jsonl")
         for p in files:
@@ -692,7 +736,38 @@ def verify(episodes, meta_path, splits_path, fold, split, arm=None, training=Fal
     {"a2": check_a2, "pend": check_pend, "a0": check_a0}[check_family(arm)](all_rows, rep, arm)
     if rl_dir:
         check_rl(rl_dir, rollouts, ckpt_pattern, rep)
+        check_rl_selection(rl_dir, splits, fold, rep)
     return rep
+
+
+def check_rl_selection(rl_dir, splits, fold, rep):
+    """validation.jsonl only on validation ids (never train, never test); best.json and manifests present."""
+    folds = {int(f["fold"]): f for f in splits["folds"]}
+    f = folds.get(fold, {})
+    val, train_all = set(f.get("validation", [])), set(f.get("train_all", f.get("train", [])))
+    vp = os.path.join(rl_dir, "validation.jsonl")
+    if rep.ok("rl.validation_present", os.path.exists(vp), vp, "missing"):
+        n = 0
+        for line in open(vp, encoding="utf-8"):
+            if not line.strip():
+                continue
+            r = json.loads(line)
+            if r.get("kind") in ("episode", "task1"):
+                n += 1
+                cid = r.get("conversation_id")
+                rep.ok("leak.validation_ids", cid in val and cid not in train_all, "validation %s" % str(cid)[:12],
+                       "validation row on a non-validation id")
+        rep.note("rl.validation_present", "%d validation rows" % n)
+    rep.ok("rl.best", os.path.exists(os.path.join(rl_dir, "best.json")), rl_dir, "best.json missing")
+    for d in sorted(glob.glob(os.path.join(rl_dir, "ckpt", "u*"))):
+        if d.endswith(".tmp"):
+            continue
+        mp = os.path.join(d, "rl_manifest.json")
+        if rep.ok("rl.manifest", os.path.exists(mp), d, "rl_manifest.json missing"):
+            m = json.load(open(mp, encoding="utf-8"))
+            forb = set(f.get("forbidden_for_training", []))
+            rep.ok("leak.manifest", not (set(m.get("train_scenarios", [])) | set(m.get("train_conversations", []))
+                                         | set(m.get("fewshot_pool", []))) & forb, d, "manifest lists a forbidden id")
 
 
 def main(argv=None):

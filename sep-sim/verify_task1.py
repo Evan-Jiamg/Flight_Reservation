@@ -9,6 +9,9 @@ FAIL (exit 1) on:
               runs) from a validation/test conversation
   profile     a profile note on turn 1 (there is no earlier message to compare with)
   selection   the selected candidate failed a guard while another passed
+  compaction  any Planner or Speaker (any candidate) prompt compacted -- no history is ever dropped
+  M2          greedy_ended != (Speaker blank at t OR Planner end at t-1); K+1 ended != (end at n OR blank)
+  capped      a capped (cut) message emitted
 WARN on: Planner max_new hits > 2%, unparsed plans, any candidate cut by the Speaker cap, duplicate
 first-turn candidates left after redraws.
 """
@@ -30,6 +33,19 @@ class Rep:
         if not cond:
             self.fail.append("%s: %s" % (name, msg))
         return cond
+
+
+def check_fits(rep, w, r, pb, sb):
+    pf = r.get("planner_fit") or {}
+    rep.ok("compaction.planner", not pf.get("compacted"), "%s Planner prompt compacted" % w)
+    fits = r.get("speaker_fits")
+    if rep.ok("trunc.speaker_fits_recorded", isinstance(fits, list) and fits, "%s speaker_fits missing" % w):
+        for j, f in enumerate(fits):
+            f = f or {}
+            tk = f.get("final_tokens") if f.get("compacted") else f.get("original_tokens")
+            rep.ok("trunc.speaker", tk is not None and tk <= sb, "%s candidate %d speaker prompt %s > %s" % (w, j, tk, sb))
+            rep.ok("compaction.speaker", not f.get("compacted"), "%s candidate %d Speaker prompt compacted" % (w, j))
+    rep.ok("capped", not r.get("emitted_capped"), "%s a capped message was emitted" % w)
 
 
 def main(argv=None):
@@ -89,7 +105,15 @@ def main(argv=None):
                 rep.ok("trunc.speaker_selected", not hits[r["selected_index"]], "%s selected candidate cut by the cap" % w)
             n_hit += bool(r.get("planner_hit_max_new"))
             n_steps += 1
-        for r in rs:
+            last = max(rs, key=lambda x: x["turn_index"]) if rs else None
+            if last is not None:
+                exp = bool(last.get("planner_ends_session")) or bool(r.get("ended_speaker"))
+                rep.ok("M2", r.get("end_mapping") == "M2" and bool(r.get("ended")) == exp and bool(r.get("greedy_ended")) == exp,
+                       "%s K+1 ended %r != end at n %r OR blank %r" % (w, r.get("ended"), last.get("planner_ends_session"),
+                                                                       r.get("ended_speaker")))
+            check_fits(rep, w, r, pb, sb)
+        prev_dec = False
+        for r in sorted(rs, key=lambda x: x["turn_index"]):
             w = "%s t%d" % (cid[:10], r["turn_index"])
             n_steps += 1
             n_hit += bool(r.get("planner_hit_max_new"))
@@ -107,6 +131,17 @@ def main(argv=None):
                 n_cand_hit += sum(bool(h) for h in hits)
                 si = r.get("selected_index")
                 rep.ok("trunc.speaker_selected", si is None or not hits[si], "%s selected candidate cut by the cap" % w)
+            exp = bool(r.get("speaker_ended")) or prev_dec
+            rep.ok("M2", r.get("end_mapping") == "M2" and bool(r.get("greedy_ended")) == exp
+                   and bool(r.get("ended_by_prev_decision")) == prev_dec, "%s greedy_ended %r != blank %r OR end at t-1 %r" % (
+                       w, r.get("greedy_ended"), r.get("speaker_ended"), prev_dec))
+            se = r.get("samples_speaker_ended")
+            if isinstance(se, list):
+                rep.ok("M2", [bool(x) or prev_dec for x in se] == [bool(x) for x in (r.get("samples_ended") or [])], w,
+                       "samples_ended does not follow M2")
+            prev_dec = bool(r.get("planner_ends_session"))
+            rep.ok("planner_diag", isinstance(r.get("planner_diag"), dict), w, "planner_diag missing")
+            check_fits(rep, w, r, pb, sb)
             reasons = r.get("guard_reasons") or []
             elig = [i for i, x in enumerate(reasons) if not x]
             if elig and r.get("selected_index") is not None:

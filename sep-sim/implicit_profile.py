@@ -81,13 +81,24 @@ def render_planner_sections(notes, ctx):
     s = IP_HEAD + ("\n".join("- " + n for n in notes) if notes else "- (no notes yet)")
     if ctx and ctx.get("mode") == "task1":
         s += (T1_HEAD + "- you predicted: \"%s\"\n- they really wrote the last USER message below\n- measured: %s\n"
-              "- in profile_note, say how their real message differs from yours and what to do differently"
+              "- in profile_note, describe how their real message differs from yours in the way they write"
               % (" ".join((ctx["pred_prev"] or "").split()), measured_diff(ctx["pred_prev"], ctx["gold_prev"])))
     elif ctx and ctx.get("mode") == "task2":
         s += (T2_HEAD + "- the last USER message below is the one you produced for them\n"
-              "- in profile_note, judge it against who this person is, your notes, and how the assistant "
-              "responded to it, and say what to do differently")
+              "- in profile_note, judge how it is written against who this person is, your notes, and how the "
+              "assistant responded to it; describe the way they write, not what the assistant should do")
     return s
+
+
+def profile_entry(message_no, measured, note):
+    """One Implicit Profile record for message `message_no`: the deterministic measured difference
+    (Task 1 only) and the Planner's own note; either may be empty. '' when both are."""
+    parts = []
+    if measured:
+        parts.append("measured: " + measured)
+    if note:
+        parts.append(note)
+    return ("(message %d) " % message_no + " | ".join(parts)) if parts else ""
 
 
 def clean_note(note):
@@ -168,6 +179,8 @@ class FewShotPool:
         if cid not in self.goal_of or cid not in self.persona_of:
             raise KeyError("conversation %s has no goal/persona id: the exclusion rule cannot be applied" % cid)
         g, p = self.goal_of[cid], self.persona_of[cid]
+        if g is None or p is None:
+            raise KeyError("conversation %s has an empty goal/persona id: the exclusion rule cannot be applied" % cid)
         allowed = [x for x in self.items if x["cid"] != cid
                    and (g is None or self.goal_of.get(x["cid"]) != g)
                    and (p is None or self.persona_of.get(x["cid"]) != p)]

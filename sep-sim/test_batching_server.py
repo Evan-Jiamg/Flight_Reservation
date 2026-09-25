@@ -59,8 +59,28 @@ def main():
         gap = abs(float(lp[ta] - lp[tb]))
         log("   divergence at %d: logp single-token %.3f batch-token %.3f gap %.3f" % (j, float(lp[ta]), float(lp[tb]), gap))
         assert j >= 8, "divergence in the first tokens: position/padding bug"
-        assert gap < 0.5, "batched greedy picked a clearly worse token (gap %.3f): not a numerical tie" % gap
-    _ = RA
+    # distribution-level check: teacher-forced log-probs of the batch-generated tokens, computed LEFT-PADDED
+    # in one batch (as generation saw them) vs UNPADDED one by one (as the learner computes them)
+    dev = next(planner.model.parameters()).device
+    seqs = [b["prompt_ids"] + b["gen_ids"] for b in batch]
+    L = max(len(s) for s in seqs)
+    pad = planner.tok.pad_token_id
+    x = torch.tensor([[pad] * (L - len(s)) + s for s in seqs], device=dev)
+    m = torch.tensor([[0] * (L - len(s)) + [1] * len(s) for s in seqs], device=dev)
+    pos = (m.cumsum(-1) - 1).clamp(min=0)
+    with torch.no_grad():
+        lg = planner.model(input_ids=x, attention_mask=m, position_ids=pos).logits.float()
+    diffs = []
+    for i, b in enumerate(batch):
+        g = len(b["gen_ids"])
+        lp_pad = torch.log_softmax(lg[i, L - g - 1:L - 1], -1).gather(-1, torch.tensor(b["gen_ids"], device=dev)[:, None])[:, 0]
+        lp_one = RA.token_logprobs(planner.model, b["prompt_ids"], b["gen_ids"], 1.0)[0].detach().float()
+        diffs.append((lp_pad - lp_one).abs().cpu())
+    d = torch.cat(diffs)
+    frac = float((d > 0.5).float().mean())
+    log("   padded-batch vs unpadded logp over %d generated tokens: mean |d| %.4f, p99 %.4f, max %.3f, share > 0.5: %.4f" % (
+        d.numel(), float(d.mean()), float(d.quantile(0.99)), float(d.max()), frac))
+    assert float(d.mean()) < 0.05 and frac < 0.01, "left-padded batch computes a different distribution: padding bug"
     eos = planner.eos_ids()
     for b in batch:
         assert b["hit_max_new"] or b["gen_ids"][-1] in eos, "batched output not cut at the end token"

@@ -128,7 +128,8 @@ def episode_samples(episode, policy_version=None):
         out.append({"conversation_id": episode["conversation_id"], "replicate": episode.get("replicate"),
                     "t": step["t"], "prompt_ids": list(g["prompt_ids"]), "gen_ids": list(g["gen_ids"]),
                     "temperature": float(g["temperature"]), "policy_version": policy_version,
-                    "stop_mask": list(g["stop_mask"]) if g.get("stop_mask") is not None else None})
+                    "stop_mask": list(g["stop_mask"]) if g.get("stop_mask") is not None else None,
+                    "note_mask": list(g["note_mask"]) if g.get("note_mask") is not None else None})
     return out
 
 
@@ -338,6 +339,12 @@ class TorchLearner:
                     # per-token advantage: the sequence advantage on every token, plus the stop
                     # advantage on the tokens of the end_session value only (stop credit assignment)
                     adv = torch.full_like(logp, float(s["adv"]))
+                    if s.get("note_mask") and float(s["adv"]) != 0.0:
+                        # D4: the profile_note tokens carry no sequence advantage (only the KL term)
+                        nm = torch.tensor(s["note_mask"], dtype=logp.dtype, device=logp.device)
+                        if nm.shape != logp.shape:
+                            raise AssertionError("note_mask length %d != %d generated tokens" % (nm.shape[0], logp.shape[0]))
+                        adv = adv * (1.0 - nm)
                     if s.get("adv_stop") and s.get("stop_mask"):
                         m = torch.tensor(s["stop_mask"], dtype=logp.dtype, device=logp.device)
                         if m.shape != logp.shape:

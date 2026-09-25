@@ -92,6 +92,50 @@ JUDGE_MIN_TOKENS = int(os.environ.get("JUDGE_MIN_TOKENS", "4000"))
 
 
 R0_CONTEXT = int(os.environ.get("R0_CONTEXT", "12288"))     # gpt-oss-120b on the vLLM server: max_model_len
+JUDGE_RETRY_TOKENS = int(os.environ.get("JUDGE_RETRY_TOKENS", "8000"))   # one re-request of an unparseable verdict
+
+# Per-episode counters of R0 / ledger-judge incidents. Episodes run one per thread and every R0 and
+# ledger call of an episode is made on that episode's thread, so a thread-local dict attributes each
+# incident to exactly one episode (the *_total counters on the clients stay process-wide).
+_EP = threading.local()
+EPISODE_COUNTERS = ("r0_len_retries", "r0_len_truncated", "r0_ctx_fit",
+                    "judge_empty", "judge_unparseable", "judge_retries")
+
+
+def episode_begin():
+    _EP.counts = {k: 0 for k in EPISODE_COUNTERS}
+
+
+def episode_end():
+    c = getattr(_EP, "counts", None)
+    _EP.counts = None
+    return dict(c) if c else {k: 0 for k in EPISODE_COUNTERS}
+
+
+def _ep_count(name):
+    c = getattr(_EP, "counts", None)
+    if c is not None:
+        c[name] += 1
+
+
+def rl_masks(planner, g, unparsed, diag, t):
+    """(stop_mask, note_mask) for one Planner generation.
+    stop_mask gets stop credit only for a REAL decision: None when the output was not parsed, was cut by
+    the token cap, has no valid end_session value, is turn 1 (cannot end; the answer is ignored), or its
+    turn-1 end was ignored. note_mask marks the profile_note value (kept out of the sequence advantage,
+    D4); None when absent."""
+    diag = diag or {}
+    ok = not unparsed and not g.get("hit_max_new") and t >= 2 and diag.get("end_session_valid") is True \
+        and not diag.get("end_session_t1_ignored") and not diag.get("cut_by_max_new")
+    sm = planner.stop_mask(g["gen_ids"]) if ok else None
+    nm = None if g.get("hit_max_new") else planner.field_mask(g["gen_ids"], "profile_note")
+    return sm, nm
+
+
+def episode_clean(counts):
+    """An episode may enter a reward group only if no R0 reply was cut and no ledger verdict was lost."""
+    return counts.get("r0_len_truncated", 0) == 0 and counts.get("judge_empty", 0) == 0 \
+        and counts.get("judge_unparseable", 0) == 0
 
 
 def prompt_tokens_from_error(msg):
@@ -142,6 +186,7 @@ def make_tracking_r0(R0Client):
                 body = dict(body, **{key: room})
                 with self._tlock:
                     self.n_ctx_fit += 1
+                _ep_count("r0_ctx_fit")
                 return super()._post(body), body
 
         def _post(self, body):
@@ -160,11 +205,13 @@ def make_tracking_r0(R0Client):
                 if tries >= 3 or new <= cur:
                     with self._tlock:
                         self.n_len_truncated += 1
+                    _ep_count("r0_len_truncated")
                     return data
                 body = dict(body, **{key: new})
                 tries += 1
                 with self._tlock:
                     self.n_len_retries += 1
+                _ep_count("r0_len_retries")
                 data, body = self._post_fit(body)
     return TrackingR0
 
@@ -187,17 +234,26 @@ def make_floor_judge(Judge):
             super().__init__(*a, **kw)
             self.gpt5 = str(self.model).startswith("gpt-5")
             self.floor = None if self.gpt5 else JUDGE_MIN_TOKENS
-            self.n_empty = self.n_unparseable = 0
+            self.n_empty = self.n_unparseable = self.n_retries = 0
             self._lock = threading.Lock()
 
         def chat(self, system, user, max_tokens=400):
-            out = super().chat(system, user, max(max_tokens, self.floor) if self.floor else max_tokens)
+            budget = max(max_tokens, self.floor) if self.floor else max_tokens
+            out = super().chat(system, user, budget)
+            if not _parses_as_object(out) and not self.gpt5 and JUDGE_RETRY_TOKENS > budget:
+                # one re-request at a larger budget (an answer cut by the budget is the usual cause)
+                with self._lock:
+                    self.n_retries += 1
+                _ep_count("judge_retries")
+                out = super().chat(system, user, JUDGE_RETRY_TOKENS)
             if not (out or "").strip():
                 with self._lock:
                     self.n_empty += 1
+                _ep_count("judge_empty")
             elif not _parses_as_object(out):
                 with self._lock:
-                    self.n_unparseable += 1          # e.g. an answer cut by the budget: the Ledger credits nothing
+                    self.n_unparseable += 1          # the Ledger credits nothing: the episode leaves the reward groups
+                _ep_count("judge_unparseable")
             return out
     return FloorJudge
 
@@ -340,6 +396,29 @@ class PlannerLM:
                                 "batch_seed": int(items[0]["seed"]) if (t0 and t0 > 0) else None},
                         "hit_max_new": cut is None and len(gen) >= self.max_new})
         return res
+
+    def field_mask(self, gen_ids, field):
+        """1 on the generated tokens that spell the string VALUE of a JSON field (e.g. profile_note),
+        located as in stop_mask; None when the field is absent."""
+        import re
+        ids = list(gen_ids)
+        full = self.tok.decode(ids, skip_special_tokens=False)
+        m = re.search(r'"%s"\s*:\s*"((?:[^"\\]|\\.)*)"' % re.escape(field), full)
+        if not m or m.end(1) <= m.start(1):
+            return None
+        a, b = m.start(1), m.end(1)
+
+        def first_token_covering(pos):
+            lo, hi = 1, len(ids)
+            while lo < hi:
+                mid = (lo + hi) // 2
+                if len(self.tok.decode(ids[:mid], skip_special_tokens=False)) > pos:
+                    hi = mid
+                else:
+                    lo = mid + 1
+            return lo - 1
+        i, j = first_token_covering(a), first_token_covering(b - 1)
+        return [1 if i <= k <= j else 0 for k in range(len(ids))]
 
     def stop_target(self, gen_ids, mask, want_end):
         """Supervision target for the end_session value: the policy's own prefix up to the value, and the
@@ -523,7 +602,7 @@ class Task2Env:
                 # dialect; for other models (gpt-oss on vLLM) the server's default effort applies
                 "r0_reasoning_effort": self.r0_effort if getattr(self.r0, "gpt5_dialect", True) else "server default (not sent)",
                 "judge_reasoning_effort": self.judge_effort if self.ledger_judge.gpt5 else "server default (not sent)",
-                "ledger_judge_min_tokens": self.ledger_judge.floor, "ledger_judge_empty": self.ledger_judge.n_empty,
+                "ledger_judge_min_tokens": self.ledger_judge.floor, "ledger_judge_retry_tokens": JUDGE_RETRY_TOKENS,
                 "act_prior": os.environ["SEPSIM_ACT_PRIOR"], "v2fix": V2FIX, "t_max": T_MAX,
                 "tree": tree_of(self.arm), "arm_env": ARM_ENV[self.arm], "t1_sampling": self.t1_sampling,
                 "implicit_profile": self.ip, "fewshot": self.fewshot.describe() if self.fewshot else None,
@@ -552,7 +631,7 @@ class Task2Env:
                                              str((scenario.get("goal") or {}).get("context", ""))]), 8))
         ledger = Ledger(self.reqs[conversation_id]["req"], judge=self.ledger_judge) if with_ledger else None
         S = {"hist_u": [], "hist_a": [], "prev_block": state.d0(P.initial_stage(scenario.get("goal"))),
-             "block": None, "cov": [], "mode": "task2", "ip_notes": [], "ip_ctx": None}
+             "block": None, "cov": [], "mode": "task2", "ip_notes": [], "ip_ctx": None, "ip_last_note": None}
         import implicit_profile as IP
 
         def speak(t):
@@ -600,25 +679,39 @@ class Task2Env:
             else:
                 fields, diag = PP.read_plan(raw, t, scenario, rng, led)
                 end_session = None
+            if g["hit_max_new"] and fields is not None:
+                # a generation cut by the token cap is not a decision: treated as unparsed (no end, no note)
+                diag = dict(diag or {}, cut_by_max_new=True)
+                fields, end_session = None, False
             unparsed = fields is None
             if unparsed:
                 fields = {"move": "Other", "act": "other"}
             ended = bool(end_session) if (v3 or arm == "pend") else bool(state.ends_session(fields))
-            note = ""
-            if self.ip and t >= 2 and not unparsed:
-                note = IP.clean_note(fields.get("profile_note"))
-                if note and not (S["ip_notes"] and IP.norm_text(S["ip_notes"][-1]) == IP.norm_text(note)):
-                    S["ip_notes"].append(note)          # an exact repeat of the last note adds nothing
+            note, entry = "", ""
+            if self.ip and t >= 2:
+                note = "" if unparsed else IP.clean_note(fields.get("profile_note"))
+                if note and S["ip_last_note"] is not None and IP.norm_text(S["ip_last_note"]) == IP.norm_text(note):
+                    note = ""                           # an exact repeat of the last note adds nothing
+                elif note:
+                    S["ip_last_note"] = note
+                ctx = S["ip_ctx"] if S["mode"] == "task1" else None
+                measured = IP.measured_diff(ctx["pred_prev"], ctx["gold_prev"]) if ctx else ""
+                entry = IP.profile_entry(t - 1, measured, note)
+                if entry:
+                    S["ip_notes"].append(entry)
             base = {"planner_prompt": g["prompt_text"], "planner_fit": g["fit"], "planner_raw": raw,
                     "planner_hit_max_new": g["hit_max_new"], "planner_diag": diag,
                     "planner_unparsed": unparsed, "ended_planner": ended,
                     "move": fields.get("move", ""), "act": fields.get("act", ""),
                     "stop_rule": fields.get("stop_rule", "none"), "goal_status": gs, "self_judge": self_judge,
                     "goal_met": fields.get("goal_met"), "still_wanted": fields.get("still_wanted"),
-                    "profile_note": note if self.ip else None, "ip_notes_n": len(S["ip_notes"]) if self.ip else None,
+                    "profile_note": note if self.ip else None, "profile_entry": entry if self.ip else None,
+                    "ip_notes_n": len(S["ip_notes"]) if self.ip else None,
                     "ledger_before": {"turns": led.turns, "gain_trace": list(led.gain_trace)}}
             if record_generation:
-                base["planner_gen"] = {"prompt_ids": g["prompt_ids"], "gen_ids": g["gen_ids"], "stop_mask": planner.stop_mask(g["gen_ids"]),
+                sm, nm = rl_masks(planner, g, unparsed, diag, t)
+                base["planner_gen"] = {"prompt_ids": g["prompt_ids"], "gen_ids": g["gen_ids"], "stop_mask": sm,
+                                       "note_mask": nm, "hit_max_new": g["hit_max_new"],
                                        "temperature": planner_temperature, "top_p": planner_top_p, "seed": pseed}
             if v3 and ended:
                 return {**base, "planner_stop": True, "user": ""}
@@ -735,7 +828,8 @@ class Task2Env:
             return self.fewshot.select(cid, persona, t, variant=variant) if self.fewshot else []
 
         def block_for(ex):
-            if unparsed or not (notes or ex):
+            # an unparsed turn keeps the Planner's previous block, and still gets the notes and examples
+            if not (notes or ex):
                 return block
             return block + IP.speaker_lines(notes, ex)
 
@@ -808,17 +902,25 @@ class Task2Env:
             reasons.append(reason_of(len(cands) - 1))
             n_extra += 1
         eligible = [i for i, x in enumerate(reasons) if not x] or None
+        # no survivor: choose among the candidates that were at least produced whole and are not blank;
+        # a capped (cut) text is never emitted unless nothing else exists (then recorded, verify FAILs)
+        pool = eligible
+        fallback = None
+        if eligible is None:
+            whole = [i for i in range(len(cands)) if not hits[i]]
+            pool = [i for i in whole if (cands[i] or "").strip()] or whole or None
+            fallback = "whole_nonblank" if pool and any((cands[i] or "").strip() for i in pool) else \
+                ("whole_blank" if pool else "all_capped")
         sel = None
         if self.selector == "borda":
             own = S["mode"] == "task1" and t >= 2
             refs = list(hist_u) if own else [e["text"] for e in all_examples()]
-            idx, sel = SS.select(cands, eligible, fields.get("length_words"), refs, self.style_scorer)
+            idx, sel = SS.select(cands, pool, fields.get("length_words"), refs, self.style_scorer)
             sel["refs"] = "own_real_messages" if own else ("fewshot" if refs else "none")
         else:
-            idx = run_v2.choose(cands, fields.get("length_words"), None, eligible)
+            idx = run_v2.choose(cands, fields.get("length_words"), None, pool)
             if z1:
-                pool = eligible if eligible else list(range(len(cands)))
-                idx = random.Random(pipeline.seed_for(sid, t, 97)).choice(pool)
+                idx = random.Random(pipeline.seed_for(sid, t, 97)).choice(pool or list(range(len(cands))))
 
         def fit_tokens(f):
             if not isinstance(f, dict):
@@ -827,8 +929,9 @@ class Task2Env:
         worst = max(range(len(fits)), key=lambda i: fit_tokens(fits[i]))
         return {**base, "user": cands[idx], "ended_speaker": bool(flags[idx]), "block": block, "t1_sampled": z1,
                 "guard_reasons": reasons, "guard_extra": n_extra, "dup_redraws": dup_redraws,
-                "no_survivor": eligible is None, "selected_index": idx, "n_candidates": len(cands),
-                "speaker_fit": fits[worst], "speaker_hit_max_new": hits, "selection": sel,
+                "no_survivor": eligible is None, "no_survivor_fallback": fallback,
+                "emitted_capped": bool(hits[idx]), "selected_index": idx, "n_candidates": len(cands),
+                "speaker_fit": fits[worst], "speaker_fits": list(fits), "speaker_hit_max_new": hits, "selection": sel,
                 "candidates": list(cands), "candidates_ended": [bool(f) for f in flags],
                 "fewshot": [[[e["cid"], e["t"]] for e in ex] for ex in slot_ex] if self.fewshot else None,
                 "speaker_block_selected": slot_blk[idx] if slot_blk[idx] != block else None}
@@ -841,7 +944,13 @@ class Task2Env:
         S, speak, respond, ledger, rid = ss["S"], ss["speak"], ss["respond"], ss["ledger"], ss["rid"]
         # e16: E1.6 SEPSIM_PLANNER_END -- the Planner's Complete act ends the episode after the
         # closing message it asked for (emitted, no assistant reply). v3 arms exit silently instead.
-        ep = run_episode(T_MAX, None, speak, respond, planner_end=(arm in EMIT_END_ARMS))
+        episode_begin()
+        try:
+            ep = run_episode(T_MAX, None, speak, respond, planner_end=(arm in EMIT_END_ARMS))
+        finally:
+            counts = episode_end()
+        capped = sum(1 for s in ep["trace"] if s.get("emitted_capped"))
+        clean = episode_clean(counts) and capped == 0 and ep["emitted_user_turns"] > 0
         after, last = dict(S["cov"]), (0.0, False)
         for step in ep["trace"]:
             last = after.get(step["t"], last)
@@ -859,6 +968,8 @@ class Task2Env:
                 "r0_empty_retries_total": getattr(self.r0, "n_empty_retries", None),
                 "r0_len_retries_total": self.r0.n_len_retries, "r0_len_truncated_total": self.r0.n_len_truncated,
                 "r0_ctx_fit_total": self.r0.n_ctx_fit,
+                # this episode's own incidents; an unclean episode never enters a reward group
+                "episode_counters": counts, "emitted_capped_steps": capped, "clean": clean,
                 "human_turns": self.human_turns(conversation_id)}
 
     def task1_generate(self, conversation_id, seed=0, keep_prompts=False):
@@ -878,6 +989,11 @@ class Task2Env:
         preds = []
         goal = rec["scenario"].get("goal") or {}
         rows = []
+        # M2 (user decision D7): the Planner's end at turn t makes message t the LAST one, i.e. the person
+        # sends no message t+1 -> the benchmark END flag (the person stops INSTEAD of writing) is set at row
+        # t+1, and at the K+1 probe for an end decided at the real last turn n. A blank Speaker message at
+        # turn t is END at row t itself (the benchmark convention). The raw decisions stay in the rows.
+        prev_decision = False
         for t in range(1, len(users) + 1):
             # only message t-1 (prediction and real text) may inform turn t
             S["ip_ctx"] = IP.task1_context(real[: t - 1], preds, t) if self.ip else None
@@ -886,24 +1002,32 @@ class Task2Env:
                 raise RuntimeError("silent Planner exit has no Task 1 utterance; use an emit-end arm")
             cands, ends, idx = st["candidates"], st["candidates_ended"], st["selected_index"]
             samples = [c for i, c in enumerate(cands) if i != idx]
-            s_ends = [e for i, e in enumerate(ends) if i != idx]
+            s_blank = [bool(e) for i, e in enumerate(ends) if i != idx]
             rows.append({"record_id": rec["record_id"], "conversation_id": conversation_id, "turn_index": t,
                          "is_first_turn": t == 1, "discipline": goal.get("discipline", "unknown"),
                          "intent_variant": "pend_" + os.path.basename(str(self.planner.path).rstrip("/")),
-                         "greedy": st["user"], "greedy_ended": bool(st["ended_speaker"]) or bool(st["ended_planner"]),
+                         "greedy": st["user"],
+                         "greedy_ended": bool(st["ended_speaker"]) or prev_decision,
+                         "end_mapping": "M2", "ended_by_prev_decision": prev_decision,
                          "speaker_ended": bool(st["ended_speaker"]), "planner_ends_session": bool(st["ended_planner"]),
-                         "samples": samples, "samples_ended": s_ends, "profile": st.get("block"),
+                         "samples": samples, "samples_ended": [b or prev_decision for b in s_blank],
+                         "samples_speaker_ended": s_blank, "profile": st.get("block"),
                          "move": st.get("move"), "act": st.get("act"), "goal_met": st.get("goal_met"),
                          "planner_unparsed": st.get("planner_unparsed"), "planner_hit_max_new": st.get("planner_hit_max_new"),
+                         "planner_diag": st.get("planner_diag"),
                          "planner_fit": st.get("planner_fit"), "speaker_fit": st.get("speaker_fit"),
-                         "guard_no_survivor": st.get("no_survivor"), "planner_adapter": self.planner.adapter,
-                         "profile_note": st.get("profile_note"), "ip_notes_n": st.get("ip_notes_n"),
+                         "speaker_fits": st.get("speaker_fits"), "emitted_capped": st.get("emitted_capped"),
+                         "guard_no_survivor": st.get("no_survivor"), "no_survivor_fallback": st.get("no_survivor_fallback"),
+                         "planner_adapter": self.planner.adapter,
+                         "profile_note": st.get("profile_note"), "profile_entry": st.get("profile_entry"),
+                         "ip_notes_n": st.get("ip_notes_n"),
                          "fewshot": st.get("fewshot"), "speaker_hit_max_new": st.get("speaker_hit_max_new"),
                          "guard_reasons": st.get("guard_reasons"), "dup_redraws": st.get("dup_redraws"),
                          "selected_index": st.get("selected_index"), "selection": st.get("selection"),
                          "planner_prompt_tokens": (st.get("planner_fit") or {}).get("prompt_tokens")})
             if keep_prompts:
                 rows[-1]["planner_prompt"] = st["planner_prompt"]
+            prev_decision = bool(st["ended_planner"])
             preds.append(st["user"])
             # teacher forcing: the REAL message and the REAL assistant reply enter the history
             S["hist_u"].append(users[t - 1]["text"])
@@ -916,23 +1040,30 @@ class Task2Env:
                 if AG.looks_like_new_offer(reply, prev):
                     ag.reset_on_new_offer()
             S["prev_block"] = S["block"] if S["block"] is not None else S["prev_block"]
-        # K+1 probe (the benchmark's termination measurement): after the real person's last message
-        # and whatever reply followed it, one more turn; ended = Speaker end OR Planner end (E1 semantics)
+        # K+1 probe (the benchmark's termination measurement): after the real person's last message and
+        # whatever reply followed it, one more turn. M2: ended = the Planner's decision at the real last
+        # turn n (message n was the close) OR a blank Speaker message at K+1. The K+1 turn's own Planner
+        # decision is recorded (ended_planner_k1) but is not the END flag.
         k = len(users)
         S["ip_ctx"] = IP.task1_context(real[:k], preds, k + 1) if self.ip else None
         st = speak(k + 1)
         if st.get("planner_stop"):
             raise RuntimeError("silent Planner exit has no Task 1 utterance; use an emit-end arm")
+        blank = bool(st["ended_speaker"])
         k1 = {"record_id": rec["record_id"], "conversation_id": conversation_id, "gold_k": k, "turn_index": k + 1,
               "intent_variant": rows[0]["intent_variant"] + "_k1" if rows else "k1",
-              "ended_speaker": bool(st["ended_speaker"]), "ended_planner": bool(st["ended_planner"]),
+              "end_mapping": "M2", "ended_by_decision_at_n": prev_decision,
+              "ended_speaker": blank, "ended_planner_k1": bool(st["ended_planner"]),
               "ended_empty": not (st["user"] or "").strip(),
-              "ended": bool(st["ended_speaker"]) or bool(st["ended_planner"]),
-              "greedy": st["user"], "greedy_ended": bool(st["ended_speaker"]) or bool(st["ended_planner"]),
+              "ended": prev_decision or blank,
+              "greedy": st["user"], "greedy_ended": prev_decision or blank,
               "planner_move": st.get("move"), "planner_act": st.get("act"), "goal_met": st.get("goal_met"),
               "planner_hit_max_new": st.get("planner_hit_max_new"), "planner_unparsed": st.get("planner_unparsed"),
+              "planner_diag": st.get("planner_diag"),
               "planner_prompt_tokens": (st.get("planner_fit") or {}).get("prompt_tokens"),
-              "speaker_fit": st.get("speaker_fit"), "speaker_hit_max_new": st.get("speaker_hit_max_new"),
+              "planner_fit": st.get("planner_fit"),
+              "speaker_fit": st.get("speaker_fit"), "speaker_fits": st.get("speaker_fits"),
+              "speaker_hit_max_new": st.get("speaker_hit_max_new"), "emitted_capped": st.get("emitted_capped"),
               "guard_reasons": st.get("guard_reasons"), "selected_index": st.get("selected_index"),
               "fewshot": st.get("fewshot")}
         return rows, k1
@@ -945,23 +1076,26 @@ class Task2Env:
 
     def task1_prompts(self, conversation_id):
         """Greedy teacher-forced pass (current policy) -> per turn the exact Planner user prompt, so a
-        Task 1 training group can sample G decisions from the same state the Planner would be in.
-        With the Implicit Profile / few-shot on, the pass is the full Task 1 generation (the notes need the
-        Speaker's predictions), i.e. exactly what the Task 1 evaluation runs."""
-        if self.arm == "pend":
-            rows, _ = self.task1_generate(conversation_id, keep_prompts=True)
-            n = len(rows)
-            return [{"t": r["turn_index"], "n_real": n, "real_final": r["turn_index"] == n, "user_prompt": r["planner_prompt"]}
-                    for r in rows]
-        res = self.run_task1(conversation_id, keep_prompts=True)
-        return [{"t": r["t"], "n_real": r["n_real"], "real_final": r["real_final"], "user_prompt": r["user_prompt"]}
-                for r in res["turns"]]
+        Task 1 training group can sample G decisions from the same state the Planner would be in. The pass
+        is the full Task 1 generation (the Implicit Profile needs the Speaker's predictions), i.e. exactly
+        what the Task 1 evaluation runs."""
+        if self.arm != "pend":
+            raise ValueError("task1_prompts is implemented for the pend arm")
+        rows, _ = self.task1_generate(conversation_id, keep_prompts=True)
+        n = len(rows)
+        return [{"t": r["turn_index"], "n_real": n, "real_final": r["turn_index"] == n, "user_prompt": r["planner_prompt"]}
+                for r in rows]
 
     def task1_sample(self, conversation_id, t, user_prompt, real_final, G, temperature, top_p, seed):
-        """G sampled Planner decisions at one real turn; reward 1 if end_session == (message t was the
-        person's last), else 0. Returned in the rollout schema (one step with planner_gen each)."""
+        """G sampled Planner decisions at one real turn t >= 2 (turn 1 cannot end, so it teaches nothing about
+        stopping); reward 1 if end_session == (message t was the person's last), else 0. A sample whose plan
+        was not parsed, was cut by the token cap, or has no valid end_session value is not a decision: reward
+        0, no stop mask (so no stop credit), never used as the supervision example. Returned in the rollout
+        schema (one step with planner_gen each)."""
         if self.arm != "pend":
             raise ValueError("task1_sample is implemented for the pend arm")
+        if t < 2:
+            raise ValueError("Task 1 stop groups start at turn 2 (turn 1 cannot end)")
         from sepsim import stopping
         import planner_prompt_v3 as V3
         scenario = self.recs[conversation_id]["scenario"]
@@ -974,13 +1108,23 @@ class Task2Env:
             pseed, gen = seeds[g], gens[g]
             fields, diag, end = V3.read_plan_pend(gen["raw"], t, scenario, random.Random(pseed),
                                                   stopping.StoppingLedger(scenario))
+            if gen["hit_max_new"] and fields is not None:
+                diag = dict(diag or {}, cut_by_max_new=True)
+                fields, end = None, False
+            unparsed = fields is None
+            sm, nm = rl_masks(self.planner, gen, unparsed, diag, t)
+            valid = sm is not None
             out.append({"t": t, "replicate": g, "real_final": bool(real_final), "ended_planner": bool(end),
-                        "planner_unparsed": fields is None, "planner_hit_max_new": gen["hit_max_new"],
-                        "reward": float(bool(end) == bool(real_final)),
-                        "planner_gen": {"prompt_ids": gen["prompt_ids"], "gen_ids": gen["gen_ids"], "stop_mask": self.planner.stop_mask(gen["gen_ids"]),
+                        "planner_unparsed": unparsed, "planner_hit_max_new": gen["hit_max_new"],
+                        "decision_valid": valid, "planner_diag": diag,
+                        "reward": float(valid and bool(end) == bool(real_final)),
+                        "planner_gen": {"prompt_ids": gen["prompt_ids"], "gen_ids": gen["gen_ids"], "stop_mask": sm,
+                                        "note_mask": nm, "hit_max_new": gen["hit_max_new"],
                                         "temperature": temperature, "top_p": top_p, "seed": pseed}})
-        # one stop-supervision example per position: the first sample whose end_session value was found
+        # one stop-supervision example per position: the first VALID sample
         for x in out:
+            if not x["decision_valid"]:
+                continue
             tgt = self.planner.stop_target(x["planner_gen"]["gen_ids"], x["planner_gen"]["stop_mask"], real_final)
             if tgt is not None:
                 out[0]["aux"] = dict(tgt, prompt_ids=list(x["planner_gen"]["prompt_ids"]))
@@ -988,58 +1132,26 @@ class Task2Env:
         return out
 
     def run_task1(self, conversation_id, seed=0, keep_prompts=False):
-        """Task 1 (teacher-forced) stop decisions of the Planner on a REAL conversation (pend arm).
-
-        Mirrors the E1.6 run_v2 loop: at turn t the history is the real person's first t-1 messages and
-        the real assistant replies; the Planner writes its state (temperature 0) and its end_session is
-        recorded against whether the real person's message t was their last. The Planner's own previous
-        state carries over as in run_v2. Only the Planner runs (no Ditto, no R0): the stop decision is the
-        Planner's alone in this architecture."""
+        """Task 1 (teacher-forced) stop decisions of the Planner on a REAL conversation (pend arm), read
+        off the full Task 1 generation (the same code as the evaluation; the Implicit Profile also needs
+        the Speaker's predictions). Each turn carries the raw decision and the Speaker blank, and the
+        conversation the K+1 Speaker blank, so task1_stop can apply the M2 mapping."""
         if self.arm != "pend":
             raise ValueError("run_task1 is implemented for the pend arm")
-        if self.arm == "pend":
-            # the full Task 1 generation (the same code as the evaluation; the Implicit Profile also needs
-            # the Speaker's predictions), with the Planner's decisions read off it
-            rows, _ = self.task1_generate(conversation_id, seed=seed)
-            n = len(rows)
-            return {"conversation_id": conversation_id, "record_id": self.recs[conversation_id]["record_id"],
-                    "arm": self.arm, "n_real": n, "planner_path": self.planner.path,
-                    "planner_adapter": self.planner.adapter,
-                    "turns": [{"t": r["turn_index"], "n_real": n, "real_final": r["turn_index"] == n,
-                               "ended_planner": bool(r["planner_ends_session"]),
-                               "planner_unparsed": bool(r.get("planner_unparsed")),
-                               "planner_hit_max_new": bool(r.get("planner_hit_max_new")),
-                               "goal_met": r.get("goal_met"), "planner_diag": None,
-                               "planner_fit": r.get("planner_fit")} for r in rows]}
-        from sepsim import persona as P, pipeline, state, stopping
-        import planner_prompt_v3 as V3
-        rec = self.recs[conversation_id]
-        rid, scenario = rec["record_id"], rec["scenario"]
-        users, agents = pipeline.split_messages(rec)
-        n = len(users)
-        rng = random.Random(pipeline.seed_for(rid, 0))
-        led = stopping.StoppingLedger(scenario)
-        prev_block = state.d0(P.initial_stage(scenario.get("goal")))
-        rows = []
-        for t in range(1, n + 1):
-            if t >= 2 and t - 2 < len(agents):
-                at = agents[t - 2]["text"]
-                pt = agents[t - 3]["text"] if t >= 3 and t - 3 < len(agents) else ""
-                led.observe({}, at, pt)
-            hist_u = [u["text"] for u in users[: t - 1]]
-            hist_a = [a["text"] for a in agents[: t - 1]]
-            up = V3.user_prompt_pend(scenario, prev_block, hist_u, hist_a, t, led, prev_ann={})
-            pseed = int(hashlib.sha256(("t1|%s|%d|%d" % (rid, t, seed)).encode()).hexdigest()[:8], 16)
-            g = self._plan(self.system, up, 0.0, 1.0, pseed)
-            fields, diag, end = V3.read_plan_pend(g["raw"], t, scenario, rng, led)
-            unparsed = fields is None
-            block = prev_block if unparsed else V3.speaker_block_pend(fields)
-            rows.append({"t": t, "n_real": n, "real_final": t == n, "ended_planner": bool(end),
-                         "planner_unparsed": unparsed, "planner_hit_max_new": g["hit_max_new"],
-                         "goal_met": None if unparsed else fields.get("goal_met"),
-                         "planner_fit": g["fit"], "planner_diag": diag})
+        rows, k1 = self.task1_generate(conversation_id, seed=seed, keep_prompts=keep_prompts)
+        n = len(rows)
+        turns = []
+        for r in rows:
+            x = {"t": r["turn_index"], "n_real": n, "real_final": r["turn_index"] == n,
+                 "ended_planner": bool(r["planner_ends_session"]), "speaker_blank": bool(r["speaker_ended"]),
+                 "planner_unparsed": bool(r.get("planner_unparsed")),
+                 "planner_hit_max_new": bool(r.get("planner_hit_max_new")),
+                 "goal_met": r.get("goal_met"), "planner_diag": r.get("planner_diag"),
+                 "planner_fit": r.get("planner_fit")}
             if keep_prompts:
-                rows[-1]["user_prompt"] = up
-            prev_block = block
-        return {"conversation_id": conversation_id, "record_id": rid, "arm": self.arm, "n_real": n,
-                "planner_path": self.planner.path, "planner_adapter": self.planner.adapter, "turns": rows}
+                x["user_prompt"] = r["planner_prompt"]
+            turns.append(x)
+        return {"conversation_id": conversation_id, "record_id": self.recs[conversation_id]["record_id"],
+                "arm": self.arm, "n_real": n, "planner_path": self.planner.path,
+                "planner_adapter": self.planner.adapter, "end_mapping": "M2",
+                "k1_speaker_blank": bool(k1["ended_speaker"]), "k1_ended": bool(k1["ended"]), "turns": turns}
