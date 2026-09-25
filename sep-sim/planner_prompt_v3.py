@@ -139,6 +139,11 @@ def read_plan_v3(raw, turn, scenario, rng, ledger):
     d = state.json_of(raw) or {}
     es = d.get("end_session")
     end = es is True or (isinstance(es, str) and es.strip().lower() == "true")
+    if turn == 1 and end:
+        # Task 2 definition, not a stop rule: the session exists because the person opened it, so
+        # they write at least the first message. The Planner's raw answer is kept in diag.
+        diag["end_session_t1_ignored"] = True
+        end = False
     diag["end_session_raw"] = es
     diag["end_session_valid"] = isinstance(es, bool) or (isinstance(es, str) and es.strip().lower() in ("true", "false"))
     lw_src, lw_val = "top", d.get("length_words")

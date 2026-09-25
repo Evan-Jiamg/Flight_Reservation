@@ -450,8 +450,11 @@ def check_a2(rows, rep, arm="a2"):
                 if "end_session_raw" not in d:
                     rep.ok("a2.end_session", False, w, "planner_diag.end_session_raw missing")
                 else:
-                    rep.ok("a2.end_session", bool(s.get("ended_planner")) == parsed_end(d["end_session_raw"]), w,
-                           "ended_planner %r vs end_session_raw %r" % (s.get("ended_planner"), d["end_session_raw"]))
+                    t1_ign = bool(d.get("end_session_t1_ignored"))
+                    rep.ok("a2.end_session", not t1_ign or s.get("t") == 1, w, "end_session ignored outside turn 1")
+                    exp_end = parsed_end(d["end_session_raw"]) and not t1_ign
+                    rep.ok("a2.end_session", bool(s.get("ended_planner")) == exp_end, w,
+                           "ended_planner %r vs end_session_raw %r (t1 ignored %r)" % (s.get("ended_planner"), d["end_session_raw"], t1_ign))
                 rep.ok("a2.no_length_clamp", d.get("length_clamped") is False, w,
                        "length_clamped %r" % d.get("length_clamped"))
             rep.ok("a2.no_stop_override", d.get("stop_override") is not True, w, "stop override applied")

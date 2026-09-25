@@ -184,8 +184,15 @@ class Task2Env:
                 r = json.loads(l)
                 self.recs[r["conversation_id"]] = r
         self.reqs = json.load(open(os.path.join(BENCH, "data/req_shards_v1.json")))
-        self.ledger_judge = Judge(reasoning_effort="minimal", verbose=False, cache_dir=os.path.join(WORK, "judge_cache"))
-        self.r0 = R0Client()
+        # Task Agent (R0) and requirement-ledger judge. Default = the benchmark's gpt-5-mini at
+        # reasoning_effort=minimal. A substitute endpoint (e.g. gpt-oss-120b on vLLM) is set with
+        # R0_BASE_URL/R0_MODEL and JUDGE_BASE_URL/JUDGE_MODEL; gpt-oss has no "minimal", so the
+        # effort is set with R0_REASONING_EFFORT / JUDGE_REASONING_EFFORT. All of it is in describe().
+        self.r0_effort = os.environ.get("R0_REASONING_EFFORT", "minimal")
+        self.judge_effort = os.environ.get("JUDGE_REASONING_EFFORT", "minimal")
+        self.ledger_judge = Judge(reasoning_effort=self.judge_effort, verbose=False,
+                                  cache_dir=os.path.join(WORK, "judge_cache"))
+        self.r0 = R0Client(reasoning_effort=self.r0_effort)
         if self.e16:
             import ditto_e16
             base_cls = ditto_e16.DittoSpeaker
@@ -203,6 +210,9 @@ class Task2Env:
                 "system_prompt_sha256": hashlib.sha256(self.system.encode()).hexdigest(),
                 "goal_judge": (self.judge.model_path, self.judge.adapter) if self.judge else None,
                 "r0_model": self.r0.model, "ledger_judge_model": self.ledger_judge.model,
+                "r0_base_url": os.environ.get("R0_BASE_URL", "default(api.openai.com)"),
+                "judge_base_url": os.environ.get("JUDGE_BASE_URL", "default(api.openai.com)"),
+                "r0_reasoning_effort": self.r0_effort, "judge_reasoning_effort": self.judge_effort,
                 "act_prior": os.environ["SEPSIM_ACT_PRIOR"], "v2fix": V2FIX, "t_max": T_MAX,
                 "tree": tree_of(self.arm), "arm_env": ARM_ENV[self.arm], "t1_sampling": self.t1_sampling}
 

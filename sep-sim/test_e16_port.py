@@ -115,6 +115,19 @@ def test_final_read_plan_takes_the_drawn_acts_length():
         assert (lw2, src2) == (900, "act_entry")
 
 
+def test_final_turn1_end_is_ignored_and_logged():
+    entries = [{"move": "Complete", "act": "thank and leave", "p": 1.0, "length_words": 4}]
+    code = ("import random\nfrom sepsim import stopping\nimport planner_prompt_v3 as V\n"
+            "sc = json.loads(%r)\nout = []\n"
+            "for t in (1, 3):\n"
+            "    f, d, e = V.read_plan_v3(%r, t, sc, random.Random(0), stopping.StoppingLedger(sc))\n"
+            "    out.append([e, bool(d.get('end_session_t1_ignored')), d.get('end_session_raw')])\n"
+            "print(json.dumps(out))") % (json.dumps(SCENARIO), plan(entries, end=True))
+    (e1, ign1, raw1), (e3, ign3, raw3) = run(E1R, T2.ARM_ENV["final"], code)
+    assert (e1, ign1, raw1) == (False, True, True)
+    assert (e3, ign3, raw3) == (True, False, True)
+
+
 def test_arm_env_consistency():
     assert T2.ARM_ENV["final"]["SEPSIM_ACT_PRIOR"] == "nostopclobber"
     assert T2.ARM_ENV["e16"]["SEPSIM_ACT_PRIOR"] == "off"
