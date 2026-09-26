@@ -705,6 +705,7 @@ class Task2Env:
         import fit_prompts as F
         return {"arm": self.arm, "planner": self.planner.path, "planner_adapter": self.planner.adapter,
                 "planner_backend": "vllm" if getattr(self.planner, "remote", None) is not None else "hf",
+                "planner_vllm_max_model_len": getattr(getattr(self.planner, "remote", None), "max_model_len", None),
                 "planner_vllm_url": getattr(getattr(self.planner, "remote", None), "url", None),
                 "planner_budget": self.planner.budget, "speaker_budget": F.SPEAKER_BUDGET,
                 "system_prompt_sha256": hashlib.sha256(self.system.encode()).hexdigest(),

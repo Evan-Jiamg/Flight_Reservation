@@ -101,6 +101,12 @@ def split_group_advantages(rewards, stop_parts, eps=1e-6, min_std=1e-8):
     return [(x - mr) / (s + eps) for x in rest], [(x - ms) / (s + eps) for x in stop_parts]
 
 
+class MismatchAbort(RuntimeError):
+    def __init__(self, value):
+        super().__init__("mean |log pi_learner - log pi_vllm| = %.4f" % value)
+        self.value = value
+
+
 def tis_weights(old_logp, behav_logp, cap):
     """Truncated importance sampling (pure python reference of the learner's tensor code): the rollout tokens were
     sampled by the vLLM engine (behaviour log-probs), the learner's policy is the HF model (old log-probs); each
@@ -334,9 +340,10 @@ class TorchLearner:
             for s, a in zip(samples, adv):
                 s["adv"] = a
 
-    def update(self, samples, cfg, seed, aux=None):
+    def update(self, samples, cfg, seed, aux=None, mismatch_abort=None):
         """cfg: controller cfg (lr, kl_coef). aux: optional stop-token supervision examples
-        {prompt_ids, prefix_ids, target_ids, want_end, weight}. -> stats dict."""
+        {prompt_ids, prefix_ids, target_ids, want_end, weight}. mismatch_abort: raise MismatchAbort before any
+        optimizer step when the mean |log pi_old - log pi_behaviour| of vLLM-sampled tokens exceeds it. -> stats."""
         import torch
         if not samples and not aux:
             return {"n_samples": 0, "n_tokens": 0, "skipped_update": True}
@@ -348,6 +355,15 @@ class TorchLearner:
         beta, eps = float(cfg["kl_coef"]), float(self.acfg["clip_eps"])
         clipped = self.algo in ("grpo", "ppo") or self.acfg["rloo_clipped"]
         self.prepare(samples)
+        if mismatch_abort is not None:
+            tot, n = 0.0, 0
+            for s in samples:
+                if s.get("behav_logp") is not None:
+                    bl = torch.tensor(s["behav_logp"], dtype=s["old_logp"].dtype)
+                    tot += float((s["old_logp"].cpu() - bl).abs().sum())
+                    n += int(bl.numel())
+            if n and tot / n > mismatch_abort:
+                raise MismatchAbort(tot / n)
         _set_mode(self.model, self.acfg["forward_mode"])
         st = {"n_samples": len(samples), "loss": 0.0, "kl": 0.0, "ratio_mean": 0.0, "clip_frac": 0.0,
               "n_tokens": 0, "grad_norm": [], "value_mse": 0.0, "ratio_init_maxdev": None, "optimizer_steps": 0}

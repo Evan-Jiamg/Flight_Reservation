@@ -79,7 +79,7 @@ def make_planner(PlannerLM, path, gpu, adapter, backend, url, **hf_kw):
         return PlannerLM(path, gpu, adapter=adapter or None, **hf_kw)
     import vllm_planner
     planner = PlannerLM(path, gpu, load_model=False)
-    planner.remote = vllm_planner.VLLMPlanner(url)
+    vllm_planner.VLLMPlanner(url).attach(planner)
     if adapter:
         planner.remote.use_adapter(adapter, "eval")
     planner.adapter = adapter or None
@@ -168,7 +168,7 @@ def main():
             check_rl_settings(args.planner_adapter, {"arm": args.arm, "implicit_profile": args.implicit_profile,
                                                      "fewshot": args.fewshot, "selector": args.selector,
                                                      "planner_path": args.planner_path,
-                                                     "planner_backend": args.planner_backend})
+                                                     **({} if args.ablation else {"planner_backend": args.planner_backend})})
     print("leak gate OK", json.dumps(gate), flush=True)
 
     from task2_env import Task2Env, PlannerLM, setup_environment, make_fewshot_pool

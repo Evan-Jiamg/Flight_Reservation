@@ -13,7 +13,7 @@ import vllm_planner as VP  # noqa: E402
 T2.setup_environment("pend")
 Q4 = os.environ["Q4"]
 p = T2.PlannerLM(Q4, 0, load_model=False)
-p.remote = VP.VLLMPlanner("http://127.0.0.1:8031/v1")
+VP.VLLMPlanner("http://127.0.0.1:8031/v1").attach(p)
 item = {"system": "You answer in JSON.", "user": "Reply with {\"ok\": true} and nothing else.",
         "temperature": 0.0, "top_p": 1.0, "seed": 1}
 g = p.generate_batch([item])[0]

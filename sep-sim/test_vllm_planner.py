@@ -51,11 +51,12 @@ class H(BaseHTTPRequestHandler):
             State.unloaded.append(body["lora_name"])
             return self._send({"message": "ok"})
         m = State.mode
-        ids = [5, 6, EOS] if m in ("stop", "no_ids", "bad_lp") else ([5, 6, 7] if m == "length" else [5, 6])
-        ch = {"text": "x", "finish_reason": "length" if m == "length" else "stop",
+        ids = [5, 6, EOS] if m in ("stop", "no_ids", "bad_lp", "echo_bad") else             ([5, 6, 7] if m == "length" else ([5, 6] if m in ("stop_no_eos", "short_length") else [5, 6]))
+        ch = {"text": "x", "finish_reason": "length" if m in ("length", "short_length") else "stop",
               "logprobs": {"token_logprobs": [-0.1, -0.2] if m == "bad_lp" else [-0.1] * len(ids)}}
         if m != "no_ids":
             ch["token_ids"] = ids
+        ch["prompt_token_ids"] = [99] if m == "echo_bad" else body["prompt"]
         self._send({"choices": [ch]})
 
 
@@ -112,7 +113,8 @@ def test_cap_is_detected(server):
     assert g["hit_max_new"] is True and g["gen_ids"] == [5, 6, 7]
 
 
-@pytest.mark.parametrize("mode,msg", [("no_ids", "token_ids"), ("bad_lp", "log-probs"), ("stop_no_eos", "end token")])
+@pytest.mark.parametrize("mode,msg", [("no_ids", "token_ids"), ("bad_lp", "log-probs"), ("stop_no_eos", "end token"),
+                                      ("short_length", "max_new"), ("echo_bad", "prompt token ids")])
 def test_inconsistencies_raise(server, mode, msg):
     State.mode = mode
     with pytest.raises(RuntimeError, match=msg):
@@ -144,3 +146,22 @@ def test_adapter_names_carry_version_and_sha_and_old_ones_are_unloaded(server, t
 def test_tis_weights():
     w = RA.tis_weights([-1.0, -0.5, -2.0], [-1.0, -2.0, -0.5], 2.0)
     assert w[0] == 1.0 and w[1] == 2.0 and math.isclose(w[2], math.exp(-1.5))
+
+
+def test_an_adapter_left_on_the_server_is_adopted_not_reposted(server, tmp_path):
+    """A resume talks to a server that still holds the adapter (same name = same content sha)."""
+    State.mode = "stop"
+    d = tmp_path / "ua"
+    d.mkdir()
+    (d / "adapter_model.safetensors").write_bytes(b"left-over")
+    n = VP.VLLMPlanner(server).use_adapter(str(d), "p5")
+    posts = State.loaded.count(n)
+    fresh = VP.VLLMPlanner(server)                     # a new process: current = base, knows nothing
+    assert fresh.use_adapter(str(d), "p5") == n and State.loaded.count(n) == posts and fresh.current == n
+
+
+def test_attach_caps_the_fit_budget_to_the_server_context(server):
+    p = FakePlanner()
+    p.budget = 31168
+    VP.VLLMPlanner(server).attach(p)
+    assert p.remote is not None and p.budget == 2048 - 3 - __import__("fit_prompts").MARGIN and p.budget_hf == 31168

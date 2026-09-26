@@ -84,16 +84,24 @@ class VLLMPlanner:
         with self.lock:
             if name == self.current:
                 return name
-            _post(self.url.rsplit("/v1", 1)[0] + "/v1/load_lora_adapter", {"lora_name": name, "lora_path": path})
             served = [m.get("id") for m in _get(self.url + "/models").get("data", [])]
             if name not in served:
-                raise RuntimeError("adapter %s not listed by vLLM after loading (serves %r)" % (name, served))
-            old = [n for n in self.loaded if n != name]
+                # (a server left up by a crashed run may still hold it: the name carries the content sha, so a listed
+                # name is the same adapter and is adopted instead of re-posted, which vLLM would refuse)
+                try:
+                    _post(self.url + "/load_lora_adapter", {"lora_name": name, "lora_path": path})
+                except RuntimeError as e:
+                    if "already" not in str(e).lower():
+                        raise
+                served = [m.get("id") for m in _get(self.url + "/models").get("data", [])]
+                if name not in served:
+                    raise RuntimeError("adapter %s not listed by vLLM after loading (serves %r)" % (name, served))
+            old = [n for n in served if n not in (name, self.base_name)]
             self.loaded = [name]
             self.current = name
         for n in old:
             try:
-                _post(self.url.rsplit("/v1", 1)[0] + "/v1/unload_lora_adapter", {"lora_name": n})
+                _post(self.url + "/unload_lora_adapter", {"lora_name": n})
             except RuntimeError:
                 pass                       # an adapter that cannot be unloaded only costs memory; never used again
         return name
@@ -130,19 +138,41 @@ class VLLMPlanner:
         fin = ch.get("finish_reason")
         if fin not in ("stop", "length"):
             raise RuntimeError("unexpected finish_reason %r" % fin)
-        eos = planner.eos_ids()
+        eos = self._eos(planner)
         if fin == "stop" and (not gen or gen[-1] not in eos):
             raise RuntimeError("vLLM stopped without an end token at the end of token_ids (stop_reason %r)"
                                % ch.get("stop_reason"))
+        if fin == "length" and len(gen) != planner.max_new:
+            raise RuntimeError("finish_reason 'length' with %d tokens, max_new is %d" % (len(gen), planner.max_new))
+        echoed = ch.get("prompt_token_ids") or r.get("prompt_token_ids")
+        if echoed is not None and list(echoed) != list(ids):
+            raise RuntimeError("the server's prompt token ids differ from the ids sent")
         with self.lock:
             self.n_requests += 1
-        planner.n_calls += 1
+            planner.n_calls += 1
         return {"raw": planner.tok.decode(gen, skip_special_tokens=True), "prompt_text": user_fit,
                 "prompt_ids": list(ids), "gen_ids": gen, "gen_logprobs": [float(x) for x in lps],
                 "gen_adapter": name,
-                "fit": {**fit, "prompt_tokens": len(ids), "budget": planner.budget, "backend": "vllm",
+                "fit": {**fit, "prompt_tokens": len(ids), "budget": planner.budget, "backend": "vllm", "gen_adapter": name,
                         "batched": 1, "batch_seed": int(it["seed"]) if t > 0 else None},
                 "hit_max_new": fin == "length"}
+
+    def _eos(self, planner):
+        e = getattr(self, "_eos_cache", None)
+        if e is None:
+            e = self._eos_cache = set(planner.eos_ids())
+        return e
+
+    def attach(self, planner):
+        """planner.remote = self, and the fitter's budget is capped so a fitted prompt + max_new always fits the
+        server context (a longer prompt is compacted -- recorded, unclean -- instead of raising mid-run)."""
+        import fit_prompts as F
+        planner.remote = self
+        cap = self.max_model_len - planner.max_new - F.MARGIN
+        if cap < planner.budget:
+            planner.budget_hf = planner.budget
+            planner.budget = cap
+        return planner
 
     def generate_batch(self, planner, items):
         name = self.current

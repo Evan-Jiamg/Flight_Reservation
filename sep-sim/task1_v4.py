@@ -57,7 +57,7 @@ def make_planner(PlannerLM, path, gpu, adapter, backend, url, **hf_kw):
         return PlannerLM(path, gpu, adapter=adapter or None, **hf_kw)
     import vllm_planner
     planner = PlannerLM(path, gpu, load_model=False)
-    planner.remote = vllm_planner.VLLMPlanner(url)
+    vllm_planner.VLLMPlanner(url).attach(planner)
     if adapter:
         planner.remote.use_adapter(adapter, "eval")
     planner.adapter = adapter or None
@@ -145,7 +145,8 @@ def main(argv=None):
                 raise SystemExit("LEAK GATE: adapter has no manifest")
             check_rl_settings(a.planner_adapter, {"arm": "pend", "implicit_profile": a.implicit_profile,
                                                   "selector": a.selector, "fewshot": a.fewshot,
-                                                  "planner_path": a.planner_path, "planner_backend": a.planner_backend})
+                                                  "planner_path": a.planner_path,
+                                                  **({} if a.ablation else {"planner_backend": a.planner_backend})})
             used = set(man.get("train_scenarios", [])) | set(man.get("train_conversations", [])) | set(man.get("fewshot_pool", []))
             if man.get("splits_sha256") and man["splits_sha256"] != sha_file(a.splits):
                 raise SystemExit("LEAK GATE: adapter was trained with another split file (sha differs)")

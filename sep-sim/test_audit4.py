@@ -112,3 +112,9 @@ def test_stopping_line_only_on_the_last_message_speaker_block():
     assert "- stopping:" not in cont_spk and "- stopping:" not in cont_state      # the conversation goes on
     assert "- stopping: satiation" in last_spk and "this is their last message" in last_spk
     assert "- stopping:" not in last_state and "this is their last message" not in last_state
+
+
+def test_vllm_training_needs_temperature_one(capsys):
+    with pytest.raises(SystemExit):
+        T.parse_args(BASE + ["--temperature", "0.7"])
+    assert "--temperature 1" in capsys.readouterr().err
