@@ -72,6 +72,20 @@ def check_rl_settings(adapter, settings):
     raise SystemExit("LEAK GATE: RL adapter without rl_manifest.json (next to it or in its directory)")
 
 
+def make_planner(PlannerLM, path, gpu, adapter, backend, url, **hf_kw):
+    """HF: the model on this GPU (legacy / ablation). vLLM (spec): only the tokenizer here; generation on the vLLM
+    server, the adapter (if any) loaded there under a name carrying its sha."""
+    if backend == "hf":
+        return PlannerLM(path, gpu, adapter=adapter or None, **hf_kw)
+    import vllm_planner
+    planner = PlannerLM(path, gpu, load_model=False)
+    planner.remote = vllm_planner.VLLMPlanner(url)
+    if adapter:
+        planner.remote.use_adapter(adapter, "eval")
+    planner.adapter = adapter or None
+    return planner
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--arm", choices=("a0", "a2", "e16", "final", "pend"), required=True)
@@ -82,6 +96,9 @@ def main():
     ap.add_argument("--planner-nf4", action="store_true")
     ap.add_argument("--planner-dtype", default="bfloat16")
     ap.add_argument("--planner-adapter", default="")
+    ap.add_argument("--planner-backend", choices=("vllm", "hf"), default=None,
+                    help="pend spec: vllm (the same generation backend as training); other arms: hf")
+    ap.add_argument("--vllm-url", default="http://127.0.0.1:8031/v1")
     ap.add_argument("--judge-base", default="")
     ap.add_argument("--judge-adapter", default="")
     ap.add_argument("--replicate", type=int, default=0)
@@ -104,8 +121,10 @@ def main():
                     help="pipeline smoke only: judge may be the untrained base (no adapter); never on test; "
                          "out-dir must contain 'smoke'; rows are not results")
     args = ap.parse_args()
-    spec = {"implicit_profile": 1, "fewshot": "fold", "selector": "borda", "planner_temperature": 0.7} \
-        if args.arm == "pend" else {"implicit_profile": 0, "fewshot": "off", "selector": "length", "planner_temperature": 0.0}
+    spec = {"implicit_profile": 1, "fewshot": "fold", "selector": "borda", "planner_temperature": 0.7,
+            "planner_backend": "vllm"} \
+        if args.arm == "pend" else {"implicit_profile": 0, "fewshot": "off", "selector": "length", "planner_temperature": 0.0,
+                                    "planner_backend": "hf"}
     for k, v in spec.items():
         if getattr(args, k) is None:
             setattr(args, k, v)
@@ -148,14 +167,15 @@ def main():
         if args.arm == "pend":           # pend adapters come from train_planner_rl: rl_manifest.json required
             check_rl_settings(args.planner_adapter, {"arm": args.arm, "implicit_profile": args.implicit_profile,
                                                      "fewshot": args.fewshot, "selector": args.selector,
-                                                     "planner_path": args.planner_path})
+                                                     "planner_path": args.planner_path,
+                                                     "planner_backend": args.planner_backend})
     print("leak gate OK", json.dumps(gate), flush=True)
 
     from task2_env import Task2Env, PlannerLM, setup_environment, make_fewshot_pool
     setup_environment(args.arm)
     import goal_judge as GJ
-    planner = PlannerLM(args.planner_path, args.gpu, nf4=args.planner_nf4, dtype=args.planner_dtype,
-                        adapter=args.planner_adapter or None)
+    planner = make_planner(PlannerLM, args.planner_path, args.gpu, args.planner_adapter, args.planner_backend,
+                           args.vllm_url, nf4=args.planner_nf4, dtype=args.planner_dtype)
     judge = GJ.GoalJudge(args.judge_base, adapter=args.judge_adapter or None, gpu=args.gpu).load() if args.arm in ("a2", "final") else None
     env = Task2Env(args.arm, args.gpu, planner, judge=judge, batch=bool(args.batch), max_batch=args.max_batch,
                    implicit_profile=bool(args.implicit_profile), selector=args.selector)
@@ -191,6 +211,7 @@ def main():
             "planner_nf4": args.planner_nf4, "planner_dtype": args.planner_dtype,
             "settings": {"implicit_profile": args.implicit_profile, "fewshot": args.fewshot, "selector": args.selector,
                          "planner_temperature": args.planner_temperature, "planner_top_p": args.planner_top_p,
+                         "planner_backend": args.planner_backend,
                          "ablation": args.ablation},
             "goal_judge_system_sha256": hashlib.sha256(GJ.SYSTEM.encode()).hexdigest() if judge else None,
             "started": time.strftime("%Y-%m-%d %H:%M:%S")}

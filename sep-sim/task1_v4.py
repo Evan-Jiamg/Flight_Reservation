@@ -50,6 +50,20 @@ def check_rl_settings(adapter, settings):
     raise SystemExit("LEAK GATE: RL adapter without rl_manifest.json (next to it or in its directory)")
 
 
+def make_planner(PlannerLM, path, gpu, adapter, backend, url, **hf_kw):
+    """HF: the model on this GPU (legacy / ablation). vLLM (spec): only the tokenizer here; generation on the vLLM
+    server, the adapter (if any) loaded there under a name carrying its sha."""
+    if backend == "hf":
+        return PlannerLM(path, gpu, adapter=adapter or None, **hf_kw)
+    import vllm_planner
+    planner = PlannerLM(path, gpu, load_model=False)
+    planner.remote = vllm_planner.VLLMPlanner(url)
+    if adapter:
+        planner.remote.use_adapter(adapter, "eval")
+    planner.adapter = adapter or None
+    return planner
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("--sessions", choices=("all", "fold-validation", "fold-test"), required=True)
@@ -57,6 +71,9 @@ def main(argv=None):
     ap.add_argument("--splits", default="/tmp2/mzjiang_usersim/grpo_planner/splits_v1.json")
     ap.add_argument("--planner-path", required=True)
     ap.add_argument("--planner-adapter", default="")
+    ap.add_argument("--planner-backend", choices=("vllm", "hf"), default="vllm",
+                    help="spec: vllm (the same generation backend as training); hf needs --ablation")
+    ap.add_argument("--vllm-url", default="http://127.0.0.1:8031/v1")
     ap.add_argument("--gpu", type=int, default=1)
     ap.add_argument("--workers", type=int, default=4)
     ap.add_argument("--implicit-profile", type=int, choices=(0, 1), default=1)
@@ -77,6 +94,8 @@ def main(argv=None):
     spec_fs = "loo" if a.sessions == "all" else "fold"
     off = {k: v for k, v in (("implicit_profile", a.implicit_profile), ("selector", a.selector), ("fewshot", a.fewshot))
            if v != {"implicit_profile": 1, "selector": "borda", "fewshot": spec_fs}[k]}
+    if a.planner_backend != "vllm":
+        off["planner_backend"] = a.planner_backend
     if "Qwen3-4B-Instruct-2507" not in a.planner_path:
         off["planner_path"] = a.planner_path            # the spec's Planner
     if off and not a.ablation:
@@ -86,7 +105,7 @@ def main(argv=None):
     from task2_env import Task2Env, PlannerLM, setup_environment, make_fewshot_pool
     setup_environment("pend")
     from sepsim import pipeline
-    planner = PlannerLM(a.planner_path, a.gpu, adapter=a.planner_adapter or None)
+    planner = make_planner(PlannerLM, a.planner_path, a.gpu, a.planner_adapter, a.planner_backend, a.vllm_url)
     env = Task2Env("pend", a.gpu, planner, judge=None, batch=bool(a.batch), max_batch=a.max_batch,
                    implicit_profile=bool(a.implicit_profile), selector=a.selector, task1_only=True)
     finished = [cid for cid, r in env.recs.items()
@@ -126,7 +145,7 @@ def main(argv=None):
                 raise SystemExit("LEAK GATE: adapter has no manifest")
             check_rl_settings(a.planner_adapter, {"arm": "pend", "implicit_profile": a.implicit_profile,
                                                   "selector": a.selector, "fewshot": a.fewshot,
-                                                  "planner_path": a.planner_path})
+                                                  "planner_path": a.planner_path, "planner_backend": a.planner_backend})
             used = set(man.get("train_scenarios", [])) | set(man.get("train_conversations", [])) | set(man.get("fewshot_pool", []))
             if man.get("splits_sha256") and man["splits_sha256"] != sha_file(a.splits):
                 raise SystemExit("LEAK GATE: adapter was trained with another split file (sha differs)")
@@ -159,7 +178,7 @@ def main(argv=None):
                 "fewshot_k": 3, "copy_ngram": IP.COPY_NGRAM,
                 "fewshot_backoff": "same style+proficiency; fewer than k -> same interaction style",
                 "planner_temperature": 0.0, "end_mapping": "M2", "simcse": getattr(SS, "SIMCSE", None),
-                "sessions": a.sessions, "fold": a.fold, "limit": a.limit,
+                "sessions": a.sessions, "fold": a.fold, "limit": a.limit, "planner_backend": a.planner_backend,
                 "splits_sha256": sha_file(a.splits) if a.sessions != "all" else None}
     code = {n: sha_file(os.path.join(HERE, n)) for n in
             ("task1_v4.py", "task2_env.py", "planner_prompt_v3.py", "fit_prompts.py", "ditto_e16.py",

@@ -31,7 +31,7 @@ import rl_reward as RR
 
 # w_aux: weight of the auxiliary stop-token supervision on the Task 1 positions (D2 anneals it further);
 # a training knob like lr / kl_coef, not part of the reward (so the shadow / selection reward ignore it)
-TRAIN_DEFAULTS = {"lr": 1e-5, "kl_coef": 0.04, "w_aux": 1.0}
+TRAIN_DEFAULTS = {"lr": 2e-5, "kl_coef": 0.04, "w_aux": 1.0}   # lr 2e-5: phase-0 KL at 1e-5 was ~1.1e-3/token
 TRAIN_BOUNDS = {"lr": (1e-7, 1e-4), "kl_coef": (0.0, 1.0), "w_aux": (0.0, 10.0)}
 CFG_BOUNDS = {**TRAIN_BOUNDS, **RR.REWARD_BOUNDS}
 

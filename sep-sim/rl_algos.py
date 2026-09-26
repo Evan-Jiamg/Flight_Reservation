@@ -39,11 +39,11 @@ import random
 ALGOS = ("grpo", "rloo", "ppo")
 LORA = {"r": 16, "lora_alpha": 32, "lora_dropout": 0.0,
         "target_modules": ["q_proj", "k_proj", "v_proj", "o_proj"], "bias": "none"}
-ALGO_DEFAULTS = {"clip_eps": 0.2, "adv_eps": 1e-6, "min_group_std": 1e-8, "epochs": 1, "minibatches": 1,
+ALGO_DEFAULTS = {"tis_cap": 2.0, "clip_eps": 0.2, "adv_eps": 1e-6, "min_group_std": 1e-8, "epochs": 1, "minibatches": 1,
                  "max_grad_norm": 1.0, "vf_coef": 0.5, "value_hidden": 256, "value_lr": 1e-4,
                  "rloo_clipped": False, "ppo_adv_norm": True, "ratio_init_tol": 1e-4,
                  "forward_mode": "train_nodropout", "weight_decay": 0.0, "old_logp_grad_graph": False}
-ALGO_BOUNDS = {"clip_eps": (0.0, 1.0), "adv_eps": (0.0, 1.0), "min_group_std": (0.0, 1.0), "epochs": (1, 10),
+ALGO_BOUNDS = {"tis_cap": (1.0, 100.0), "clip_eps": (0.0, 1.0), "adv_eps": (0.0, 1.0), "min_group_std": (0.0, 1.0), "epochs": (1, 10),
                "minibatches": (1, 256), "max_grad_norm": (0.0, 1000.0), "vf_coef": (0.0, 10.0),
                "value_hidden": (8, 8192), "value_lr": (1e-7, 1e-2), "ratio_init_tol": (0.0, 1.0),
                "weight_decay": (0.0, 1.0)}
@@ -101,6 +101,15 @@ def split_group_advantages(rewards, stop_parts, eps=1e-6, min_std=1e-8):
     return [(x - mr) / (s + eps) for x in rest], [(x - ms) / (s + eps) for x in stop_parts]
 
 
+def tis_weights(old_logp, behav_logp, cap):
+    """Truncated importance sampling (pure python reference of the learner's tensor code): the rollout tokens were
+    sampled by the vLLM engine (behaviour log-probs), the learner's policy is the HF model (old log-probs); each
+    token's surrogate is weighted by min(exp(old - behav), cap)."""
+    if len(old_logp) != len(behav_logp):
+        raise ValueError("old / behaviour log-prob length mismatch")
+    return [min(math.exp(o - b), cap) for o, b in zip(old_logp, behav_logp)]
+
+
 def rloo_advantages(rewards):
     """Leave-one-out baseline: A_i = R_i - mean of the other G-1 rewards."""
     g = len(rewards)
@@ -147,7 +156,9 @@ def episode_samples(episode, policy_version=None):
                     "t": step["t"], "prompt_ids": list(g["prompt_ids"]), "gen_ids": list(g["gen_ids"]),
                     "temperature": float(g["temperature"]), "policy_version": policy_version,
                     "stop_mask": list(g["stop_mask"]) if g.get("stop_mask") is not None else None,
-                    "note_mask": list(g["note_mask"]) if g.get("note_mask") is not None else None})
+                    "note_mask": list(g["note_mask"]) if g.get("note_mask") is not None else None,
+                    "behav_logp": list(g["gen_logprobs"]) if g.get("gen_logprobs") is not None else None,
+                    "gen_adapter": g.get("gen_adapter")})
     return out
 
 
@@ -404,6 +415,19 @@ class TorchLearner:
                         surr = torch.minimum(ratio * adv, torch.clamp(ratio, 1 - eps, 1 + eps) * adv)
                     else:
                         surr = ratio * adv
+                    if s.get("behav_logp") is not None:
+                        # rollout sampled by vLLM: truncated importance weight min(pi_old / pi_vllm, cap) per token
+                        bl = torch.tensor(s["behav_logp"], dtype=logp.dtype, device=logp.device)
+                        if bl.shape != logp.shape:
+                            raise AssertionError("behaviour log-probs %d != %d generated tokens" % (bl.shape[0], logp.shape[0]))
+                        with torch.no_grad():
+                            dlp = old - bl
+                            w = torch.clamp(torch.exp(dlp), max=float(self.acfg["tis_cap"]))
+                            st["tis_w_sum"] = st.get("tis_w_sum", 0.0) + float(w.sum())
+                            st["tis_capped"] = st.get("tis_capped", 0) + int((torch.exp(dlp) > float(self.acfg["tis_cap"])).sum())
+                            st["tis_tokens"] = st.get("tis_tokens", 0) + int(w.numel())
+                            st["behav_absdiff_sum"] = st.get("behav_absdiff_sum", 0.0) + float(dlp.abs().sum())
+                        surr = surr * w
                     d = ref - logp
                     kl = torch.exp(d) - d - 1.0
                     loss = (-surr + beta * kl).sum() / n_tok
@@ -449,6 +473,12 @@ class TorchLearner:
         self.model.eval()
         n_mb = max(1, st["optimizer_steps"])
         tok_div = max(1, tok_seen)          # 0 only for an aux-only update
+        if st.get("tis_tokens"):
+            n_tis = st.pop("tis_tokens")
+            st["tis_w_mean"] = st.pop("tis_w_sum") / n_tis
+            st["tis_capped_frac"] = st.pop("tis_capped") / n_tis
+            st["behav_mismatch_mean"] = st.pop("behav_absdiff_sum") / n_tis     # mean |log pi_old - log pi_vllm|
+            st["tis_tokens"] = n_tis // max(1, int(self.acfg["epochs"]))
         st.update(n_tokens=tok_seen, kl=st["kl"] / tok_div, ratio_mean=st["ratio_mean"] / tok_div,
                   clip_frac=st["clip_frac"] / tok_div, loss=st["loss"] / n_mb,
                   grad_norm=max(st["grad_norm"]) if st["grad_norm"] else 0.0,

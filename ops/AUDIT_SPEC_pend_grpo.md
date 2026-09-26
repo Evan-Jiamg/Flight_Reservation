@@ -98,6 +98,27 @@ behaviour is also a finding ("unauthorised design change").
   Task 1 validation during training = splits[fold].validation (the 4 sessions; not validation_all).
 - D6: fold 2 first.
 
+## Planner generation backend (approved 2026-09-26)
+- Planner generation runs on a vLLM server (Qwen3-4B-Instruct-2507, runtime LoRA loading, prefix caching, bound to
+  127.0.0.1); Ditto stays on HF. The HF model remains the learner and re-scores every generated token.
+- Prompts are built by the one builder (PlannerLM.build_prompt: fit, chat template, ids, budget assert) and sent as
+  token ids; the server returns the generated ids (ending with the end token when stopped), the sampled tokens'
+  log-probs and the finish reason ("length" = cap hit). Any missing field / length mismatch / stop without an end
+  token / prompt + max_new beyond the server context RAISES.
+- The served adapter is the checkpoint of the current policy version, loaded under "p<version>-<sha12>"; every
+  generation records it; samples from another adapter abort the update. Training rollouts use policy u-1,
+  validation after update u uses u. Evaluation CLIs use the same backend (tokenizer only locally).
+- Truncated importance sampling: each token's surrogate is weighted by min(pi_old / pi_vllm, 2); the mean
+  |log pi_learner - log pi_vllm| is logged per update and the run stops (before the checkpoint) above 0.1
+  (phase 0 measured 0.017; HF batch padding 0.007).
+- lr = 2e-5 (phase 0: one step at 1e-5 gave per-token KL ~1.1e-3, the low end of the usual 1e-3..1e-2).
+- GPU layout: GPU0 = gpt-oss-120b (memory share 0.78) + Planner vLLM (0.15); GPU1 = learner + Ditto.
+
+## Comparison protocol (approved 2026-09-26)
+- The 3 outer folds' test_all cover 26 of the 56 finished sessions (not a partition of the corpus). Comparisons
+  with E1.6 use E1.6's EXISTING generations re-scored on the same test sessions (no regeneration), paired per
+  session with Stage A and Stage B, with bootstrap confidence intervals. Fold 2 is the pilot.
+
 ## Data
 - splits_v1.json fold 2: train (with requirement shards) 14; train_all 17; validation 4;
   test 5 (Task 2) / test_all 9 (Task 1); forbidden = validation ∪ test. Zero leakage: training,

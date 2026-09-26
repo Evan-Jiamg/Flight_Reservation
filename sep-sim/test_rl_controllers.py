@@ -98,7 +98,7 @@ def test_llm_controller_clip_and_log():
     payload = json.loads(req["messages"][1]["content"])
     assert [h["update"] for h in payload["train_aggregates_last_rounds"]] == [2, 3]
     assert "secret_extra" not in req["messages"][1]["content"]            # only declared keys are sent
-    assert math.isclose(cfg["lr"], 3e-5)                                   # x3 per round cap
+    assert math.isclose(cfg["lr"], 3 * RC.TRAIN_DEFAULTS["lr"])            # x3 per round cap
     assert math.isclose(cfg["kl_coef"], 0.04 / 3)                          # /3 per round cap
     assert math.isclose(cfg["w_goal"], 1.2)
     assert cfg["w_partial"] == 1.0                                         # x3 -> 1.5, then bound 1.0
