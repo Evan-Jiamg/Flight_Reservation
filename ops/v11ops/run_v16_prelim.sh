@@ -1,10 +1,11 @@
 #!/bin/bash
-# v16 preliminary experiments on GPU0 only (user 2026-09-28: GPU smoke with the real model + Step 0), code pend_v16.
-#  1. GPU0 must be free (< 2 GiB used): never take a GPU someone else is using.
-#  2. Planner vLLM on GPU0 (same flags as the formal run) -> smoke_v16.py (validation Task 1 end probabilities,
+# v16 preliminary experiments (user 2026-09-28: GPU smoke with the real model + Step 0), code pend_v16. GPU: whichever
+# GPU is completely free (< 2 GiB used) at the moment of each step (user: GPU0 and GPU1 both usable, dynamic); a GPU
+# someone else is using is never taken.
+#  1. Planner vLLM on a free GPU (same flags as the formal run) -> smoke_v16.py (validation Task 1 end probabilities,
 #     Task 1 groups with refill, one learner update: step-size statistics) -> the Planner server is stopped.
-#  3. gpt-oss-120b on GPU0 (same flags as the formal run) -> step0_coverage.py on the fold-2 TRAIN conversations ->
-#     gpt-oss is stopped; GPU0 is left free.
+#  2. gpt-oss-120b on a free GPU (same flags as the formal run) -> step0_coverage.py on the fold-2 TRAIN
+#     conversations -> gpt-oss is stopped; our processes leave every GPU.
 set -uo pipefail
 G=/tmp2/mzjiang_usersim/grpo_planner; C=$G/code_snapshots/pend_v16
 PYDIR=/home/mzjiang/miniconda3/envs/consistent-test/bin; PY=$PYDIR/python
@@ -31,59 +32,60 @@ stop_port() {   # our own server on this port only; escalates to SIGKILL, then w
   pkill -9 -u mzjiang -f "vllm serve .*--port $1"
   sleep 10
 }
-our_gpu0() {    # our compute processes on GPU0
-  for p in $(nvidia-smi --query-compute-apps=pid --format=csv,noheader -i 0); do
+our_gpu() {     # our compute processes on any GPU
+  for p in $(nvidia-smi --query-compute-apps=pid --format=csv,noheader); do
     [ "$(ps -o user= -p $p 2>/dev/null)" = "mzjiang" ] && echo $p
   done
 }
-gpu0_used() {
-  v=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits -i 0)
-  [[ "$v" =~ ^[0-9]+$ ]] || { echo "STOP: cannot read GPU0 memory ($v)" >&2; echo 999999; return; }
-  echo $v
+pick_free() {   # the first GPU with < 2 GiB used; nothing when none (or when nvidia-smi cannot be read)
+  nvidia-smi --query-gpu=index,memory.used --format=csv,noheader,nounits | \
+    awk -F', ' '$1 ~ /^[0-9]+$/ && $2 ~ /^[0-9]+$/ && $2 < 2048 {print $1; exit}'
 }
-cleanup() {     # on any exit: our two servers down; our leftover GPU0 processes killed
+cleanup() {     # on any exit: our two servers down; our leftover GPU processes killed
   stop_port 8031; stop_port 8029
-  for p in $(our_gpu0); do kill -9 $p 2>/dev/null; done
+  for p in $(our_gpu); do kill -9 $p 2>/dev/null; done
 }
-trap cleanup EXIT
 cd $C
 sha256sum -c --quiet local_sha_v16.txt || { echo "STOP: pend_v16 snapshot sha mismatch"; exit 1; }
-used=$(gpu0_used)
-if [ "$used" -gt 2048 ]; then echo "STOP: GPU0 is in use ($used MiB) - not taking it"; trap - EXIT; exit 1; fi
-if pgrep -u mzjiang -f "vllm serve|train_planner_rl.py|gpu_holder2" > /dev/null; then echo "STOP: our servers / training already running"; trap - EXIT; exit 1; fi
+if pgrep -u mzjiang -f "vllm serve|train_planner_rl.py|gpu_holder2" > /dev/null; then echo "STOP: our servers / training already running"; exit 1; fi
+PG=$(pick_free)
+[ -n "$PG" ] || { echo "STOP: no completely free GPU - not taking a GPU in use"; exit 1; }
+trap cleanup EXIT
 mkdir -p $OUT $Q/cache $R/cache
 # ---- 1. smoke
-echo "=== smoke: planner vLLM on GPU0 $(date +%H:%M)"
+echo "=== smoke: planner vLLM on GPU $PG $(date +%H:%M)"
 cat > $Q/serve_prelim.sh <<EOF
 #!/bin/bash
-export PATH=$PYDIR:\$PATH CUDA_VISIBLE_DEVICES=0 PYTHONNOUSERSITE=1 HF_HOME=/tmp2/hf_shared VLLM_CACHE_ROOT=$Q/cache
+export PATH=$PYDIR:\$PATH CUDA_VISIBLE_DEVICES=$PG PYTHONNOUSERSITE=1 HF_HOME=/tmp2/hf_shared VLLM_CACHE_ROOT=$Q/cache
 export VLLM_ALLOW_RUNTIME_LORA_UPDATING=True
 exec $PYDIR/vllm serve $Q4 --served-model-name planner-base --dtype bfloat16 \\
   --enable-lora --max-lora-rank 16 --max-loras 2 --enable-prefix-caching \\
   --max-model-len 20480 --host 127.0.0.1 --port 8031 --gpu-memory-utilization 0.15
 EOF
 setsid nohup bash $Q/serve_prelim.sh > $OUT/planner_vllm.log 2>&1 < /dev/null &
-wait_up 8031 planner-base $OUT/planner_vllm.log || { echo "STOP: planner vLLM did not come up"; stop_port 8031; exit 1; }
+wait_up 8031 planner-base $OUT/planner_vllm.log || { echo "STOP: planner vLLM did not come up"; exit 1; }
 echo "planner vLLM up $(date +%H:%M)"
 rm -rf $OUT/smoke_run
-CUDA_VISIBLE_DEVICES=0 timeout 3h $PY smoke_v16.py --fold 2 --planner-path $Q4 --gpu 0 --G 4 --scenarios-per-update 4 \
+CUDA_VISIBLE_DEVICES=$PG timeout 3h $PY smoke_v16.py --fold 2 --planner-path $Q4 --gpu 0 --G 4 --scenarios-per-update 4 \
     --rollout-workers 4 --out $OUT/smoke_run --val-convs 2 > $OUT/smoke.log 2>&1
-rc=$?; echo "smoke rc=$rc $(date +%H:%M)"
+rc=$?; echo "smoke rc=$rc on GPU $PG $(date +%H:%M)"
 stop_port 8031
 [ $rc -ne 0 ] && { echo "STOP: smoke failed"; grep -v "Loading weights" $OUT/smoke.log | tail -15 | cut -c1-300; exit 1; }
 grep -v "Loading weights" $OUT/smoke.log | tail -60 | cut -c1-300
+for p in $(our_gpu); do kill -9 $p 2>/dev/null; done
+sleep 10
 # ---- 2. Step 0
-echo "=== step 0: gpt-oss on GPU0 $(date +%H:%M)"
-used=$(gpu0_used)
-if [ "$used" -gt 2048 ]; then echo "STOP: GPU0 not free after the smoke ($used MiB)"; exit 1; fi
+PG=$(pick_free)
+[ -n "$PG" ] || { echo "STOP: no completely free GPU for Step 0"; exit 1; }
+echo "=== step 0: gpt-oss on GPU $PG $(date +%H:%M)"
 cat > $R/serve_prelim.sh <<EOF
 #!/bin/bash
-export PATH=$PYDIR:\$PATH CUDA_VISIBLE_DEVICES=0 PYTHONNOUSERSITE=1 HF_HOME=/tmp2/hf_shared VLLM_CACHE_ROOT=$R/cache
+export PATH=$PYDIR:\$PATH CUDA_VISIBLE_DEVICES=$PG PYTHONNOUSERSITE=1 HF_HOME=/tmp2/hf_shared VLLM_CACHE_ROOT=$R/cache
 exec $PYDIR/vllm serve $M --served-model-name gpt-oss-120b \\
   --max-model-len 12288 --host 127.0.0.1 --port 8029 --gpu-memory-utilization 0.78
 EOF
 setsid nohup bash $R/serve_prelim.sh > $OUT/gptoss.log 2>&1 < /dev/null &
-wait_up 8029 gpt-oss-120b $OUT/gptoss.log || { echo "STOP: gpt-oss did not come up"; stop_port 8029; exit 1; }
+wait_up 8029 gpt-oss-120b $OUT/gptoss.log || { echo "STOP: gpt-oss did not come up"; exit 1; }
 echo "gpt-oss up $(date +%H:%M)"
 timeout 2h $PY step0_coverage.py --fold 2 --splits $G/splits_v1.json --out $OUT/step0_f2.jsonl --workers 4 > $OUT/step0.log 2>&1
 rc=$?; echo "step0 rc=$rc $(date +%H:%M)"
@@ -92,7 +94,7 @@ stop_port 8029
 cat $OUT/step0.log | cut -c1-300
 cleanup
 trap - EXIT
-left=$(our_gpu0 | wc -l)
+left=$(our_gpu | wc -l)
 nvidia-smi --query-gpu=index,memory.used --format=csv,noheader
-[ "$left" -eq 0 ] || { echo "WARNING: $left of our processes still on GPU0"; exit 1; }
+[ "$left" -eq 0 ] || { echo "WARNING: $left of our processes still on a GPU"; exit 1; }
 echo "V16 PRELIM DONE $(date)"
