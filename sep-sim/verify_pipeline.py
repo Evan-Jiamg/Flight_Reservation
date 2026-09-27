@@ -716,7 +716,37 @@ def check_vllm_generation(rl_dir, rollouts, meta, rep, abort=0.1):
                     w, mm, st.get("tis_w_mean") or 0.0, st.get("tis_capped_frac") or 0.0))
 
 
+def check_intervention(rl_dir, rep):
+    """A user-approved intervention (run_meta rows "intervention"): one record for the whole run, the first
+    update after it used the set values, and every later update's weights lie inside the new bounds."""
+    mp, up = os.path.join(rl_dir, "run_meta.jsonl"), os.path.join(rl_dir, "updates.jsonl")
+    if not os.path.exists(mp):
+        return
+    ivs = [r["intervention"] for r in (json.loads(l) for l in open(mp, encoding="utf-8") if l.strip())
+           if r.get("intervention")]
+    if not ivs:
+        return
+    rep.ok("rl.intervention", len({(i["at_update"], i["file_sha256"]) for i in ivs}) == 1, "run_meta",
+           "more than one intervention record: %r" % sorted({(i["at_update"], i["file_sha256"]) for i in ivs}))
+    iv = ivs[0]
+    rows = [json.loads(l) for l in open(up, encoding="utf-8") if l.strip()] if os.path.exists(up) else []
+    for u in rows:
+        if u.get("update", 0) < iv["at_update"]:
+            continue
+        cfg, w = u.get("cfg_used") or {}, "update %s" % u.get("update")
+        if u["update"] == iv["at_update"]:
+            for k, v in iv["set_cfg"].items():
+                rep.ok("rl.intervention", abs(float(cfg.get(k, float("nan"))) - float(v)) < 1e-9, w,
+                       "%s used %r, intervention set %r" % (k, cfg.get(k), v))
+        for k, (lo, hi) in (iv.get("controller_bounds") or {}).items():
+            rep.ok("rl.intervention", cfg.get(k) == 0 or lo - 1e-9 <= float(cfg.get(k, float("nan"))) <= hi + 1e-9, w,
+                   "%s=%r outside the intervention bounds [%g, %g]" % (k, cfg.get(k), lo, hi))
+    rep.note("rl.intervention", "applied before update %s: %s bounds %s (%s)" % (
+        iv["at_update"], iv["set_cfg"], iv.get("controller_bounds"), iv.get("approved")))
+
+
 def check_rl(rl_dir, rollouts, ckpt_pattern, rep):
+    check_intervention(rl_dir, rep)
     for r in rollouts:
         for s in r.get("trace") or []:
             w = "%s s%s t%s" % (str(r.get("conversation_id"))[:12], r.get("seed"), s.get("t"))

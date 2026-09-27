@@ -56,7 +56,7 @@ TIME_KEYS = ("time", "wall_s", "rollout_s", "update_s", "timing", "validation_s"
              "planner_s", "speaker_s", "r0_s", "ledger_s")
 VAL_RETRIES = 2          # an unclean validation episode (infrastructure incident) is re-run up to this many times
 RESUME_MAY_CHANGE = ("resume", "allow_code_change", "updates", "rollout_workers", "gpu", "max_batch",
-                     "keep_optimizer_last", "dry_run_crash_after_episodes", "vllm_url")
+                     "keep_optimizer_last", "dry_run_crash_after_episodes", "vllm_url", "intervention")
 
 
 # ------------------------------------------------------------------ small utilities
@@ -401,6 +401,7 @@ class Trainer:
         self.history, self.best, self.update_done = [], None, 0
         self.task1_base = None       # Task 1 stop metrics of the starting policy (update 0 validation)
         self.aux_anneal_start = None # D2: first update at which validation Task 1 term_f1 beat task1_base
+        self.intervention = None     # a human intervention on the controller, once applied (see apply_intervention)
         self.p_h = None              # v4: smoothed human length distribution of the TRAIN conversations
         self.env = self.learner = None
         self.n_new_episodes = 0
@@ -470,6 +471,42 @@ class Trainer:
             return w
         return w * max(0.0, 1.0 - (u - self.aux_anneal_start) / float(self.a.stop_sup_anneal))
 
+    def apply_intervention(self):
+        """Human intervention approved by the user (--intervention FILE, JSON {"set_cfg": {key: value},
+        "controller_bounds": {key: [lo, hi]}, "reason": str, "approved": str}). The bounds are set at EVERY
+        launch (the controller options are rebuilt from the config each time); the values are set ONCE, before
+        the next update, and the record (update, file sha) is kept in every later checkpoint. Once applied, every
+        later launch must pass the same file: the tightened bounds must not silently revert."""
+        a = self.a
+        if not a.intervention:
+            if self.intervention:
+                raise SystemExit("an intervention was applied at update %s; pass the same --intervention"
+                                 % self.intervention["at_update"])
+            return None
+        if not hasattr(self.controller, "intervene"):
+            raise SystemExit("--intervention needs the llm (v4 factor) controller")
+        iv = json.load(open(a.intervention, encoding="utf-8"))
+        extra = set(iv) - {"set_cfg", "controller_bounds", "reason", "approved"}
+        if extra or not iv.get("set_cfg") or not iv.get("reason") or not iv.get("approved"):
+            raise SystemExit("intervention file needs set_cfg, reason, approved (unknown keys %r)" % sorted(extra))
+        sha = sha_file(a.intervention)
+        for k, (lo, hi) in (iv.get("controller_bounds") or {}).items():
+            self.controller.set_bounds(k, lo, hi)
+        if self.intervention is None:
+            u = self.update_done + 1
+            self.cfg = self.controller.intervene(iv["set_cfg"], u, iv["reason"])
+            self.intervention = {"at_update": u, "file_sha256": sha, **iv}
+            print("INTERVENTION applied before update %d: %s bounds %s" % (u, iv["set_cfg"], iv.get("controller_bounds")),
+                  flush=True)
+        elif self.intervention["file_sha256"] != sha:
+            raise SystemExit("intervention file changed after it was applied (sha %s -> %s)"
+                             % (self.intervention["file_sha256"], sha))
+        for k in self.controller.opt["keys"]:
+            lo, hi = self.controller.opt["bounds"][k]
+            if self.cfg[k] != 0 and not (lo <= self.cfg[k] <= hi):
+                raise SystemExit("%s=%g outside the controller bounds [%g, %g] after the intervention" % (k, self.cfg[k], lo, hi))
+        return self.intervention
+
     def meta(self, kind):
         a = self.a
         row = {"kind": kind, "time": time.time(), "code_sha256": code_shas(),
@@ -513,7 +550,7 @@ class Trainer:
         state = {"update": u, "policy_version": u, "policy_sha": self.learner.policy_sha(),
                  "cfg": self.cfg, "controller": self.controller.state_dict(), "history": self.history,
                  "best": self.best, "update_row": update_row, "task1_base": self.task1_base,
-                 "aux_anneal_start": self.aux_anneal_start,
+                 "aux_anneal_start": self.aux_anneal_start, "intervention": self.intervention,
                  "python_rng": [rng["python"][0], list(rng["python"][1]), rng["python"][2]]}
         write_json_atomic(os.path.join(tmp, "state.json"), state)
         write_json_atomic(os.path.join(tmp, "rl_manifest.json"), self.manifest())
@@ -553,6 +590,7 @@ class Trainer:
         self.cfg, self.history, self.best, self.update_done = st["cfg"], st["history"], st["best"], u
         self.task1_base = st.get("task1_base")
         self.aux_anneal_start = st.get("aux_anneal_start")
+        self.intervention = st.get("intervention")
         py = st["python_rng"]
         random.setstate((py[0], tuple(py[1]), py[2]))
         if not self.a.dry_run:
@@ -964,6 +1002,8 @@ class Trainer:
         if not resumed and os.path.exists(os.path.join(self.ckpt_root, "LATEST.json")):
             raise SystemExit("%s already has checkpoints; pass --resume or use a new --out" % a.out)
         row = self.meta("resume" if resumed else "start")
+        row["intervention"] = self.apply_intervention()
+        row["intervention_file_sha256"] = sha_file(a.intervention) if a.intervention else None
         self.check_provenance(row)
         append_jsonl(os.path.join(a.out, "run_meta.jsonl"), row)
         if not resumed:
@@ -1060,6 +1100,8 @@ def parse_args(argv=None):
     ap.add_argument("--out", required=True)
     ap.add_argument("--resume", action="store_true")
     ap.add_argument("--allow-code-change", action="store_true")
+    ap.add_argument("--intervention", default=None,
+                    help="JSON file of a user-approved intervention on the controller weights/bounds (see apply_intervention)")
     ap.add_argument("--keep-optimizer-last", type=int, default=3,
                     help="delete optimizer.pt of checkpoints older than this many updates (adapters kept); 0 = keep all")
     ap.add_argument("--gpu", type=int, default=0)

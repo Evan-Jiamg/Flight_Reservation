@@ -421,7 +421,8 @@ class LLMFactorController(Controller):
         if self.pending is not None and shadow is not None:
             self.pending["bad"] = self.pending["bad"] + 1 if shadow < self.pending["baseline"] else 0
             if self.pending["bad"] >= int(self.opt["rollback_windows"]):
-                self.cfg = validate_cfg(self.pending["prev_cfg"])
+                # a rollback stays inside the CURRENT bounds (a human intervention may have tightened them)
+                self.cfg = validate_cfg(self.clamp(self.pending["prev_cfg"]))
                 self.n_rollbacks += 1
                 rec.update(ok=True, rollback=True, cfg_after={k: self.cfg[k] for k in self.opt["keys"]})
                 self.pending = None
@@ -472,6 +473,43 @@ class LLMFactorController(Controller):
             rec.update(ok=False, error="%s: %s" % (type(e).__name__, e))
         rec["cfg_after"] = {k: self.cfg[k] for k in self.opt["keys"]}
         self._log(rec)
+        return copy.deepcopy(self.cfg)
+
+    def clamp(self, cfg):
+        cfg = copy.deepcopy(cfg)
+        for k in self.opt["keys"]:
+            lo, hi = self.opt["bounds"][k]
+            if cfg[k] != 0:
+                cfg[k] = min(hi, max(lo, cfg[k]))
+        return cfg
+
+    def set_bounds(self, key, lo, hi):
+        """Human intervention: new controller bounds for one key (checked like the constructor's)."""
+        if key not in self.opt["keys"]:
+            raise ValueError("%s is not a controller key" % key)
+        lo, hi = float(lo), float(hi)
+        if not (CFG_BOUNDS[key][0] <= lo <= hi <= CFG_BOUNDS[key][1]):
+            raise ValueError("controller bounds for %s outside the reward bounds" % key)
+        self.opt["bounds"][key] = [lo, hi]
+
+    def intervene(self, set_cfg, at_update, reason):
+        """Human intervention on the weights: the values are set, must lie inside the bounds, and the
+        change under suspicion (pending) is dropped - a rollback must never undo a human decision. The
+        LLM sees the intervention among its earlier decisions."""
+        cfg = copy.deepcopy(self.cfg)
+        for k, v in set_cfg.items():
+            if k not in self.opt["keys"]:
+                raise ValueError("%s is not a controller key" % k)
+            lo, hi = self.opt["bounds"][k]
+            if not (lo <= float(v) <= hi):
+                raise ValueError("intervention %s=%g outside the controller bounds [%g, %g]" % (k, v, lo, hi))
+            cfg[k] = float(v)
+        self.cfg = validate_cfg(cfg)
+        self.pending = None
+        self.decisions.append({"at_update": at_update, "human_intervention": dict(set_cfg), "reason": reason})
+        self._log({"time": time.time(), "update": at_update, "ok": True, "human_intervention": dict(set_cfg),
+                   "bounds": {k: self.opt["bounds"][k] for k in self.opt["keys"]}, "reason": reason,
+                   "cfg_after": {k: self.cfg[k] for k in self.opt["keys"]}})
         return copy.deepcopy(self.cfg)
 
     def state_dict(self):
