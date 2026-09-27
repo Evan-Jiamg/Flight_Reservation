@@ -745,11 +745,17 @@ def check_intervention(rl_dir, rep):
         iv["at_update"], iv["set_cfg"], iv.get("controller_bounds"), iv.get("approved")))
 
 
+def sha256_file(path):
+    import hashlib
+    with open(path, "rb") as f:
+        return hashlib.sha256(f.read()).hexdigest()
+
+
 def _jl(path):
     return [json.loads(l) for l in open(path, encoding="utf-8") if l.strip()] if os.path.exists(path) else []
 
 
-def check_v16(rl_dir, rep):
+def check_v16(rl_dir, rep, splits_path=None):
     """SPEC v16 (user 2026-09-28): Task 1 refill / group size, Dr. GRPO setting, aux floor and supervision, w_dist
     floor, the continuous Task 1 metric (recomputed from the logged end probabilities) and the two-point D2 trigger
     (recomputed from the validation bal_p values)."""
@@ -765,12 +771,17 @@ def check_v16(rl_dir, rep):
     rep.ok("rl.adv_norm", acfg.get("grpo_std_norm") is False, "run_meta",
            "algo_cfg.grpo_std_norm %r (spec v16: false)" % acfg.get("grpo_std_norm"))
     train_all = None
+    sp_path = splits_path or args.get("splits")
     try:
-        sp = json.load(open(args["splits"], encoding="utf-8"))
+        sp = json.load(open(sp_path, encoding="utf-8"))
         f = {int(x["fold"]): x for x in sp["folds"]}[int(args["fold"])]
         train_all = set(f.get("train_all", f.get("train", [])))
+        want = meta[0].get("splits_sha256")
+        if want:
+            rep.ok("rl.task1_refill", sha256_file(sp_path) == want, "splits",
+                   "split file %r is not the one the run used (sha differs)" % sp_path)
     except Exception as e:                       # never skipped silently
-        rep.ok("rl.task1_refill", False, "splits", "cannot read the run's split file %r: %r" % (args.get("splits"), e))
+        rep.ok("rl.task1_refill", False, "splits", "cannot read the split file %r: %r" % (sp_path, e))
     upd = {u["update"]: u for u in _jl(os.path.join(rl_dir, "updates.jsonl"))}
     # ---- Task 1 groups: the update's own record of its groups decides which rows count (an aborted attempt may
     # have left rows of other groups; a conversation with no decision position leaves no row at all)
@@ -830,7 +841,10 @@ def check_v16(rl_dir, rep):
     base_v = next((v for v in vsum if v.get("task1") and v["task1"].get("bal_p") is not None), None)
     t_at, streak = None, 0
     for v in vsum:
-        if base_v is None or v["update"] <= base_v["update"] or not v.get("task1") or v["task1"].get("bal_p") is None:
+        if base_v is None or v["update"] <= base_v["update"]:
+            continue
+        if not v.get("task1") or v["task1"].get("bal_p") is None:
+            streak = 0                           # the trainer reads a validation without Task 1 as "not met"
             continue
         met = v["task1"]["bal_p"] >= base_v["task1"]["bal_p"] + margin
         streak = streak + 1 if met else 0
@@ -879,6 +893,11 @@ def check_v16(rl_dir, rep):
         if not rows or not v.get("task1"):
             continue
         pts = [p_ for r in rows.values() for p_ in (r.get("end_probs") or [])]
+        for p_ in pts:
+            if not p_.get("valid", True) and "decision_valid" in p_:
+                want = 1.0 if (p_["decision_valid"] and p_.get("greedy_end")) else 0.0
+                rep.ok("rl.task1_prob", float(p_["p_end"]) == want, w,
+                       "t%s: unscored point p_end %r, expected %r" % (p_.get("t"), p_["p_end"], want))
         ok_rng = all(0.0 <= float(p_["p_end"]) <= 1.0 for p_ in pts)
         rep.ok("rl.task1_prob", ok_rng, w, "an end probability outside [0, 1]")
         n_exp = sum(len(r["task1"]["turns"]) - 1 for r in rows.values())
@@ -889,9 +908,9 @@ def check_v16(rl_dir, rep):
                    "summary bal_p %r != recomputed %r" % (v["task1"].get("bal_p"), m["bal_p"]))
 
 
-def check_rl(rl_dir, rollouts, ckpt_pattern, rep):
+def check_rl(rl_dir, rollouts, ckpt_pattern, rep, splits_path=None):
     check_intervention(rl_dir, rep)
-    check_v16(rl_dir, rep)
+    check_v16(rl_dir, rep, splits_path)
     for r in rollouts:
         for s in r.get("trace") or []:
             w = "%s s%s t%s" % (str(r.get("conversation_id"))[:12], r.get("seed"), s.get("t"))
@@ -1015,7 +1034,7 @@ def verify(episodes, meta_path, splits_path, fold, split, arm=None, training=Fal
     check_truncation(all_rows, arm, meta, sb, judge_budget, max_new_warn, rep)
     {"a2": check_a2, "pend": check_pend, "a0": check_a0}[check_family(arm)](all_rows, rep, arm)
     if rl_dir:
-        check_rl(rl_dir, rollouts, ckpt_pattern, rep)
+        check_rl(rl_dir, rollouts, ckpt_pattern, rep, splits_path)
         check_vllm_generation(rl_dir, rollouts, meta, rep)
         check_rl_selection(rl_dir, splits, fold, rep)
         vp = os.path.join(rl_dir, "validation.jsonl")
