@@ -88,3 +88,33 @@ def test_f6_controller_scales_aux_after_the_anneal():
     assert any(u["cfg_used"]["w_aux"] > 1.0 and u["train_aggregate"]["aux_weight"] > 0.5 for u in late), \
         "the stub controller raises w_aux: the effective weight must follow it"
     assert all(c["fail"] == 0 for c in v16_report(out).checks.values())
+
+
+def test_r1_refill_conversation_without_rows_is_not_a_false_failure(monkeypatch):
+    # a drawn refill conversation that leaves no row (one message / capped history) still counts in n_refill_convs
+    import tempfile
+    from test_v16 import make_big_splits
+    orig = T.FakeEnv.task1_sample
+
+    def never_end(self, *a, **k):
+        out = orig(self, *a, **k)
+        for x in out:
+            x["ended_planner"] = False
+            x["reward"] = float(not x["real_final"])
+        return out
+    monkeypatch.setattr(T.FakeEnv, "task1_sample", never_end)
+    d = tempfile.mkdtemp()
+    sp, out = make_big_splits(d), os.path.join(d, "run")
+    run(sp, out, updates=1)
+    pu, pt = os.path.join(out, "updates.jsonl"), os.path.join(out, "rollouts_task1.jsonl")
+    ups, t1 = T.read_jsonl(pu), T.read_jsonl(pt)
+    th = ups[0]["train_aggregate"]["task1_train"]
+    assert th["refill_stop"] == "cap" and th["n_refill_convs"] == 8
+    gone = th["refill_convs"][0]                                             # pretend it produced no row
+    th["refill_convs"] = th["refill_convs"][1:]
+    th["groups"] = [g for g in th["groups"] if g[0] != gone]
+    th["n_refill_groups"] = sum(1 for g in th["groups"] if g[2])
+    _rewrite(pu, ups)
+    _rewrite(pt, [r for r in t1 if r["conversation_id"] != gone])
+    rep = v16_report(out)
+    assert rep.checks["rl.task1_refill"]["fail"] == 0, rep.checks["rl.task1_refill"]

@@ -834,9 +834,14 @@ def check_v16(rl_dir, rep, splits_path=None):
             rep.ok("rl.task1_refill", not refill and stop_ == "none_needed", w,
                    "refill drawn although the base groups had no deficit (stop %r)" % stop_)
         else:
+            # a drawn refill conversation may leave no row (one message, or both positions after a capped
+            # message): the trainer's own count n_refill_convs includes it, the refill_convs list does not
+            n_ref = int(th.get("n_refill_convs") or 0)
+            rep.ok("rl.task1_refill", n_ref >= len(refill), w,
+                   "n_refill_convs %d < %d refill conversations with rows" % (n_ref, len(refill)))
             want_ok = {"filled": inf_all >= n_base,
-                       "cap": len(refill) == int(args["task1_convs"]) and inf_all < n_base,
-                       "pool_empty": (train_all is None or len(base | refill) == len(train_all)) and inf_all < n_base}
+                       "cap": n_ref == int(args["task1_convs"]) and inf_all < n_base,
+                       "pool_empty": (train_all is None or len(base) + n_ref == len(train_all)) and inf_all < n_base}
             rep.ok("rl.task1_refill", bool(want_ok.get(stop_)), w,
                    "refill_stop %r inconsistent (informative %d / %d base groups, %d refill convs)"
                    % (stop_, inf_all, n_base, len(refill)))
@@ -922,10 +927,13 @@ def _check_t1prob_file(rl_dir, fname, rep, real_vllm):
         w = "%s u%s" % (fname.split(".")[0], v["update"])
         if fname == "reselect.jsonl" and v.get("selection_score") is not None and v.get("task1"):
             ts = v.get("turn_stats") or {}
-            want = (v["w_sel_cov"] * ts["coverage_mean"] - v["w_sel_w1"] * ts["turn_w1"]
-                    + v["w_sel_task1"] * v["task1"][v.get("selection_task1_metric", "term_f1")])
-            rep.ok("rl.selection", abs(v["selection_score"] - want) < 1e-9, w,
-                   "re-selection score %r != recomputed %r" % (v["selection_score"], want))
+            m1 = v.get("selection_task1_metric")
+            rep.ok("rl.selection", m1 == "bal_p", w, "a v16 re-selection must select on bal_p, summary says %r" % m1)
+            parts = (ts.get("coverage_mean"), ts.get("turn_w1"), v["task1"].get(m1 or "term_f1"))
+            if rep.ok("rl.selection", None not in parts, w, "re-selection summary lacks a selection part %r" % (parts,)):
+                want = v["w_sel_cov"] * parts[0] - v["w_sel_w1"] * parts[1] + v["w_sel_task1"] * parts[2]
+                rep.ok("rl.selection", abs(v["selection_score"] - want) < 1e-9, w,
+                       "re-selection score %r != recomputed %r" % (v["selection_score"], want))
         rows = {}
         for r in vrows:
             if r.get("kind") == "task1" and r["update"] == v["update"] and r.get("policy_sha") == v.get("policy_sha"):

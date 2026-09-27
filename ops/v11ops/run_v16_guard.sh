@@ -20,6 +20,8 @@ release() {
   done
   echo "GUARD: GPUs released $(date)"
 }
+if grep -q "not launching" $G/run_v16_launch.log 2>/dev/null; then
+  echo "GUARD: the launcher refused to start - nothing to guard, nothing released $(date)"; exit 1; fi
 for retry in $(seq 1 20); do
   if grep -q "V16 FORMAL DONE" $L; then echo "GUARD: formal run finished $(date)"; release; exit 0; fi
   if grep -q "STOP: training failed" $L && tail -300 $RUN/train.log | grep -qE "CUDA out of memory|OutOfMemoryError"; then

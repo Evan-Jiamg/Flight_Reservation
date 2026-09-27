@@ -175,6 +175,11 @@ def main(argv=None):
     print(json.dumps({k: v for k, v in res.items() if k != "trajectories"}, indent=1))
     for p_ in per:
         print("  %s n=%d cov %s" % (p_["conversation_id"], p_["n"], p_["cov"]))
+    orphans = TE.orphan_incidents()                   # judge incidents outside any conversation's counters
+    if orphans:
+        raise SystemExit("step 0: %d judge incident(s) outside the per-conversation counters" % orphans)
+    if not by:
+        raise SystemExit("step 0: no clean conversation (every one failed or had judge incidents)")
     return res
 
 
