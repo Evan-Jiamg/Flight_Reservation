@@ -176,8 +176,8 @@ def main(argv=None):
     res["p_last_by_cov_prev"] = {"%.1f-%.1f" % (b / 5, (b + 1) / 5): {"last": v[0], "n": v[1]} for b, v in sorted(buckets.items())}
     per = [{"conversation_id": cid[:10], "n": len(rs), "cov": [round(rs[t]["cov"], 2) for t in sorted(rs)]} for cid, rs in sorted(by.items())]
     res["trajectories"] = per
-    json.dump(res, open(a.out + ".summary.json", "w", encoding="utf-8"), indent=1)
-    print(json.dumps({k: v for k, v in res.items() if k != "trajectories"}, indent=1))
+    json.dump(res, open(a.out + ".summary.json", "w", encoding="utf-8"), indent=1, default=str)   # judge.cache_dir is a Path
+    print(json.dumps({k: v for k, v in res.items() if k != "trajectories"}, indent=1, default=str))
     for p_ in per:
         print("  %s n=%d cov %s" % (p_["conversation_id"], p_["n"], p_["cov"]))
     orphans = TE.orphan_incidents()                   # judge incidents outside any conversation's counters
