@@ -516,6 +516,17 @@ class TorchLearner:
     def load(self, d):
         import os
         import torch
+        self.load_policy(d)
+        dev = next(self.model.parameters()).device
+        if self.value_head is not None:
+            self.value_head.load_state_dict(torch.load(os.path.join(d, "value_head.pt"), map_location=dev))
+        self.optimizer.load_state_dict(torch.load(os.path.join(d, "optimizer.pt"), map_location=dev))
+
+    def load_policy(self, d):
+        """The LoRA policy of a checkpoint only (no optimizer: old checkpoints keep only their adapter).
+        Used to evaluate earlier checkpoints (checkpoint re-selection)."""
+        import os
+        import torch
         from peft import set_peft_model_state_dict
         from safetensors.torch import load_file
         sd = load_file(os.path.join(d, "adapter", "adapter_model.safetensors"))
@@ -526,10 +537,6 @@ class TorchLearner:
         for p in self.model.parameters():
             if p.requires_grad and p.dtype != torch.float32:
                 p.data = p.data.float()
-        dev = next(self.model.parameters()).device
-        if self.value_head is not None:
-            self.value_head.load_state_dict(torch.load(os.path.join(d, "value_head.pt"), map_location=dev))
-        self.optimizer.load_state_dict(torch.load(os.path.join(d, "optimizer.pt"), map_location=dev))
 
 
 def rng_state():

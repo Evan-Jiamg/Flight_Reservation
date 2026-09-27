@@ -56,7 +56,8 @@ TIME_KEYS = ("time", "wall_s", "rollout_s", "update_s", "timing", "validation_s"
              "planner_s", "speaker_s", "r0_s", "ledger_s")
 VAL_RETRIES = 2          # an unclean validation episode (infrastructure incident) is re-run up to this many times
 RESUME_MAY_CHANGE = ("resume", "allow_code_change", "updates", "rollout_workers", "gpu", "max_batch",
-                     "keep_optimizer_last", "dry_run_crash_after_episodes", "vllm_url", "intervention")
+                     "keep_optimizer_last", "dry_run_crash_after_episodes", "vllm_url", "intervention",
+                     "reselect_seeds")
 
 
 # ------------------------------------------------------------------ small utilities
@@ -271,6 +272,9 @@ class FakeLearner:
     def load(self, d):
         s = json.load(open(os.path.join(d, "fake_learner.json")))
         self.theta, self.value, self.m = s["theta"], s["value"], s["m"]
+
+    def load_policy(self, d):
+        self.theta = json.load(open(os.path.join(d, "fake_learner.json")))["theta"]
 
 
 class FakeEnv:
@@ -879,16 +883,21 @@ class Trainer:
         return row
 
     # -------------------------------------------------------- validation
-    def validate(self, u):
+    def validate(self, u, seeds=None, p_val=None, reselect=False):
         """Task 2 episodes on the validation ids with the SAMPLED Planner (D5: --val-temperature, one
         replicate per --val-seeds entry) + Task 1 (greedy, as the benchmark); logged only to validation.jsonl;
-        drives best.json and the D2 annealing trigger. Never enters history or the controller."""
+        drives best.json and the D2 annealing trigger. Never enters history or the controller.
+        reselect=True (checkpoint re-selection, user 2026-09-27): the same procedure with other seeds into another
+        file (p_val), without any side effect (best.json, task1_base, D2 trigger and the checkpoints untouched)."""
         _tv = time.time()
         self.sync_generation_policy(u)          # validation generates with the policy after update u
         a = self.a
-        prev = read_jsonl(self.p_val)
-        if any(r.get("kind") == "summary" and r["update"] == u for r in prev):
-            return
+        seeds = list(a.val_seeds if seeds is None else seeds)
+        p_val = p_val or self.p_val
+        prev = read_jsonl(p_val)
+        for r in prev:
+            if r.get("kind") == "summary" and r["update"] == u:
+                return r
         done = {(r["conversation_id"], r["seed"]): r for r in prev if r.get("kind") == "episode" and r["update"] == u}
         done_t1 = {r["conversation_id"]: r for r in prev if r.get("kind") == "task1" and r["update"] == u}
         psha = self.learner.policy_sha()
@@ -896,7 +905,7 @@ class Trainer:
         for cid in sorted(self.split["validation"]):
             assert cid in self.split["validation"] and cid not in self.split["train"] \
                 and cid not in self.split["train_all"], "validation id %r is also a training id" % cid
-            for s in a.val_seeds:
+            for s in seeds:
                 jobs.append((cid, s))
 
         def run_val(job):
@@ -911,7 +920,7 @@ class Trainer:
                 r = {"kind": "episode", "update": u, "policy_sha": psha, "conversation_id": cid, "seed": s,
                      "attempt": attempt, "split": "validation", "episode": ep, "time": time.time()}
                 with self.io_lock:
-                    append_jsonl(self.p_val, r)
+                    append_jsonl(p_val, r)
                 if ep["clean"] or attempt >= VAL_RETRIES:
                     return r
                 attempt += 1                    # an infrastructure incident, not the policy: run it again
@@ -922,7 +931,7 @@ class Trainer:
                 r = {"kind": "task1", "update": u, "policy_sha": psha, "conversation_id": cid,
                      "split": "validation", "task1": self.env.run_task1(cid), "time": time.time()}
                 with self.io_lock:
-                    append_jsonl(self.p_val, r)
+                    append_jsonl(p_val, r)
             return r
 
         if not hasattr(self.env, "run_task1"):
@@ -948,13 +957,13 @@ class Trainer:
                                              [min(int(e["human_turns"]), int(self.selection_cfg["t_max"])) for e in eps]),
                           "end_kinds": {k: sum(e["end_kind"] == k for e in eps) for k in sorted({e["end_kind"] for e in eps})}}
         t1 = T1.task1_stop_metrics([r["task1"] for r in t1rows]) if t1rows else None
-        if t1 is not None and self.task1_base is None:
+        if not reselect and t1 is not None and self.task1_base is None:
             self.task1_base = {"update": u, **t1}
             sp = os.path.join(self.ckpt_dir(self.update_done), "state.json")
             st = json.load(open(sp))
             st["task1_base"] = self.task1_base         # persisted now: a crash in update 1 must not lose it
             write_json_atomic(sp, st)
-        if t1 is not None and self.aux_anneal_start is None and u > self.task1_base["update"] \
+        if not reselect and t1 is not None and self.aux_anneal_start is None and u > self.task1_base["update"] \
                 and t1["term_f1"] > self.task1_base["term_f1"]:
             self.aux_anneal_start = u            # D2: from here the stop supervision goes linearly to 0
             sp = os.path.join(self.ckpt_dir(self.update_done), "state.json")
@@ -974,7 +983,7 @@ class Trainer:
                                   if withheld else None,
                                   "validation_s": round(time.time() - _tv, 1),
                                   "n_episodes": len(totals), "n_unclean_episodes": n_unclean,
-                                  "val_temperature": a.val_temperature, "val_seeds": a.val_seeds,
+                                  "val_temperature": a.val_temperature, "val_seeds": seeds, "reselect": reselect,
                                   "mean_reward_selection": score, "aux_anneal_start": self.aux_anneal_start,
                                   "turn_stats": turn_stats, "task1": t1, "task1_base": self.task1_base,
                                   "task1_within_tol": t1_ok, "task1_tol": a.task1_tol,
@@ -982,7 +991,7 @@ class Trainer:
                                   "w_sel_w1": a.w_sel_w1, "w_sel_cov": a.w_sel_cov,
                                   "selection_formula": "w_sel_cov*coverage_mean - w_sel_w1*turn_w1 + w_sel_task1*task1.term_f1",
                                   "selection_cfg_sha256": RR.cfg_sha(self.selection_cfg), "time": time.time()}
-        if sel is not None and (self.best is None or sel > self.best["selection_score"]):
+        if not reselect and sel is not None and (self.best is None or sel > self.best["selection_score"]):
             self.best = {"update": u, "checkpoint": os.path.relpath(self.ckpt_dir(u), a.out).replace("\\", "/"),
                          "policy_sha": psha, "mean_reward_selection": score, "selection_score": sel,
                          "selection_cfg_sha256": RR.cfg_sha(self.selection_cfg)}
@@ -992,7 +1001,51 @@ class Trainer:
             st = json.load(open(sp))
             st["best"] = self.best
             write_json_atomic(sp, st)
-        append_jsonl(self.p_val, summary)
+        append_jsonl(p_val, summary)
+        return summary
+
+    # -------------------------------------------------------- checkpoint re-selection
+    def reselect(self):
+        """Checkpoint re-selection (user 2026-09-27): every checkpoint that was validated during training is
+        validated again with --reselect-seeds (same validation ids, temperature, env, clean re-run rule and
+        selection formula as validate()); results go to reselect.jsonl, the choice to reselect_best.json.
+        Training files (validation.jsonl, best.json, checkpoints) are never written."""
+        a = self.a
+        self.build()
+        last = json.load(open(os.path.join(self.ckpt_root, "LATEST.json")))["update"]
+        st = json.load(open(os.path.join(self.ckpt_dir(last), "state.json")))
+        self.task1_base, self.update_done = st.get("task1_base"), last
+        cands = sorted({r["update"] for r in read_jsonl(self.p_val) if r.get("kind") == "summary"})
+        if not cands:
+            raise SystemExit("no validated checkpoint in %s" % self.p_val)
+        row = self.meta("reselect")
+        self.check_provenance(row)
+        out = os.path.join(a.out, "reselect.jsonl")
+        append_jsonl(os.path.join(a.out, "reselect_meta.jsonl"),
+                     {**row, "candidates": cands, "seeds": list(a.reselect_seeds)})
+        summaries = []
+        for u in cands:
+            d = self.ckpt_dir(u)
+            cst = json.load(open(os.path.join(d, "state.json")))
+            self.learner.load_policy(d)
+            if self.learner.policy_sha() != cst["policy_sha"]:
+                raise AssertionError("checkpoint u%d: loaded policy sha differs from its record" % u)
+            s = self.validate(u, seeds=a.reselect_seeds, p_val=out, reselect=True)
+            summaries.append(s)
+            print(json.dumps({"reselect_update": u, "selection_score": s["selection_score"],
+                              "withheld": s["selection_withheld"], "n_episodes": s["n_episodes"]}), flush=True)
+        ok = [s for s in summaries if s["selection_score"] is not None]
+        best = max(ok, key=lambda s: (s["selection_score"], -s["update"])) if ok else None
+        rec = {"seeds": list(a.reselect_seeds), "candidates": {str(s["update"]): s["selection_score"] for s in summaries},
+               "withheld": [s["update"] for s in summaries if s["selection_score"] is None],
+               "selection_formula": summaries[0]["selection_formula"],
+               "selection_cfg_sha256": RR.cfg_sha(self.selection_cfg),
+               "best": None if best is None else {
+                   "update": best["update"], "selection_score": best["selection_score"], "policy_sha": best["policy_sha"],
+                   "checkpoint": os.path.relpath(self.ckpt_dir(best["update"]), a.out).replace("\\", "/")},
+               "time": time.time()}
+        write_json_atomic(os.path.join(a.out, "reselect_best.json"), rec)
+        return rec
 
     # -------------------------------------------------------- main loop
     def run(self):
@@ -1100,6 +1153,9 @@ def parse_args(argv=None):
     ap.add_argument("--out", required=True)
     ap.add_argument("--resume", action="store_true")
     ap.add_argument("--allow-code-change", action="store_true")
+    ap.add_argument("--reselect-seeds", type=int, nargs="+", default=None,
+                    help="checkpoint re-selection: re-validate every validated checkpoint with these seeds "
+                         "(writes reselect.jsonl / reselect_best.json only; no training)")
     ap.add_argument("--intervention", default=None,
                     help="JSON file of a user-approved intervention on the controller weights/bounds (see apply_intervention)")
     ap.add_argument("--keep-optimizer-last", type=int, default=3,
@@ -1154,7 +1210,10 @@ def parse_args(argv=None):
 
 
 def main(argv=None):
-    return Trainer(parse_args(argv)).run()
+    a = parse_args(argv)
+    if a.reselect_seeds:
+        return Trainer(a).reselect()
+    return Trainer(a).run()
 
 
 if __name__ == "__main__":
