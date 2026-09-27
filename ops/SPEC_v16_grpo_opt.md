@@ -1,4 +1,4 @@
-# SPEC v16：GRPO 優化（2026-09-28 使用者核准：第 1、2、3、6、7、8 點；第 4 點只做機制，數值待定；第 5 點不做）
+# SPEC v16：GRPO 優化（2026-09-28 使用者核准：第 1、2、3、4（下限 0.5）、6、7、8 點；第 5 點不做）
 
 每一項都寫明：改哪裡、確切行為、要記錄什麼、verify 要檢查什麼、要有哪些測試。
 實作與稽核一律以本文件為準。本文件沒寫到的行為一律**不變**（原 pend 規格：Implicit Profile、few-shot、Borda、vLLM backend、TIS、stop credit、note mask、reward v4、LLM 控制器、介入機制、重選機制等）。
@@ -28,13 +28,19 @@
 **記錄**（`task1_train`）：
 - 原有欄位：`n`、`acc`、`end_at_final`、`end_at_nonfinal`、`n_not_decisions`、`n_skipped_capped_history`、`groups_skipped_zero_std`。
 - 新增：`n_base_groups`、`n_refill_groups`、`n_refill_convs`、`n_informative_groups`、`refill_stop`（`"filled"` / `"pool_empty"` / `"cap"` / `"none_needed"`）。
-- `end_at_final` / `end_at_nonfinal` / `acc` 只用**基本組**計算，才能跨更新比較；另外新增 `acc_all`，涵蓋全部組。
+- `n` / `acc` / `end_at_final` / `end_at_nonfinal` 只用**基本組**計算，才能跨更新比較；另外新增 `acc_all`、`n_all`，涵蓋全部組。`n_not_decisions` 涵蓋全部組。
+- 群組紀錄（供 verify 使用）：`base_convs`（抽到的基本對話，包括沒有決策位置的）、`refill_convs`、`groups` = [[對話, t, 是否補抽], ...]。
 - `rollouts_task1.jsonl` 每列加上 `"refill"` 欄位。
 
-**verify**：
-- `rl.task1_refill`：補抽對話 ⊂ `train_all`，且和同一更新的基本對話不重複。
-- 補抽對話數 ≤ `task1_convs`。
-- aux 例子數 ≤ 基本組數。
+**verify**（稽核後修正版）：
+- 以該更新自己記錄的 `groups` 為準，每個 (對話, t) 取最後一列。這樣中止後重跑留下的舊列不會被算進來；沒有決策位置的對話也不會被當成缺漏。
+- `rl.task1_refill`：
+  - 補抽對話 ⊂ `train_all`，且和基本對話不重複；
+  - 補抽對話數 ≤ `task1_convs`；
+  - 每組的 `refill` 旗標和清單一致；
+  - `n_base_groups` / `n_refill_groups` 與清單一致。
+- `rl.task1_G`：`len(base_convs) == min(task1_convs, |train_all|)`；每組樣本數 == `task1_G`。
+- split 檔讀不到時判為 FAIL，不會默默跳過。
 
 **測試**：
 - dry run 中至少有一次更新觸發補抽，而且補抽組的 `refill` 為 true。
@@ -73,7 +79,7 @@
 
 **verify**：
 - `rl.adv_norm`：run_meta 裡 `algo_cfg.grpo_std_norm is False`。
-- `rl.adv_norm` 也要檢查 updates 裡的 `learner_stats`：新增 `adv_abs_mean`，只記錄不設門檻。
+- `rl.adv_norm` 也要檢查 updates 裡的 `learner_stats`：有樣本的每次更新都必須記錄 `adv_abs_mean`（只看有沒有記錄，不設門檻）。
 
 **測試**：
 - 數值：`[0, 1, 1, 0]` → `[-0.5, 0.5, 0.5, -0.5]`。
@@ -83,7 +89,7 @@
 
 ---
 
-## 項目 4：aux 權重下限（只做機制；數值待使用者決定）
+## 項目 4：aux 權重下限（使用者 2026-09-28 決定：0.5）
 
 - 新增 `--stop-sup-floor F`（絕對權重）。
 - `aux_weight(u, cfg) = max(F, w · anneal)`：
@@ -91,25 +97,25 @@
   - `anneal` 在 D2 未觸發時為 1，觸發後為 `max(0, 1 − (u − start) / stop_sup_anneal)`。
   - 也就是 **aux 永遠不會低於 F**，控制器仍然可以把 `w_aux` 往上調。
 - `--stop-sup-weight 0`（純 GRPO 對照）時，F 必須為 0，否則報錯。
-- `F > w` 時，實際權重為 F，並在 hist 記錄 `aux_floor_active: true`。
-- **SPEC 值 = 待定（`None`）**：
-  - 非 dry-run 時，若沒有明確給 `--stop-sup-floor`，拒絕執行，並提示「數值待使用者決定」；
-  - dry-run 時沒給則視為 0；
-  - 使用者決定後，改成 SPEC 預設值。
+- 當 F 大於「w × anneal」（下限前的值）時，實際權重為 F，並在 hist 記錄 `aux_floor_active: true`。
+- **SPEC 值 = 0.5**（使用者 2026-09-28 決定）。考量第 3 點會讓 RL 梯度變小，0.7 可能讓 aux 壓過 RL。其他值需要 `--ablation`。
 - 範圍：0 ≤ F ≤ 5。
-- LLM 控制器的系統提示中，「it is also annealed to 0 later」改為：「after validation Task 1 improves it is annealed towards a fixed floor of %g (never below it)」，並代入實際的 F。
+- LLM 控制器的系統提示中，「it is also annealed to 0 later」改為實作的字句：「once validation Task 1 improves it is annealed towards a fixed floor of %g and never goes below it」，並代入實際的 F。
 
-**記錄**：hist 裡的 `aux_weight` 是實際值，另加 `aux_floor`、`aux_floor_active`。
+**記錄**：hist 裡的 `aux_weight` 是實際值，另加 `aux_floor`、`aux_annealed`（下限前的值）、`aux_floor_active`。
 
 **verify**：
-- `rl.aux_floor`：每次更新的 `aux_weight ≥ aux_floor − 1e-12`。
-- `aux_n > 0`：只要 `aux_weight > 0` 且有 Task 1 位置。
+- `rl.aux_floor`：
+  - `aux_weight ≥ aux_floor`；
+  - `aux_weight == max(aux_floor, aux_annealed)`；
+  - `aux_weight > 0` 時，`aux_n` 必須**等於**基本組中帶有監督範例的組數（補抽組不可提供範例）。
+- `rl.d2_trigger`：只要 `aux_annealed < w_aux`（也就是正在退火），就必須在 D2 觸發之後。
 
 **測試**：
 - 衰減到下限就停住。
 - F = 0 時與舊行為相同。
 - `stop_sup_weight 0` 搭配 F > 0 時報錯。
-- 非 dry-run 沒給 F 時報錯。
+- 其他 F 值需要 `--ablation`；`--stop-sup-weight 0` 未給 F 時自動視為 0。
 
 ---
 
@@ -119,7 +125,9 @@
 - 其他鍵的上下限不變。
 - 介入機制保留。
 
-**verify**：`rl.w_dist_floor`：每次更新的 `cfg_used.w_dist ≥ 1.0`，僅限 v16 之後的 run；判斷方式是 run_meta 的 controller describe 中 bounds 為 1.0。
+**verify**：
+- `rl.w_dist_floor`：run_meta 記錄的控制器下限必須是 1.0（`--ablation` 除外）。
+- 每次更新 `cfg_used.w_dist ≥` 下限；使用者核准的介入若改了下限，從介入那次更新起改用介入的下限。
 
 **測試**：控制器提議 0.5 倍時，結果被夾在 1.0。
 
@@ -131,7 +139,10 @@
 - 在驗證對話的每個真實回合 t = 2..n（即決策點），取目前政策在該回合 **greedy** 生成的 Planner 輸出，也就是 Task 1 評估所用的同一份 prompt。
 - 以 end_session 值之前的前綴為條件，用 learner 做 teacher-forced 計算：`lp_true = log p("true" 值 token)`、`lp_false = log p("false" 值 token)`（`stop_target` 產生兩個版本）。
 - `P_end = exp(lp_true) / (exp(lp_true) + exp(lp_false))`。
-- 無效決策點（未解析、被 max_new 截斷、end_session 值無效、找不到 stop mask）視為 `P_end = 0`（和 benchmark 一致：未解析就是沒有結束），並計數 `n_invalid`。
+- 無效決策點（未解析、被 max_new 截斷、end_session 值無效）視為 `P_end = 0`（和 benchmark 一致：未解析就是沒有結束）。
+- 決策有效、但找不到值的 token 位置（沒有 stop mask）時，`P_end` 取它的 greedy 決定（1 或 0）。
+- 以上兩種都計入 `n_invalid`。
+- learner 的計算在 `env.gpu_lock` 之內進行，避免和 Speaker / Planner 同時使用 GPU。
 - 指標：
   - `bal_p = ½ · mean_{t=n} P_end + ½ · mean_{2≤t<n} (1 − P_end)`；若沒有任何 t < n 的點，只用前項。
   - 另外記錄：`auc`（最後一句與較早位置的 P_end 排序正確比例，平手算 ½）、`logloss`（對真實標籤的平均負對數機率，P 夾在 [1e-6, 1 − 1e-6]）、`n_points`、`n_final`、`n_invalid`。
@@ -167,7 +178,9 @@
   - summary 的 `bal_p` 可由該 update 各 task1 列的 `end_probs` 重算出來；
   - 每個 `p_end ∈ [0, 1]`；
   - 決策點數 = Σ(n − 1)。
-- `rl.d2_trigger`：`aux_anneal_start` 只能出現在連續兩點都達標之後。
+- `rl.d2_trigger`：
+  - 用各 summary 自己的 `task1.bal_p` 對「第一個 summary 的 bal_p + margin」**重新計算** met / streak / 觸發點，和記錄的 `d2` 比對，不採信記錄下來的值；
+  - 只能觸發一次，而且位置必須和重算結果相同。
 
 **測試**：
 - 指標數值：手算案例的 bal_p、auc、logloss。
@@ -191,8 +204,8 @@
 - 兩個 arm 之間做配對比較：
   - 要求兩者的對話集合**完全相同**，否則報錯；
   - 以對話為單位做 bootstrap，10000 次、seed 0；
-  - 輸出差值、95% CI、P(B > A)。
-- 輸出 JSON 與可讀文字；寫入各輸入檔的 sha256。
+  - 輸出差值、95% CI、`p_b_gt_a` = P(B > A)，以及 `p_b_better`（term_f1 / k1_end_rate 為 B > A，premature 類為 B < A）。
+- 輸出可讀文字；給 `--json-out` 時另外寫 JSON；記錄每個輸入檔（generations 和 `.k1.jsonl`）的 sha256。
 
 **測試**：
 - 合成檔案計算正確，並與 `task1_stop_metrics` 對照。
@@ -208,7 +221,7 @@
 ---
 
 ## 共通要求
-- 所有新 SPEC 值都要進 `parse_args` 的 SPEC gate：`task1_G` 8、`task1_convs` 8、`t1_trigger_margin` 0.10、`stop_sup_floor`（待定，必須明確給）。和 SPEC 值不同就需要 `--ablation`。
+- 所有新 SPEC 值都要進 `parse_args` 的 SPEC gate：`task1_G` 8、`task1_convs` 8、`t1_trigger_margin` 0.10、`stop_sup_floor` 0.5。和 SPEC 值不同就需要 `--ablation`。
 - `CODE_FILES` 加入 `task1_stop.py`（原本已有）；`task1_pooled.py` 是評估工具，另列。
 - provenance：新參數都自動進 run_meta 的 args，resume 時不可改。只有 `RESUME_MAY_CHANGE` 允許更改的例外，而**新參數都不加入**這份清單。
 - 既有測試全部通過；新增測試覆蓋每一項。

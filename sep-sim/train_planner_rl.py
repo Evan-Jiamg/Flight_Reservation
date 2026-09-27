@@ -9,15 +9,18 @@ Loop (update u = 1, 2, ...; the policy that generates update u's rollouts has po
      not clean (cut R0 reply, lost ledger verdict, emitted capped message, compacted prompt) are dropped;
   3. rewards = rl_reward.reward(episode, cfg, ctx) -- v4: coverage + log p_h(T) - log q(T) - penalties, p_h
      from splits[fold]["train_all"], q from this update's clean rollouts;
-  4. advantages normalised once per group, split into the stop part (end_session tokens) and the rest;
-     Task 1 stop groups on train_all conversations + the annealed stop supervision (D2);
+  4. group advantages R - mean(R) (v16 Dr. GRPO; no division by the group std), split into the stop part
+     (end_session tokens) and the rest; Task 1 stop groups on train_all conversations (--task1-convs x 2 positions,
+     --task1-G samples each, topped up with further conversations while groups carry no gradient) + the stop
+     supervision (never below --stop-sup-floor; annealed towards it after the D2 trigger);
      assert every sample was produced by the current policy_version (on-policy);
   5. checkpoint EVERY update (adapter, optimizer, controller state, RNG states, update index, policy_version,
      history, rl_manifest.json) atomically; then updates.jsonl;
   6. controller.propose(train aggregates only) -> cfg for the next update;
   7. every --val-every updates: SAMPLED-Planner episodes (D5) and greedy Task 1 on splits[fold]["validation"]
      -> validation.jsonl only; best.json = best checkpoint by w_sel_cov*coverage - w_sel_w1*W1(turn counts)
-     + w_sel_task1*Task 1 term_f1 (M2); unclean validation episodes are re-run, else the score is withheld.
+     + w_sel_task1*Task 1 bal_p (v16: teacher-forced end probabilities at every decision point; term_f1 (M2) is
+     reported); unclean validation episodes are re-run, else the score is withheld.
 Validation never enters history, reward statistics or the controller; the test ids are never read.
 
 --resume continues from ckpt/LATEST; rollouts of an interrupted update that were produced by the same
@@ -28,6 +31,7 @@ pure-python learner (no torch, no GPU) to test the loop, checkpointing and resum
 from __future__ import annotations
 
 import argparse
+import contextlib
 import copy
 import hashlib
 import json
@@ -426,7 +430,7 @@ class Trainer:
         self.cfg = copy.deepcopy(cfg0)
         self.history, self.best, self.update_done = [], None, 0
         self.task1_base = None       # Task 1 stop metrics of the starting policy (update 0 validation)
-        self.aux_anneal_start = None # D2: first update at which validation Task 1 term_f1 beat task1_base
+        self.aux_anneal_start = None # D2 (v16): validation update at which bal_p beat task1_base by the margin twice in a row
         self.intervention = None     # a human intervention on the controller, once applied (see apply_intervention)
         self.p_h = None              # v4: smoothed human length distribution of the TRAIN conversations
         self.env = self.learner = None
@@ -492,12 +496,16 @@ class Trainer:
         """Effective stop-supervision weight = max(--stop-sup-floor, cfg["w_aux"] x the D2 anneal); cfg["w_aux"] is the
         initial --stop-sup-weight, then tuned by the LLM controller from TRAIN statistics; the anneal is 1 until the
         D2 trigger (validation Task 1 bal_p above the untrained policy's by --t1-trigger-margin at two consecutive
-        validations, v16), then goes linearly to 0 over --stop-sup-anneal updates. v16 (user 2026-09-28): the
-        supervision never goes below the floor."""
+        validations, v16), then goes linearly to 0 over --stop-sup-anneal updates; the result never goes below
+        the floor (v16, user 2026-09-28)."""
+        return max(float(self.a.stop_sup_floor), self.aux_annealed(u, cfg))
+
+    def aux_annealed(self, u, cfg):
+        """cfg["w_aux"] x the D2 anneal, before the floor."""
         w = float(cfg["w_aux"])
         if self.aux_anneal_start is not None and self.a.stop_sup_anneal > 0:
             w = w * max(0.0, 1.0 - (u - self.aux_anneal_start) / float(self.a.stop_sup_anneal))
-        return max(float(self.a.stop_sup_floor), w)
+        return w
 
     def apply_intervention(self):
         """Human intervention approved by the user (--intervention FILE, JSON {"set_cfg": {key: value},
@@ -793,7 +801,10 @@ class Trainer:
             out += run_many(js, True)
             n_refill_convs += k
         self.t1_refill = {"n_base_groups": n_base, "n_refill_groups": len(out) - n_base, "n_refill_convs": n_refill_convs,
-                          "n_informative_groups": sum(1 for r in out if informative(r)), "refill_stop": stop}
+                          "n_informative_groups": sum(1 for r in out if informative(r)), "refill_stop": stop,
+                          "base_convs": sorted(cids),
+                          "refill_convs": sorted({r["conversation_id"] for r in out if r.get("refill")}),
+                          "groups": sorted([r["conversation_id"], r["t"], bool(r.get("refill"))] for r in out)}
         return sorted(out, key=lambda r: (bool(r.get("refill", False)), r["conversation_id"], r["t"]))
 
     # -------------------------------------------------------- one update
@@ -837,9 +848,9 @@ class Trainer:
         if stop_credit:
             # stop credit assignment: the length term (v3 |T - target|, v4 log p_h(T) - log q(T)) is caused
             # only by the end_session decisions, so its group advantage goes to the end_session value tokens
-            # of every decision step; coverage and the format constraints keep the sequence-level advantage
-            # normalised once by the group's std of the TOTAL reward (not per part), so w_cov / w_dist and
-            # the controller's factors keep their effect on the gradient
+            # of every decision step; coverage and the format constraints keep the sequence-level advantage;
+            # both parts are centred on the TOTAL reward's group mean (v16: not divided by its std), so they add
+            # up to the plain advantage and w_cov / w_dist and the controller's factors keep their effect
             advs, advs_stop = [], []
             for rs, sp in zip(rew_groups, stop_groups):
                 a1, a2 = RA.split_group_advantages(rs, sp, self.acfg["adv_eps"], self.acfg["min_group_std"],
@@ -932,8 +943,8 @@ class Trainer:
                 "n_dropped_singleton_episodes": n_singletons,
                 "shadow_reward_mean": sum(shadow) / len(shadow), "turn_hist": turn_hist, "p_h": self.p_h,
                 "aux_weight": w_aux, "aux_floor": float(self.a.stop_sup_floor),
-                "aux_floor_active": bool(w_aux > 0 and abs(w_aux - float(self.a.stop_sup_floor)) < 1e-12
-                                         and float(cfg["w_aux"]) != w_aux),
+                "aux_annealed": self.aux_annealed(u, cfg),
+                "aux_floor_active": bool(float(self.a.stop_sup_floor) > self.aux_annealed(u, cfg)),
                 "lr": cfg["lr"], "kl_coef": cfg["kl_coef"],
                 "aux_stats": {k: stats.get(k) for k in ("aux_n", "aux_loss", "aux_grad_norm", "aux_p_correct_before",
                                                          "aux_p_correct_end")},
@@ -1007,7 +1018,14 @@ class Trainer:
                     if x["t"] < 2:
                         continue               # turn 1 cannot end: not a decision point
                     pr = self.env.task1_end_probe(cid, x["t"], x["user_prompt"], x["real_final"])
-                    pe = float(self.learner.end_prob(pr)) if pr["valid"] else 0.0
+                    if pr["valid"]:
+                        # the learner's forward shares the GPU with the Speaker / Planner calls of Task2Env
+                        with (getattr(self.env, "gpu_lock", None) or contextlib.nullcontext()):
+                            pe = float(self.learner.end_prob(pr))
+                    else:
+                        # no value to score: an invalid plan reads as "not ending" (the benchmark's reading); a valid
+                        # decision whose value tokens could not be located counts as its greedy decision
+                        pe = 1.0 if (pr.get("decision_valid") and pr["greedy_end"]) else 0.0
                     probs.append({"t": x["t"], "real_final": bool(x["real_final"]), "p_end": pe, "valid": bool(pr["valid"]),
                                   "greedy_end": bool(pr["greedy_end"])})
                 for x in t1r["turns"]:
@@ -1072,7 +1090,7 @@ class Trainer:
         t1_ok = True if t1 is None else T1.within_tolerance(t1, self.task1_base, a.task1_tol)
         # checkpoint selection (user 2026-09-26): with ~8 validation episodes the v4 dist term is dominated by
         # the smoothing, so Task 2 is scored by the turn-count distribution W1 against the validation people
-        # plus coverage; Task 1 by the M2 term_f1. The v4 validation reward is still logged (not selected on).
+        # plus coverage. The v4 validation reward is still logged (not selected on).
         # v16 (user 2026-09-28): Task 1 enters the selection through the continuous bal_p (20 decision points rather
         # than 4 end events); term_f1 stays the reported metric
         sel = None
@@ -1226,13 +1244,14 @@ def parse_args(argv=None):
                     help="D2 (v16): validation Task 1 bal_p must exceed the untrained policy's by this at two consecutive "
                          "validations before the stop supervision anneals (spec 0.10)")
     ap.add_argument("--stop-sup-floor", type=float, default=None,
-                    help="v16: the stop supervision never goes below this weight (value pending the user's decision; "
-                         "required except with --dry-run, where it defaults to 0)")
+                    help="v16: the stop supervision never goes below this weight (user 2026-09-28: spec 0.5; "
+                         "0 when --stop-sup-weight 0 switches the supervision off)")
     ap.add_argument("--stop-sup-weight", type=float, default=1.0,  # initial w_aux; the LLM controller tunes it
                     help="auxiliary stop-token supervision on the Task 1 positions (human end/continue); 0 = off (pure GRPO)")
     ap.add_argument("--stop-sup-anneal", type=int, default=10,
-                    help="D2: updates over which the stop supervision goes linearly to 0 once validation Task 1 "
-                         "term_f1 beats the untrained policy's; 0 = never anneal")
+                    help="D2: updates over which the stop supervision goes linearly towards --stop-sup-floor once "
+                         "validation Task 1 bal_p beat the untrained policy's by --t1-trigger-margin at two consecutive "
+                         "validations (v16); 0 = never anneal")
     ap.add_argument("--stop-credit", type=int, choices=(0, 1), default=1,
                     help="1: turn-count and Task 1 advantages act only on the end_session value tokens")
     ap.add_argument("--w-sel-w1", type=float, default=1.0,
@@ -1317,10 +1336,11 @@ def parse_args(argv=None):
         ap.error("--task1-G must be >= 2 (group baselines)")
     if a.t1_trigger_margin != 0.10:
         off["t1_trigger_margin"] = a.t1_trigger_margin
+    floor_spec = 0.0 if a.stop_sup_weight == 0 else 0.5          # no supervision -> no floor
     if a.stop_sup_floor is None:
-        if not a.dry_run:
-            ap.error("--stop-sup-floor is required: its value is pending the user's decision (SPEC v16 item 4)")
-        a.stop_sup_floor = 0.0
+        a.stop_sup_floor = floor_spec
+    elif a.stop_sup_floor != floor_spec:
+        off["stop_sup_floor"] = a.stop_sup_floor
     if not (0.0 <= a.stop_sup_floor <= 5.0):
         ap.error("--stop-sup-floor must lie in [0, 5]")
     if a.stop_sup_weight == 0 and a.stop_sup_floor != 0:

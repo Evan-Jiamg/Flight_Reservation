@@ -1,9 +1,40 @@
-# pend + GRPO — the approved design (audit reference, 2026-09-25)
+# pend + GRPO — the approved design (audit reference, 2026-09-25; updated to v16 2026-09-28)
 
 Everything below was decided or approved by the user. An audit checks the code in
 `sep-sim/` against THIS list: anything missing, wired differently, or still following an
 older design is a finding. Anything the code does that is NOT on this list and changes
-behaviour is also a finding ("unauthorised design change").
+behaviour is also a finding ("unauthorised design change"). The full v16 details (logging fields,
+exact refill rules, tests) are in `ops/SPEC_v16_grpo_opt.md`; where they differ, that file wins.
+
+## v16 changes (2026-09-28, user approved items 1, 2, 3, 4 (floor 0.5), 6, 7, 8; item 5 declined)
+1. Task 1 dynamic refill: when fewer groups than the base group count (`n_base_groups`) carry a gradient (reward std ≤
+   min_group_std), more unused train_all conversations are drawn from the same rng, in rounds of
+   ceil(deficit / 2), capped at --task1-convs refill conversations in total; rows marked `"refill"`; the aux
+   examples and `acc` / `end_at_*` come from the base groups only (`acc_all` covers all).
+2. Task 1 size: new --task1-G (Task 1 samples per group) SPEC 8 (min 2); --task1-convs SPEC 4 → 8; Task 2 --G stays 4.
+3. Dr. GRPO: `grpo_std_norm = False` → group advantage A_i = R_i − mean(R) (no division by the group std);
+   stop credit A_stop = S − mean(S), A_seq = (R − S) − mean(R − S); groups with std ≤ min_group_std are still
+   skipped. RLOO / PPO unchanged.
+4. Aux floor --stop-sup-floor F, SPEC 0.5 (user decision): effective aux weight = max(F, w_aux × anneal);
+   `--stop-sup-weight 0` requires F = 0 (the SPEC floor is then 0); range 0 ≤ F ≤ 5; hist logs aux_floor,
+   aux_floor_active; the LLM controller prompt says the weight is annealed towards the fixed floor F.
+6. LLM controller w_dist bounds [1.0, 5.0] (was a lower bound of 0.1): w_dist can only be raised from 1.0.
+7. Continuous Task 1 metric `bal_p` (teacher-forced P(end_session = true) at every validation decision point,
+   greedy Planner output; invalid points count as P_end = 0), plus auc / logloss / n_points / n_final /
+   n_invalid. bal_p replaces term_f1 in checkpoint selection and in the D2 trigger (validation bal_p ≥
+   untrained bal_p + --t1-trigger-margin, SPEC 0.10, at two consecutive validations); term_f1 is still
+   computed and reported, not selected on.
+8. `task1_pooled.py` (evaluation tool, not a training file): pools Task 1 over folds (duplicate conversation
+   ids within an arm raise), M2 term_f1 / premature rates, paired per-conversation bootstrap (10000, seed 0)
+   between two arms with identical conversation sets; records input sha256.
+- Item 5 (per-person length reward) is NOT done: the visible number of requirements does not predict the real
+  turn count (r = −0.36, almost always 7 or 8 requirements) and per-person turn counts vary little (sd 1.1);
+  rewarding an unpredictable target is optimised by the middle value for everyone, i.e. the status quo plus noise.
+- New SPEC gate values (else --ablation): task1_G 8, task1_convs 8, t1_trigger_margin 0.10, stop_sup_floor 0.5;
+  none of them may change on resume.
+- New verify checks: rl.adv_norm (run_meta algo_cfg.grpo_std_norm is False; learner_stats.adv_abs_mean logged),
+  rl.task1_G, rl.task1_refill, rl.aux_floor, rl.w_dist_floor, rl.d2_trigger, rl.task1_prob; rl.selection
+  recomputes the score with summary `selection_task1_metric` (term_f1 for older runs).
 
 ## Architecture (arm `pend`, built on the E1.6 tree `trees/e1r_cf19400`)
 - Planner = Qwen3-4B-Instruct-2507 (the RL policy, LoRA r16). Speaker = Ditto-8B (frozen) + Selector.
@@ -71,30 +102,40 @@ behaviour is also a finding ("unauthorised design change").
   p_h = smoothed distribution of real people's message counts over splits[fold].train_all ONLY;
   q = smoothed distribution of the current update's (clean) rollouts. Coverage stays (D3,
   disclosed). Parameter sizes are to be explored.
+- Group advantages (v16, Dr. GRPO): A_i = R_i − mean(R) of the group, NOT divided by the group std
+  (`grpo_std_norm = False`); groups whose reward std ≤ min_group_std are skipped (no gradient) and counted.
 - Stop credit: the length term's group advantage goes only to the end_session value tokens; the
   rest keeps the sequence-level advantage. stop_mask only on real decisions (t ≥ 2, parsed,
   valid end_session, not capped).
 - D4: profile_note tokens carry no sequence advantage (KL only).
-- Task 1 stop groups on train_all conversations (last message + one earlier, t ≥ 2), G samples; their
-  advantage acts on the end_session tokens only (approved),
-  reward 1 if end_session agrees with the real person; non-decisions reward 0, no stop mask.
-- D2: auxiliary stop-token supervision on the Task 1 positions, annealed linearly to 0 (over 10
-  updates) once validation Task 1 term_f1 beats the untrained policy's. Its weight w_aux is NOT
+- Task 1 stop groups on train_all conversations (last message + one earlier, t ≥ 2): --task1-convs
+  (SPEC 8) conversations per update, --task1-G (SPEC 8) samples per group (v16; Task 2 keeps --G 4), plus
+  the v16 dynamic refill (unused train_all conversations, at most --task1-convs more, until the number of
+  groups with a gradient reaches the base group count); their advantage acts on the end_session tokens only (approved),
+  reward 1 if end_session agrees with the real person; non-decisions reward 0, no stop mask. Aux examples come
+  from the base (non-refill) groups only.
+- D2: auxiliary stop-token supervision on the Task 1 positions, annealed linearly (over 10 updates)
+  towards the floor --stop-sup-floor (v16 SPEC 0.5; never below it) once validation Task 1 bal_p is at least
+  the untrained policy's + --t1-trigger-margin (SPEC 0.10) at two consecutive validations (v16; before v16:
+  annealed to 0 once validation term_f1 beat the untrained policy's). Its weight w_aux is NOT
   fixed (user, option B): initial value --stop-sup-weight, then tuned by the v4 LLM controller
   (same factors / bounds [0.01, 5] / rollback) from TRAIN statistics (aux loss, aux vs RL gradient
-  norm, Task 1 train accuracy); effective weight = w_aux x anneal; w_aux = 0 stays off.
+  norm, Task 1 train accuracy); effective weight = max(floor, w_aux x anneal) (v16); --stop-sup-weight 0
+  (pure GRPO) requires floor 0, so w_aux = 0 stays off.
   The aux loss is normalised like the GRPO loss: by the number of GENERATED tokens of the
   generations its values belong to (approved 2026-09-26; the v8 smoke measured the aux gradient at
   ~1400x the RL gradient when it was divided by the 1-2 target tokens).
 - KL 0.04, LoRA r16. Episodes with a cut R0 reply / lost ledger verdict / emitted capped message
   never enter reward groups.
 - Controller: reuse the existing LLM controller adapted to v4 (discrete factors {0.5, 0.8, 1,
-  1.25, 2} with bounds, every 5 updates, summarised TRAIN stats only, fixed-weight shadow reward,
+  1.25, 2} with bounds — v16: w_dist bounds [1.0, 5.0], so w_dist never drops below its initial 1.0 —, every 5 updates, summarised TRAIN stats only, fixed-weight shadow reward,
   rollback after 2 worse points, local gpt-oss). No novelty needed; NO baselines/control groups now.
 - D5: validation Task 2 with the SAMPLED Planner (T 0.7, seeds 0 and 1); Task 1 greedy.
   Checkpoint selection (approved 2026-09-26) = w_sel_cov·validation coverage − w_sel_w1·W1(validation
-  simulated turn counts, validation people's turn counts) + w_sel_task1·validation Task 1 term_f1
-  (M2), weights default 1, all logged; the v4 validation reward is logged but not selected on.
+  simulated turn counts, validation people's turn counts) + w_sel_task1·validation Task 1 bal_p
+  (v16; before v16 the Task 1 term was term_f1 (M2), which is still computed and reported but not selected on),
+  weights default 1, all logged (summary `selection_task1_metric: "bal_p"`); the v4 validation reward is logged
+  but not selected on. Re-selection uses the same validation, so it also selects on bal_p.
   Task 1 validation during training = splits[fold].validation (the 4 sessions; not validation_all).
 - D6: fold 2 first.
 

@@ -9,7 +9,8 @@ FILE.jsonl.k1.jsonl the K+1 probe per conversation) and scores them with exactly
   an END flag on a real row, k1_end_rate = TP / conversations.
 Rules: the files of one arm are disjoint folds (a conversation id appearing twice is an error); every conversation
 must have turns 1..n and a K+1 row. A paired comparison needs the same conversation set in both arms; the bootstrap
-resamples conversations (10000 draws, seed 0).
+resamples conversations (10000 draws, seed 0). p_b_gt_a = P(B > A); p_b_better = P(B better): B > A for term_f1 /
+k1_end_rate, B < A for the premature rates. Every input file (generations and .k1.jsonl) is recorded with its sha256.
 
   task1_pooled.py --arm base=f0.jsonl,f1.jsonl,f2.jsonl --arm rl=g0.jsonl,g1.jsonl,g2.jsonl [--compare base rl]
                   [--json-out out.json]
@@ -97,8 +98,9 @@ def paired(a, b, n_boot=10000, seed=0):
     for k in KEYS:
         d = sorted(diffs[k])
         better = sum(1 for x in d if (x > 0 if HIGHER_BETTER[k] else x < 0)) / len(d)
+        gt = sum(1 for x in d if x > 0) / len(d)
         out[k] = {"a": ma[k], "b": mb[k], "diff": mb[k] - ma[k], "ci95": [d[int(0.025 * len(d))], d[int(0.975 * len(d)) - 1]],
-                  "p_b_better": better}
+                  "p_b_better": better, "p_b_gt_a": gt}
     return {"n_conversations": len(ids), "n_boot": n_boot, "seed": seed, "metrics": out}
 
 
@@ -115,7 +117,8 @@ def main(argv=None):
         if not name or not fl:
             ap.error("--arm needs NAME=FILE[,FILE...]")
         fs = [f for f in fl.split(",") if f]
-        arms[name], files[name] = load_arm(fs), {f: sha_file(f) for f in fs}
+        arms[name] = load_arm(fs)
+        files[name] = {**{f: sha_file(f) for f in fs}, **{f + ".k1.jsonl": sha_file(f + ".k1.jsonl") for f in fs}}
     res = {"arms": {n: metrics(c) for n, c in arms.items()}, "files_sha256": files, "comparisons": []}
     for n, m in res["arms"].items():
         print("%-12s conversations %3d turns %4d  term_f1 %.3f  premature_end_rate %.3f  premature %.3f  k1_end_rate %.3f"

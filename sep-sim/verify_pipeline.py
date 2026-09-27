@@ -750,8 +750,9 @@ def _jl(path):
 
 
 def check_v16(rl_dir, rep):
-    """SPEC v16 (user 2026-09-28): Task 1 refill / group size, Dr. GRPO setting, aux floor, w_dist floor, the
-    continuous Task 1 metric (recomputed from the logged end probabilities) and the two-point D2 trigger."""
+    """SPEC v16 (user 2026-09-28): Task 1 refill / group size, Dr. GRPO setting, aux floor and supervision, w_dist
+    floor, the continuous Task 1 metric (recomputed from the logged end probabilities) and the two-point D2 trigger
+    (recomputed from the validation bal_p values)."""
     import task1_stop as T1
     meta = _jl(os.path.join(rl_dir, "run_meta.jsonl"))
     if not meta:
@@ -761,68 +762,113 @@ def check_v16(rl_dir, rep):
         rep.note("rl.v16", "run written before v16 (no task1_G): v16 checks skipped")
         return
     acfg = (meta[0].get("config") or {}).get("algo_cfg") or {}
-    rep.ok("rl.adv_norm", acfg.get("grpo_std_norm") is False or bool(args.get("ablation")), "run_meta",
+    rep.ok("rl.adv_norm", acfg.get("grpo_std_norm") is False, "run_meta",
            "algo_cfg.grpo_std_norm %r (spec v16: false)" % acfg.get("grpo_std_norm"))
-    splits = None
+    train_all = None
     try:
         sp = json.load(open(args["splits"], encoding="utf-8"))
-        splits = {int(f["fold"]): f for f in sp["folds"]}.get(int(args["fold"]))
-    except Exception:
-        pass
-    train_all = set((splits or {}).get("train_all", (splits or {}).get("train", []))) if splits else None
-    # Task 1 groups: size, base / refill conversations
-    t1 = _jl(os.path.join(rl_dir, "rollouts_task1.jsonl"))
-    by_u = {}
-    for r in t1:
-        w = "task1 u%s %s t%s" % (r.get("update"), str(r.get("conversation_id"))[:10], r.get("t"))
-        rep.ok("rl.task1_G", len(r.get("samples") or []) == int(args["task1_G"]), w,
-               "%d samples, task1_G %s" % (len(r.get("samples") or []), args["task1_G"]))
-        by_u.setdefault(r["update"], []).append(r)
+        f = {int(x["fold"]): x for x in sp["folds"]}[int(args["fold"])]
+        train_all = set(f.get("train_all", f.get("train", [])))
+    except Exception as e:                       # never skipped silently
+        rep.ok("rl.task1_refill", False, "splits", "cannot read the run's split file %r: %r" % (args.get("splits"), e))
     upd = {u["update"]: u for u in _jl(os.path.join(rl_dir, "updates.jsonl"))}
-    for u, rows in sorted(by_u.items()):
-        base = {r["conversation_id"] for r in rows if not r.get("refill")}
-        refill = {r["conversation_id"] for r in rows if r.get("refill")}
+    # ---- Task 1 groups: the update's own record of its groups decides which rows count (an aborted attempt may
+    # have left rows of other groups; a conversation with no decision position leaves no row at all)
+    latest = {}
+    for r in _jl(os.path.join(rl_dir, "rollouts_task1.jsonl")):
+        latest[(r["update"], r["conversation_id"], r["t"])] = r
+    for u, row in sorted(upd.items()):
+        th = (row.get("train_aggregate") or {}).get("task1_train") or {}
+        st = row.get("learner_stats") or {}
         w = "task1 u%s" % u
+        if int(args.get("task1_convs", 0)) <= 0:
+            continue
+        ok_rec = all(k in th for k in ("groups", "base_convs", "refill_convs"))
+        rep.ok("rl.task1_refill", ok_rec, w, "task1_train has no group record (groups / base_convs / refill_convs)")
+        if not ok_rec:
+            continue
+        base, refill = set(th["base_convs"]), set(th["refill_convs"])
         if train_all is not None:
             rep.ok("rl.task1_refill", (base | refill) <= train_all, w, "Task 1 conversation outside train_all")
             rep.ok("rl.task1_G", len(base) == min(int(args["task1_convs"]), len(train_all)), w,
                    "%d base conversations, task1_convs %s" % (len(base), args["task1_convs"]))
         rep.ok("rl.task1_refill", not (base & refill), w, "a refill conversation is also a base conversation")
         rep.ok("rl.task1_refill", len(refill) <= int(args["task1_convs"]), w, "%d refill conversations > cap" % len(refill))
-        n_base_groups = sum(1 for r in rows if not r.get("refill"))
-        st = (upd.get(u) or {}).get("learner_stats") or {}
-        if st.get("aux_n") is not None:
-            rep.ok("rl.task1_refill", st["aux_n"] <= n_base_groups, w,
-                   "aux examples %s > base groups %d (aux must come from base groups only)" % (st["aux_n"], n_base_groups))
-        th = ((upd.get(u) or {}).get("train_aggregate") or {}).get("task1_train") or {}
-        if th:
-            rep.ok("rl.task1_refill", th.get("n_base_groups") == n_base_groups and th.get("n_refill_groups") ==
-                   len(rows) - n_base_groups, w, "task1_train refill counts %r / %r do not match the logged rows %d / %d"
-                   % (th.get("n_base_groups"), th.get("n_refill_groups"), n_base_groups, len(rows) - n_base_groups))
-    # aux floor, w_dist floor, D2 trigger
+        rows = []
+        for cid, t, is_ref in th["groups"]:
+            r = latest.get((u, cid, t))
+            rep.ok("rl.task1_refill", r is not None, w, "group %s t%s has no row" % (str(cid)[:10], t))
+            if r is None:
+                continue
+            rows.append(r)
+            rep.ok("rl.task1_refill", bool(r.get("refill")) == bool(is_ref) and (cid in (refill if is_ref else base)), w,
+                   "group %s t%s: refill flag / conversation list disagree" % (str(cid)[:10], t))
+            rep.ok("rl.task1_G", len(r.get("samples") or []) == int(args["task1_G"]), w,
+                   "%d samples, task1_G %s" % (len(r.get("samples") or []), args["task1_G"]))
+        n_base = sum(1 for r in rows if not r.get("refill"))
+        rep.ok("rl.task1_refill", th.get("n_base_groups") == n_base and th.get("n_refill_groups") == len(rows) - n_base, w,
+               "task1_train counts %r / %r != groups %d / %d" % (th.get("n_base_groups"), th.get("n_refill_groups"),
+                                                                 n_base, len(rows) - n_base))
+        # the stop supervision: exactly one example per base group that has one (none from the refill groups)
+        ag = row.get("train_aggregate") or {}
+        want_aux = sum(1 for r in rows if not r.get("refill") and (r.get("samples") or [{}])[0].get("aux") is not None)
+        if (ag.get("aux_weight") or 0) > 0:
+            rep.ok("rl.aux_floor", (st.get("aux_n") or 0) == want_aux, w,
+                   "stop supervision used %r examples, the base groups provide %d" % (st.get("aux_n"), want_aux))
+    # ---- per update: advantage magnitude logged, aux floor, anneal only after the trigger, w_dist floor
+    ivs = [m_["intervention"] for m_ in meta if m_.get("intervention")]
+    iv = ivs[0] if ivs else None
     ctl = ((meta[0].get("config") or {}).get("controller") or {}).get("llm4") or {}
-    wlo = ((ctl.get("bounds") or {}).get("w_dist") or [None])[0]
+    wlo0 = ((ctl.get("bounds") or {}).get("w_dist") or [None])[0]
+    if wlo0 is not None:
+        rep.ok("rl.w_dist_floor", float(wlo0) == 1.0 or bool(args.get("ablation")), "run_meta",
+               "controller w_dist lower bound %r (spec v16: 1.0)" % wlo0)
     vsum = sorted((v for v in _jl(os.path.join(rl_dir, "validation.jsonl")) if v.get("kind") == "summary"),
                   key=lambda v: v["update"])
-    trig = [v for v in vsum if (v.get("d2") or {}).get("triggered_at") == v["update"]]
-    rep.ok("rl.d2_trigger", len(trig) <= 1, "validation", "D2 triggered more than once: %r" % [v["update"] for v in trig])
-    for v in trig:
-        rep.ok("rl.d2_trigger", v["d2"]["streak"] >= 2 and v["d2"]["met"], "validation u%s" % v["update"],
-               "D2 triggered without two consecutive validations over the margin: %r" % v["d2"])
-    t_at = trig[0]["update"] if trig else None
+    # D2 recomputed from the summaries' own bal_p (never trusting the logged streak)
+    margin = float(args.get("t1_trigger_margin", 0.10))
+    base_v = next((v for v in vsum if v.get("task1") and v["task1"].get("bal_p") is not None), None)
+    t_at, streak = None, 0
+    for v in vsum:
+        if base_v is None or v["update"] <= base_v["update"] or not v.get("task1") or v["task1"].get("bal_p") is None:
+            continue
+        met = v["task1"]["bal_p"] >= base_v["task1"]["bal_p"] + margin
+        streak = streak + 1 if met else 0
+        d2 = v.get("d2") or {}
+        w = "validation u%s" % v["update"]
+        rep.ok("rl.d2_trigger", d2.get("met") == met and d2.get("streak") == streak, w,
+               "logged d2 %r, recomputed met %r streak %d" % ({k: d2.get(k) for k in ("met", "streak")}, met, streak))
+        if t_at is None and streak >= 2:
+            t_at = v["update"]
+            rep.ok("rl.d2_trigger", d2.get("triggered_at") == t_at, w, "D2 should trigger here (streak 2), logged %r"
+                   % d2.get("triggered_at"))
+    for v in vsum:
+        ta = (v.get("d2") or {}).get("triggered_at")
+        if ta is not None:
+            rep.ok("rl.d2_trigger", ta == t_at, "validation u%s" % v["update"],
+                   "logged trigger at %r, recomputed %r" % (ta, t_at))
     for u, row in sorted(upd.items()):
-        ag, cfg = row.get("train_aggregate") or {}, row.get("cfg_used") or {}
+        ag, cfg, st = row.get("train_aggregate") or {}, row.get("cfg_used") or {}, row.get("learner_stats") or {}
         w = "update %s" % u
+        if row.get("n_samples"):
+            rep.ok("rl.adv_norm", st.get("adv_abs_mean") is not None, w, "learner_stats.adv_abs_mean missing")
         if ag.get("aux_floor") is not None and ag.get("aux_weight") is not None:
             rep.ok("rl.aux_floor", ag["aux_weight"] >= ag["aux_floor"] - 1e-12, w,
                    "aux weight %r below the floor %r" % (ag["aux_weight"], ag["aux_floor"]))
-            if ag["aux_weight"] < float(cfg.get("w_aux", 0.0)) - 1e-12:
+            want = max(float(ag["aux_floor"]), float(ag.get("aux_annealed", ag["aux_weight"])))
+            rep.ok("rl.aux_floor", abs(ag["aux_weight"] - want) < 1e-12, w,
+                   "aux weight %r != max(floor %r, annealed %r)" % (ag["aux_weight"], ag["aux_floor"], ag.get("aux_annealed")))
+            ann = float(ag.get("aux_annealed", ag["aux_weight"]))
+            if ann < float(cfg.get("w_aux", 0.0)) - 1e-12:
                 rep.ok("rl.d2_trigger", t_at is not None and u > t_at, w,
-                       "stop supervision annealed (%r < w_aux %r) before any D2 trigger" % (ag["aux_weight"], cfg.get("w_aux")))
-        if wlo is not None and "w_dist" in cfg:
-            rep.ok("rl.w_dist_floor", float(cfg["w_dist"]) >= float(wlo) - 1e-12, w,
-                   "w_dist %r below the controller bound %r" % (cfg["w_dist"], wlo))
-    # continuous Task 1 metric recomputed from the logged end probabilities
+                       "stop supervision annealed (%r < w_aux %r) before the D2 trigger" % (ann, cfg.get("w_aux")))
+        lo = wlo0
+        if iv and u >= iv.get("at_update", 10 ** 9) and "w_dist" in (iv.get("controller_bounds") or {}):
+            lo = iv["controller_bounds"]["w_dist"][0]            # a user-approved intervention changed the bound
+        if lo is not None and "w_dist" in cfg:
+            rep.ok("rl.w_dist_floor", float(cfg["w_dist"]) >= float(lo) - 1e-12, w,
+                   "w_dist %r below the controller bound %r" % (cfg["w_dist"], lo))
+    # ---- continuous Task 1 metric recomputed from the logged end probabilities
     vrows = _jl(os.path.join(rl_dir, "validation.jsonl"))
     for v in vsum:
         w = "validation u%s" % v["update"]
