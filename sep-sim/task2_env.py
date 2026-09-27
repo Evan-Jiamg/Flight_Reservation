@@ -116,6 +116,9 @@ def episode_end():
 
 
 _ORPHANS = {"n": 0}
+# identifies the process that wrote an episode row: the *_total counters are per process, so the
+# verifier groups rows by this token to check that every counted incident is attributed to an episode
+PROCESS_TOKEN = "%d-%d-%s" % (os.getpid(), int(time.time()), os.urandom(4).hex())
 _ORPHAN_LOCK = threading.Lock()
 
 
@@ -1111,6 +1114,7 @@ class Task2Env:
                 "r0_empty_retries_total": getattr(self.r0, "n_empty_retries", None),
                 "r0_len_retries_total": self.r0.n_len_retries, "r0_len_truncated_total": self.r0.n_len_truncated,
                 "r0_ctx_fit_total": self.r0.n_ctx_fit,
+                "process_token": PROCESS_TOKEN,
                 # this episode's own incidents; an unclean episode never enters a reward group
                 "episode_counters": counts, "emitted_capped_steps": capped, "compacted_steps": compacted,
                 "clean": clean,

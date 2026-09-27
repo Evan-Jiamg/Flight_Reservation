@@ -493,6 +493,30 @@ def check_a2(rows, rep, arm="a2"):
 PEND_FORBIDDEN = A2_FORBIDDEN + ("GOAL STATUS", E16_ROWS)
 
 
+def check_r0_attribution(rows, rep):
+    """Every R0 reply cut by the token budget must be charged to the episode that received it (that
+    episode is then unclean, pend.clean_flag, and never enters a reward group / evaluation). The
+    *_total fields are running totals of one process, so rows are grouped by process_token (all rows
+    of the run: train rollouts AND validation, which share the process) and the largest total of a
+    process must equal the sum of its episodes' own counts. Rows without a token (written before the
+    token existed) are pooled: their per-episode sum must at least cover the largest total seen."""
+    groups = {}
+    for r in rows:
+        if "r0_len_truncated_total" not in r:
+            continue
+        g = groups.setdefault(r.get("process_token"), [0, 0])
+        g[0] = max(g[0], r.get("r0_len_truncated_total") or 0)
+        g[1] += (r.get("episode_counters") or {}).get("r0_len_truncated", 0)
+    for tok, (total, attributed) in sorted(groups.items(), key=lambda kv: str(kv[0])):
+        if tok is None:
+            rep.ok("trunc.r0_attributed", attributed >= total, "legacy rows (no process_token)",
+                   "R0 truncations counted %d, charged to episodes %d" % (total, attributed))
+        else:
+            rep.ok("trunc.r0_attributed", attributed == total, "process %s" % tok,
+                   "R0 truncations counted %d, charged to episodes %d" % (total, attributed))
+    rep._c("trunc.r0_attributed")
+
+
 def check_pend(rows, rep, arm="pend"):
     """pend: v3 prompt without the goal judge; Planner end = the planned message is the last one."""
     n_end = n_unparsed = 0
@@ -600,7 +624,8 @@ def check_pend(rows, rep, arm="pend"):
     rep._c(name)
     (rep.warn if unp else rep.note)(name, "ledger-judge answers that are not a verdict object (running total) %d" % unp)
     r0t = max([r.get("r0_len_truncated_total") or 0 for r in rows] or [0])
-    rep.ok("trunc.r0_reply", r0t == 0, "episodes", "%d R0 replies still cut by the token budget" % r0t)
+    rep.note("trunc.r0_reply", "R0 replies cut by the token budget (running total, per process) %d; "
+             "attribution: trunc.r0_attributed, exclusion: pend.clean_flag" % r0t)
     rep.note("trunc.r0_reply", "R0 length retries (running total) %d" % max([r.get("r0_len_retries_total") or 0 for r in rows] or [0]))
     # a ledger that never credits anything means its judge is answering empty (seen with a reasoning
     # model under max_tokens=200): coverage would be 0 everywhere, silently
@@ -831,6 +856,9 @@ def verify(episodes, meta_path, splits_path, fold, split, arm=None, training=Fal
             check_selection(vp, rl_dir, rep)
     if arm == "pend":
         check_endpoints(meta, rep)
+        vp = os.path.join(rl_dir, "validation.jsonl") if rl_dir else None
+        vr = [r for r in (load_jsonl(vp, rep) if vp and os.path.exists(vp) else [])]
+        check_r0_attribution(all_rows + vr, rep)
         n_reuse = sum(1 for r in all_rows for s in (r.get("trace") or []) if s.get("ended_planner")
                       and s.get("guard_reasons") and "reuse" in [x for x in s["guard_reasons"] if x])
         name = "pend.close_rejected_as_reuse"
