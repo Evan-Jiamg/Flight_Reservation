@@ -72,12 +72,18 @@ def main(argv=None):
     old, _ = RA.advantages_for_groups(rs, "grpo", RA.algo_cfg(grpo_std_norm=True))
     new, _ = RA.advantages_for_groups(rs, "grpo", tr.acfg)
     mean_abs = lambda xs: (sum(abs(v) for a_ in xs if a_ for v in a_) / max(1, sum(len(a_) for a_ in xs if a_)))
+    bad = sorted({s_.get("gen_adapter") for s_ in samples if s_.get("gen_adapter") != tr.gen_name})
+    res["task1_groups"]["off_policy_adapters"] = bad          # must be [] (as one_update asserts)
     t3 = time.time()
-    stats = tr.learner.update(samples, tr.cfg, seed=T.seed_of(a.seed, "update", 1), aux=aux or None,
-                              mismatch_abort=a.behav_mismatch_abort)
+    try:
+        stats = tr.learner.update(samples, tr.cfg, seed=T.seed_of(a.seed, "update", 1), aux=aux or None,
+                                  mismatch_abort=a.behav_mismatch_abort)
+    except RA.MismatchAbort as e:                             # keep what was measured before the abort
+        stats = {"mismatch_abort": e.value}
     res["update"] = {"seconds": round(time.time() - t3, 1), "n_samples": len(samples), "groups_skipped": skipped,
                      "aux_weight": w_aux, "aux_n": len(aux), "adv_abs_mean_dr_grpo": mean_abs(new),
                      "adv_abs_mean_if_std_norm": mean_abs(old),
+                     "mismatch_abort": stats.get("mismatch_abort"),
                      **{k: stats.get(k) for k in ("rl_grad_norm", "aux_grad_norm", "grad_norm", "kl", "loss", "n_tokens",
                                                   "behav_mismatch_mean", "tis_w_mean", "tis_capped_frac", "aux_p_correct_before",
                                                   "aux_p_correct_end", "optimizer_steps")}}

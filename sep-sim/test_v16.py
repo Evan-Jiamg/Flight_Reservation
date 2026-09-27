@@ -81,7 +81,7 @@ def test_item4_floor_args():
 
 def test_item4_floor_weight():
     class A:
-        stop_sup_floor, stop_sup_anneal = 0.5, 10
+        stop_sup_floor, stop_sup_anneal, stop_sup_weight = 0.5, 10, 1.0
     tr = T.Trainer.__new__(T.Trainer)
     tr.a, tr.aux_anneal_start = A(), None
     assert tr.aux_weight(3, {"w_aux": 1.0}) == 1.0
@@ -90,6 +90,9 @@ def test_item4_floor_weight():
     assert tr.aux_weight(18, {"w_aux": 1.0}) == 0.5                             # 0.2 -> floor
     assert tr.aux_weight(40, {"w_aux": 1.0}) == 0.5
     assert tr.aux_weight(3, {"w_aux": 0.2}) == 0.5                              # controller below the floor
+    # after the anneal the controller's w_aux still scales the supervision (factor floor = floor / initial weight)
+    assert tr.aux_weight(40, {"w_aux": 2.0}) == 1.0
+    assert tr.aux_weight(40, {"w_aux": 0.6}) == 0.5                             # never below the floor
     A.stop_sup_floor = 0.0
     assert tr.aux_weight(40, {"w_aux": 1.0}) == 0.0                             # floor 0 = the old behaviour
 

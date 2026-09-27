@@ -501,10 +501,14 @@ class Trainer:
         return max(float(self.a.stop_sup_floor), self.aux_annealed(u, cfg))
 
     def aux_annealed(self, u, cfg):
-        """cfg["w_aux"] x the D2 anneal, before the floor."""
+        """cfg["w_aux"] x the D2 anneal factor, before the floor. The factor goes linearly from 1 towards
+        floor / --stop-sup-weight (not to 0): once the anneal is over the controller's w_aux still scales the
+        supervision (user 2026-09-28: the floor bounds it from below, the controller may still raise it)."""
         w = float(cfg["w_aux"])
         if self.aux_anneal_start is not None and self.a.stop_sup_anneal > 0:
-            w = w * max(0.0, 1.0 - (u - self.aux_anneal_start) / float(self.a.stop_sup_anneal))
+            fmin = (float(self.a.stop_sup_floor) / float(self.a.stop_sup_weight)) if self.a.stop_sup_weight > 0 else 0.0
+            f = max(0.0, 1.0 - (u - self.aux_anneal_start) / float(self.a.stop_sup_anneal))
+            w = w * max(fmin, f)
         return w
 
     def apply_intervention(self):
@@ -862,7 +866,7 @@ class Trainer:
                 pe = 1.0 if (pr.get("decision_valid") and pr["greedy_end"]) else 0.0
             probs.append({"t": x["t"], "real_final": bool(x["real_final"]), "p_end": pe, "valid": bool(pr["valid"]),
                           "decision_valid": bool(pr.get("decision_valid", pr["valid"])),
-                          "greedy_end": bool(pr["greedy_end"])})
+                          "greedy_end": bool(pr["greedy_end"]), "gen_adapter": pr.get("gen_adapter")})
         for x in t1r["turns"]:
             x.pop("user_prompt", None)
         return {"kind": "task1", "update": u, "policy_sha": psha, "conversation_id": cid,
@@ -1329,6 +1333,16 @@ def parse_args(argv=None):
     if a.stop_credit and a.algo != "grpo":
         ap.error("--stop-credit 1 is implemented for grpo")
     off = {k: getattr(a, k) for k in SPEC if getattr(a, k) != SPEC[k]}
+    for k, want in (("G", 4), ("behav_mismatch_abort", 0.1), ("w_sel_cov", 1.0), ("w_sel_w1", 1.0),
+                    ("w_sel_task1", 1.0), ("batch", 1), ("task1_tol", 0.05)):
+        if getattr(a, k) != want:
+            off[k] = getattr(a, k)
+    if a.stop_sup_weight not in (0.0, 1.0):
+        off["stop_sup_weight"] = a.stop_sup_weight
+    if not a.dry_run:
+        for k, want in (("scenarios_per_update", 4), ("val_every", 5)):
+            if getattr(a, k) != want:
+                off[k] = getattr(a, k)
     if a.controller != "llm":
         off["controller"] = a.controller
     if a.planner_path and "Qwen3-4B-Instruct-2507" not in a.planner_path:

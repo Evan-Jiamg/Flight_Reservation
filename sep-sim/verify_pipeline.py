@@ -817,6 +817,29 @@ def check_v16(rl_dir, rep, splits_path=None):
             rep.ok("rl.task1_G", len(r.get("samples") or []) == int(args["task1_G"]), w,
                    "%d samples, task1_G %s" % (len(r.get("samples") or []), args["task1_G"]))
         n_base = sum(1 for r in rows if not r.get("refill"))
+        mstd = float(acfg.get("min_group_std", 1e-8))
+
+        def _inf(r):
+            rs_ = [x["reward"] for x in r.get("samples") or []]
+            if len(rs_) < 2:
+                return False
+            m_ = sum(rs_) / len(rs_)
+            return (sum((x - m_) ** 2 for x in rs_) / len(rs_)) ** 0.5 > mstd
+        inf_base = sum(1 for r in rows if not r.get("refill") and _inf(r))
+        inf_all = sum(1 for r in rows if _inf(r))
+        stop_ = th.get("refill_stop")
+        rep.ok("rl.task1_refill", th.get("n_informative_groups") == inf_all, w,
+               "n_informative_groups %r != recounted %d" % (th.get("n_informative_groups"), inf_all))
+        if inf_base >= n_base:
+            rep.ok("rl.task1_refill", not refill and stop_ == "none_needed", w,
+                   "refill drawn although the base groups had no deficit (stop %r)" % stop_)
+        else:
+            want_ok = {"filled": inf_all >= n_base,
+                       "cap": len(refill) == int(args["task1_convs"]) and inf_all < n_base,
+                       "pool_empty": (train_all is None or len(base | refill) == len(train_all)) and inf_all < n_base}
+            rep.ok("rl.task1_refill", bool(want_ok.get(stop_)), w,
+                   "refill_stop %r inconsistent (informative %d / %d base groups, %d refill convs)"
+                   % (stop_, inf_all, n_base, len(refill)))
         rep.ok("rl.task1_refill", th.get("n_base_groups") == n_base and th.get("n_refill_groups") == len(rows) - n_base, w,
                "task1_train counts %r / %r != groups %d / %d" % (th.get("n_base_groups"), th.get("n_refill_groups"),
                                                                  n_base, len(rows) - n_base))
@@ -866,6 +889,9 @@ def check_v16(rl_dir, rep, splits_path=None):
         w = "update %s" % u
         if row.get("n_samples"):
             rep.ok("rl.adv_norm", st.get("adv_abs_mean") is not None, w, "learner_stats.adv_abs_mean missing")
+        if ag.get("aux_floor") is not None and "stop_sup_floor" in args:
+            rep.ok("rl.aux_floor", abs(float(ag["aux_floor"]) - float(args["stop_sup_floor"])) < 1e-12, w,
+                   "logged floor %r != the run's --stop-sup-floor %r" % (ag["aux_floor"], args["stop_sup_floor"]))
         if ag.get("aux_floor") is not None and ag.get("aux_weight") is not None:
             rep.ok("rl.aux_floor", ag["aux_weight"] >= ag["aux_floor"] - 1e-12, w,
                    "aux weight %r below the floor %r" % (ag["aux_weight"], ag["aux_floor"]))
@@ -882,10 +908,24 @@ def check_v16(rl_dir, rep, splits_path=None):
         if lo is not None and "w_dist" in cfg:
             rep.ok("rl.w_dist_floor", float(cfg["w_dist"]) >= float(lo) - 1e-12, w,
                    "w_dist %r below the controller bound %r" % (cfg["w_dist"], lo))
-    # ---- continuous Task 1 metric recomputed from the logged end probabilities
-    vrows = _jl(os.path.join(rl_dir, "validation.jsonl"))
+    # ---- continuous Task 1 metric recomputed from the logged end probabilities (validation and re-selection)
+    real_vllm = args.get("planner_backend") == "vllm" and not args.get("dry_run")
+    for fname in ("validation.jsonl", "reselect.jsonl"):
+        _check_t1prob_file(rl_dir, fname, rep, real_vllm)
+
+
+def _check_t1prob_file(rl_dir, fname, rep, real_vllm):
+    import task1_stop as T1
+    vrows = _jl(os.path.join(rl_dir, fname))
+    vsum = sorted((v for v in vrows if v.get("kind") == "summary"), key=lambda v: v["update"])
     for v in vsum:
-        w = "validation u%s" % v["update"]
+        w = "%s u%s" % (fname.split(".")[0], v["update"])
+        if fname == "reselect.jsonl" and v.get("selection_score") is not None and v.get("task1"):
+            ts = v.get("turn_stats") or {}
+            want = (v["w_sel_cov"] * ts["coverage_mean"] - v["w_sel_w1"] * ts["turn_w1"]
+                    + v["w_sel_task1"] * v["task1"][v.get("selection_task1_metric", "term_f1")])
+            rep.ok("rl.selection", abs(v["selection_score"] - want) < 1e-9, w,
+                   "re-selection score %r != recomputed %r" % (v["selection_score"], want))
         rows = {}
         for r in vrows:
             if r.get("kind") == "task1" and r["update"] == v["update"] and r.get("policy_sha") == v.get("policy_sha"):
@@ -893,6 +933,11 @@ def check_v16(rl_dir, rep, splits_path=None):
         if not rows or not v.get("task1"):
             continue
         pts = [p_ for r in rows.values() for p_ in (r.get("end_probs") or [])]
+        if real_vllm:
+            want_ad = adapter_name(rl_dir, v["update"])
+            bad = [p_.get("t") for p_ in pts if p_.get("gen_adapter") != want_ad]
+            rep.ok("rl.task1_prob", not bad, w, "probes at t %r not generated by the policy of update %s (%r)"
+                   % (bad[:5], v["update"], want_ad))
         for p_ in pts:
             if not p_.get("valid", True) and "decision_valid" in p_:
                 want = 1.0 if (p_["decision_valid"] and p_.get("greedy_end")) else 0.0
@@ -1089,6 +1134,8 @@ def check_endpoints(meta, rep):
 def check_selection(vp, rl_dir, rep):
     """validation summaries: D5 settings, the selection score recomputed from its logged parts, best = argmax."""
     summ = [json.loads(l) for l in open(vp, encoding="utf-8") if l.strip() and json.loads(l).get("kind") == "summary"]
+    meta0 = _jl(os.path.join(rl_dir, "run_meta.jsonl"))[:1]
+    v16_run = bool(meta0) and "task1_G" in ((meta0[0].get("config") or {}).get("args") or {})
     scored = {}
     for v in summ:
         w = "validation u%s" % v.get("update")
@@ -1101,6 +1148,8 @@ def check_selection(vp, rl_dir, rep):
         if v.get("selection_score") is None:
             continue
         m1 = v.get("selection_task1_metric", "term_f1")        # v16 runs: bal_p; older runs: term_f1
+        if v16_run:
+            rep.ok("rl.selection", m1 == "bal_p", w, "a v16 run must select on bal_p, summary says %r" % m1)
         want = (v["w_sel_cov"] * ts["coverage_mean"] - v["w_sel_w1"] * ts["turn_w1"]
                 + v["w_sel_task1"] * (t1[m1] if t1 else 0.0))
         rep.ok("rl.selection", abs(v["selection_score"] - want) < 1e-9, w,

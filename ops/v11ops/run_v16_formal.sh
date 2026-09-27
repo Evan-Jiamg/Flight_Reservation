@@ -68,13 +68,16 @@ s = sorted([json.loads(l) for l in open(O + "validation.jsonl") if l.strip() and
 best, stale = None, 0
 for v in s:
     x = v["selection_score"]
-    if x is not None and (best is None or x > best):
+    if x is None:
+        continue                     # a withheld validation (unclean episodes after re-runs) is no evaluation
+    if best is None or x > best:
         best, stale = x, 0
     else:
         stale += 1
 print("yes" if stale >= 2 else "no")
 PYEOF
 )
+  [ "$STOP" = "yes" ] || [ "$STOP" = "no" ] || { echo "STOP: the stop rule could not be computed ($STOP)"; exit 1; }
   echo "stop rule (2 validations without improvement): $STOP"
   [ "$STOP" = "yes" ] && { echo "early stop after update $N"; break; }
 done

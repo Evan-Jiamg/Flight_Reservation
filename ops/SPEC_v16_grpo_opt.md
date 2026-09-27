@@ -94,8 +94,8 @@
 - 新增 `--stop-sup-floor F`（絕對權重）。
 - `aux_weight(u, cfg) = max(F, w · anneal)`：
   - `w = cfg["w_aux"]`；
-  - `anneal` 在 D2 未觸發時為 1，觸發後為 `max(0, 1 − (u − start) / stop_sup_anneal)`。
-  - 也就是 **aux 永遠不會低於 F**，控制器仍然可以把 `w_aux` 往上調。
+  - `anneal` 在 D2 未觸發時為 1，觸發後為 `max(F / stop_sup_weight, 1 − (u − start) / stop_sup_anneal)`。退火因子的下限是 F / 初始權重，而不是 0（稽核 P 的 F6）。
+  - 也就是 **aux 永遠不會低於 F**；退火結束後，控制器把 `w_aux` 往上調仍然有效（例：w_aux = 2 → 實際 1.0）。
 - `--stop-sup-weight 0`（純 GRPO 對照）時，F 必須為 0，否則報錯。
 - 當 F 大於「w × anneal」（下限前的值）時，實際權重為 F，並在 hist 記錄 `aux_floor_active: true`。
 - **SPEC 值 = 0.5**（使用者 2026-09-28 決定）。考量第 3 點會讓 RL 梯度變小，0.7 可能讓 aux 壓過 RL。其他值需要 `--ablation`。
@@ -222,6 +222,24 @@
 
 ## 共通要求
 - 所有新 SPEC 值都要進 `parse_args` 的 SPEC gate：`task1_G` 8、`task1_convs` 8、`t1_trigger_margin` 0.10、`stop_sup_floor` 0.5。和 SPEC 值不同就需要 `--ablation`。
+- 早先核准的數值也納入 gate（稽核 P 的 F1），不同就需要 `--ablation`：
+  - Task 2 的 `G` 4；
+  - `behav_mismatch_abort` 0.1；
+  - `w_sel_cov`、`w_sel_w1`、`w_sel_task1` 皆為 1.0；
+  - `batch` 1；
+  - `task1_tol` 0.05；
+  - `stop_sup_weight` 1.0 或 0；
+  - 非 dry-run 時，`scenarios_per_update` 4、`val_every` 5。
+- verify 補強（稽核 P）：
+  - v16 run 的選擇指標必須是 `bal_p`；
+  - reselect.jsonl 的 summary 也要重算選擇分數與 bal_p；
+  - 重算補抽是否該發生、停止原因是否一致；
+  - 記錄的 aux_floor 必須等於 run 的 `--stop-sup-floor`；
+  - 驗證探測的 greedy 前綴必須由該 update 的 policy adapter 產生（vLLM 的正式 run）。
+- 實驗腳本（稽核 Q）：
+  - **prelim**：只用 GPU0，佔用中就拒絕；結束或異常退出時一定停掉自己的 server；GPU 讀值不是數字就停止；設時間上限。
+  - **step0**：沿對話順序配對回覆；每段對話分別計數 judge 事件，不乾淨的對話不算入 AUC；單段失敗不影響其他段。
+  - **formal**：由 `run_v16_launch.sh` 啟動佔位程式，結束時釋放所有 GPU（guard 同樣）；withheld 的驗證不算「沒有改進」；停止規則算不出來就停止。
 - `CODE_FILES` 加入 `task1_stop.py`（原本已有）；`task1_pooled.py` 是評估工具，另列。
 - provenance：新參數都自動進 run_meta 的 args，resume 時不可改。只有 `RESUME_MAY_CHANGE` 允許更改的例外，而**新參數都不加入**這份清單。
 - 既有測試全部通過；新增測試覆蓋每一項。

@@ -1297,7 +1297,8 @@ class Task2Env:
         computes P(end) teacher-forced). Otherwise {"valid": False} (read as p_end 0, like the benchmark)."""
         x = self.task1_sample(conversation_id, t, user_prompt, real_final, 1, 0.0, 1.0, 0)[0]
         g = x["planner_gen"]
-        out = {"valid": False, "greedy_end": bool(x["ended_planner"]), "decision_valid": bool(x["decision_valid"])}
+        out = {"valid": False, "greedy_end": bool(x["ended_planner"]), "decision_valid": bool(x["decision_valid"]),
+               "gen_adapter": g.get("gen_adapter")}
         if not x["decision_valid"] or g["stop_mask"] is None:
             return out
         tt = self.planner.stop_target(g["gen_ids"], g["stop_mask"], True)
