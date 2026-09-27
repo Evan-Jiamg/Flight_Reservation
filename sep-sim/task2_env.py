@@ -59,12 +59,26 @@ V3_ARMS = ("a2", "final")            # goal judge + silent Planner exit
 E16_ARMS = ("e16", "final", "pend")  # built on the E1.6 tree
 EMIT_END_ARMS = ("e16", "pend")      # Planner end = the planned message is the last one
 BENCH = "/tmp2/hchsu/trec2026-usersim-benchmark"
+# The benchmark's Python tools (r0_client: R0 client + requirement Ledger; metrics.judge) are loaded from a PINNED copy
+# of benchmark commit ca13b33 (2026-09-17), the version every run up to v15 used: the shared tree was rewritten on
+# 2026-09-27 (names R0Client / Ledger / R0_* / JUDGE_BASE_URL retired). Data files (req_shards_v1.json, folds) are read
+# from the live tree; they did not change (sha checked in the pin's manifest). Override only with PEND_BENCH_TOOLS.
+BENCH_PIN = "ca13b33"
+BENCH_TOOLS = os.environ.get("PEND_BENCH_TOOLS") or "/tmp2/mzjiang_usersim/grpo_planner/bench_pin/%s/tools" % BENCH_PIN
 TREE_V2FIX = "/home/mzjiang/Sep-Simulator"
 TREE_E16 = "/tmp2/mzjiang_usersim/grpo_planner/trees/e1r_cf19400"
 TREE = TREE_V2FIX
 
 
 FOLDS_GP = os.path.join("/tmp2/hchsu/trec2026-usersim-benchmark", "domains/main_dataset_search/folds3_goal_persona_v1.json")
+
+
+def check_bench_module(mod):
+    """The benchmark module actually imported must be the PINNED copy (a test stub without a file is accepted)."""
+    f = getattr(mod, "__file__", None)
+    if f and not os.path.abspath(f).startswith(os.path.abspath(BENCH_TOOLS) + os.sep):
+        raise RuntimeError("benchmark module %s loaded from %s, not from the pinned copy %s" % (mod.__name__, f, BENCH_TOOLS))
+    return mod
 
 
 def make_fewshot_pool(recs_by_cid, allowed, folds_path=FOLDS_GP):
@@ -343,7 +357,7 @@ def setup_environment(arm):
     tree = tree_of(arm)
     if "sepsim" in sys.modules and not os.path.abspath(sys.modules["sepsim"].__file__).startswith(os.path.abspath(tree)):
         raise RuntimeError("sepsim already imported from another tree; one arm family per process")
-    for p in (HERE, tree, os.path.join(tree, "scripts"), os.path.join(BENCH, "tools")):
+    for p in (HERE, tree, os.path.join(tree, "scripts"), BENCH_TOOLS):
         if p not in sys.path:
             sys.path.insert(0, p)
     sys.modules.setdefault("torchvision", None)
@@ -570,6 +584,10 @@ class Task2Env:
         setup_environment(arm)
         from sepsim import acts, models, planner_prompt as PP
         import run_v2
+        import r0_client as _r0mod
+        import metrics.judge as _judgemod
+        check_bench_module(_r0mod)
+        check_bench_module(_judgemod)
         from r0_client import R0Client
         from metrics.judge import Judge
         import fit_prompts as F
@@ -712,6 +730,10 @@ class Task2Env:
                 "planner_vllm_url": getattr(getattr(self.planner, "remote", None), "url", None),
                 "planner_budget": self.planner.budget, "speaker_budget": F.SPEAKER_BUDGET,
                 "system_prompt_sha256": hashlib.sha256(self.system.encode()).hexdigest(),
+                "bench_tools": BENCH_TOOLS, "bench_pin": BENCH_PIN,
+                "bench_tools_sha256": {f: hashlib.sha256(open(os.path.join(BENCH_TOOLS, f), "rb").read()).hexdigest()
+                                       for f in ("r0_client.py", "metrics/judge.py")
+                                       if os.path.isfile(os.path.join(BENCH_TOOLS, f))},
                 "goal_judge": (self.judge.model_path, self.judge.adapter) if self.judge else None,
                 "r0_model": self.r0.model, "ledger_judge_model": self.ledger_judge.model,
                 "r0_base_url": os.environ.get("R0_BASE_URL", "default(api.openai.com)"),

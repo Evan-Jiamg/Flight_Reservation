@@ -60,6 +60,10 @@ def main(argv=None):
     forb = set(f["forbidden_for_training"])
     assert not set(ids) & forb, "a train id is forbidden"
     TE.setup_environment("pend")
+    import r0_client as _r0mod
+    import metrics.judge as _judgemod
+    TE.check_bench_module(_r0mod)                     # the pinned benchmark copy (as Task 2)
+    TE.check_bench_module(_judgemod)
     from r0_client import Ledger
     from metrics.judge import Judge
     from sepsim import pipeline
