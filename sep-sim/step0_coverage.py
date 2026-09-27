@@ -63,6 +63,7 @@ def main(argv=None):
     import r0_client as _r0mod
     import metrics.judge as _judgemod
     TE.check_bench_module(_r0mod)                     # the pinned benchmark copy (as Task 2)
+    TE.check_bench_data()                             # the requirement shards every earlier run read
     TE.check_bench_module(_judgemod)
     from r0_client import Ledger
     from metrics.judge import Judge
