@@ -32,9 +32,10 @@ stop_port() {   # our own server on this port only; escalates to SIGKILL, then w
   pkill -9 -u mzjiang -f "vllm serve .*--port $1"
   sleep 10
 }
-our_gpu() {     # our compute processes on any GPU
+our_gpu() {     # OUR processes of this prelim on any GPU (vLLM engines, the smoke, Step 0) - never other GPU work
   for p in $(nvidia-smi --query-compute-apps=pid --format=csv,noheader); do
-    [ "$(ps -o user= -p $p 2>/dev/null)" = "mzjiang" ] && echo $p
+    [ "$(ps -o user= -p $p 2>/dev/null)" = "mzjiang" ] || continue
+    ps -o args= -p $p 2>/dev/null | grep -qE "vllm|VLLM|EngineCore|smoke_v16|step0_coverage" && echo $p
   done
 }
 pick_free() {   # the first GPU with < 2 GiB used; nothing when none (or when nvidia-smi cannot be read)

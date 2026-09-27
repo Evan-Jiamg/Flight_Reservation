@@ -13,6 +13,11 @@ release() {
     for i in $(seq 1 60); do pgrep -u mzjiang -f "vllm serve .*--port $port" > /dev/null || break; sleep 2; done
     pkill -9 -u mzjiang -f "vllm serve .*--port $port"
   done
+  sleep 5
+  for p in $(nvidia-smi --query-compute-apps=pid --format=csv,noheader); do     # orphaned engines of our servers
+    [ "$(ps -o user= -p $p 2>/dev/null)" = "mzjiang" ] || continue
+    ps -o args= -p $p 2>/dev/null | grep -qE "vllm|VLLM|EngineCore" && kill -9 $p 2>/dev/null
+  done
   echo "GUARD: GPUs released $(date)"
 }
 for retry in $(seq 1 20); do
