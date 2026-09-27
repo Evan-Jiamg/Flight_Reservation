@@ -57,7 +57,7 @@ TIME_KEYS = ("time", "wall_s", "rollout_s", "update_s", "timing", "validation_s"
 VAL_RETRIES = 2          # an unclean validation episode (infrastructure incident) is re-run up to this many times
 RESUME_MAY_CHANGE = ("resume", "allow_code_change", "updates", "rollout_workers", "gpu", "max_batch",
                      "keep_optimizer_last", "dry_run_crash_after_episodes", "vllm_url", "intervention",
-                     "reselect_seeds")
+                     "reselect_seeds", "reselect_updates")
 
 
 # ------------------------------------------------------------------ small utilities
@@ -1018,6 +1018,11 @@ class Trainer:
         cands = sorted({r["update"] for r in read_jsonl(self.p_val) if r.get("kind") == "summary"})
         if not cands:
             raise SystemExit("no validated checkpoint in %s" % self.p_val)
+        if a.reselect_updates:
+            miss = sorted(set(a.reselect_updates) - set(cands))
+            if miss:
+                raise SystemExit("--reselect-updates %s were never validated in training" % miss)
+            cands = sorted(set(a.reselect_updates))
         row = self.meta("reselect")
         self.check_provenance(row)
         out = os.path.join(a.out, "reselect.jsonl")
@@ -1156,6 +1161,8 @@ def parse_args(argv=None):
     ap.add_argument("--reselect-seeds", type=int, nargs="+", default=None,
                     help="checkpoint re-selection: re-validate every validated checkpoint with these seeds "
                          "(writes reselect.jsonl / reselect_best.json only; no training)")
+    ap.add_argument("--reselect-updates", type=int, nargs="+", default=None,
+                    help="with --reselect-seeds: only these validated checkpoints (default: all validated ones)")
     ap.add_argument("--intervention", default=None,
                     help="JSON file of a user-approved intervention on the controller weights/bounds (see apply_intervention)")
     ap.add_argument("--keep-optimizer-last", type=int, default=3,

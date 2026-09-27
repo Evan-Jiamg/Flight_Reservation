@@ -78,3 +78,20 @@ def test_verify_catches_wrong_seed_and_best():
     rep = V.Report()
     V.check_reselect_ids(out, val, tra, rep)
     assert rep.checks["rl.reselect_seeds"]["fail"] == 1 and rep.checks["rl.reselect_best"]["fail"] == 1
+
+
+def test_reselect_only_chosen_updates():
+    import pytest
+    sp, out = _setup()
+    with pytest.raises(SystemExit):
+        T.main(args(sp, out, *SEEDS, "--reselect-updates", "3", controller="llm", updates=4))   # never validated
+    rec = T.main(args(sp, out, *SEEDS, "--reselect-updates", "0", "4", controller="llm", updates=4))
+    rows = T.read_jsonl(os.path.join(out, "reselect.jsonl"))
+    assert sorted(r["update"] for r in rows if r["kind"] == "summary") == [0, 4]
+    assert sorted(int(u) for u in rec["candidates"]) == [0, 4]
+    meta = T.read_jsonl(os.path.join(out, "reselect_meta.jsonl"))
+    assert meta[-1]["candidates"] == [0, 4]
+    rep = V.Report()
+    sp_ = json.load(open(sp))["folds"][0]
+    V.check_reselect_ids(out, set(sp_["validation"]), set(sp_["train_all"]), rep)
+    assert all(c["fail"] == 0 for c in rep.checks.values())

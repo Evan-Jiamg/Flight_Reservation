@@ -65,7 +65,8 @@ for u in sorted(summ):
 print("self-check: recomputed selection scores match the summaries")
 pairs = [(0, u) for u in sorted(summ) if u != 0] + [(bu, u) for u in sorted(summ) if bu is not None and u not in (0, bu)]
 for a, b in pairs:
-    if a not in eps or b not in eps:
+    # only checkpoints with a finished re-selection summary (a stopped run may leave partial episodes)
+    if a not in summ or b not in summ or a not in eps or b not in eps:
         continue
     keys = sorted(set(eps[a]) & set(eps[b]))
     convs = sorted({k[0] for k in keys})
