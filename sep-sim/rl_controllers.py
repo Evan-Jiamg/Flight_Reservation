@@ -299,7 +299,10 @@ class LLMController(Controller):
 LLM4_DEFAULTS = {"model": "gpt-oss-120b", "every": 5, "window": 5, "rollback_windows": 2,
                  "factors": [0.5, 0.8, 1.0, 1.25, 2.0],
                  "keys": ["w_cov", "w_dist", "lambda_unparsed", "lambda_hit_max_new", "w_aux"],
-                 "bounds": {"w_cov": [0.1, 5.0], "w_dist": [0.1, 5.0],
+                 # v16 (user 2026-09-28): w_dist may not go below its initial 1.0 (lowering it collapsed the
+                 # conversation length in the v11 run, u12-u17); it may still be raised
+                 "aux_floor": 0.0,
+                 "bounds": {"w_cov": [0.1, 5.0], "w_dist": [1.0, 5.0],
                             "lambda_unparsed": [0.1, 5.0], "lambda_hit_max_new": [0.1, 5.0],
                             "w_aux": [0.01, 5.0]},
                  "max_tokens": 4000, "timeout_s": 300}
@@ -312,7 +315,8 @@ LLM4_SYSTEM = (
     "conversation lengths T matches real people's) - lambda_unparsed * (share of unreadable plans) "
     "- lambda_hit_max_new * (share of plans cut by the length cap). Separately, w_aux weights an auxiliary "
     "supervised loss that pulls the Planner's end_session decision towards the real person's on training "
-    "conversations (it is also annealed to 0 later); both share one optimizer step: compare aux_grad_norm with "
+    "conversations (once validation Task 1 improves it is annealed towards a fixed floor of %g and never goes "
+    "below it); both share one optimizer step: compare aux_grad_norm with "
     "rl_grad_norm (the RL part of the same step) to "
     "judge whether it dominates or is negligible, and task1_train accuracy to judge whether it is still needed. "
     "You see ONLY statistics of TRAINING "
@@ -400,7 +404,8 @@ class LLMFactorController(Controller):
                    "bounds": {k: self.opt["bounds"][k] for k in self.opt["keys"]},
                    "earlier_decisions": self.decisions[-6:]}
         return {"model": self.opt["model"], "max_tokens": int(self.opt["max_tokens"]),
-                "messages": [{"role": "system", "content": LLM4_SYSTEM % (self.opt["factors"], ", ".join(self.opt["keys"]))},
+                "messages": [{"role": "system", "content": LLM4_SYSTEM % (float(self.opt["aux_floor"]), self.opt["factors"],
+                                                                          ", ".join(self.opt["keys"]))},
                              {"role": "user", "content": json.dumps(payload, sort_keys=True)}]}
 
     def _log(self, rec):

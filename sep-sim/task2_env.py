@@ -1290,6 +1290,24 @@ class Task2Env:
                 break
         return out
 
+    def task1_end_probe(self, conversation_id, t, user_prompt, real_final):
+        """v16 validation Task 1 metric input at one real turn t >= 2: the policy's GREEDY Planner output from the
+        Task 1 prompt of that turn and, when it holds a valid end_session value with a located stop mask, the
+        prompt + own prefix up to the value and the value tokens re-encoded as true and as false (the learner then
+        computes P(end) teacher-forced). Otherwise {"valid": False} (read as p_end 0, like the benchmark)."""
+        x = self.task1_sample(conversation_id, t, user_prompt, real_final, 1, 0.0, 1.0, 0)[0]
+        g = x["planner_gen"]
+        out = {"valid": False, "greedy_end": bool(x["ended_planner"]), "decision_valid": bool(x["decision_valid"])}
+        if not x["decision_valid"] or g["stop_mask"] is None:
+            return out
+        tt = self.planner.stop_target(g["gen_ids"], g["stop_mask"], True)
+        tf = self.planner.stop_target(g["gen_ids"], g["stop_mask"], False)
+        if tt is None or tf is None or tt["prefix_ids"] != tf["prefix_ids"]:
+            return out
+        out.update(valid=True, prompt_ids=list(g["prompt_ids"]), prefix_ids=tt["prefix_ids"],
+                   target_true=tt["target_ids"], target_false=tf["target_ids"])
+        return out
+
     def run_task1(self, conversation_id, seed=0, keep_prompts=False):
         """Task 1 (teacher-forced) stop decisions of the Planner on a REAL conversation (pend arm), read
         off the full Task 1 generation (the same code as the evaluation; the Implicit Profile also needs

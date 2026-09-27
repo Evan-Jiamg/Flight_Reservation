@@ -1,9 +1,10 @@
 """RL objectives for the Planner: GRPO, RLOO, PPO.
 
 Pure-python part (no torch; tested locally in test_rl_advantages.py):
-  group_advantages      GRPO: A_i = (R_i - mean) / (std + eps) within a group of G episodes of the same
-                        scenario; std is the population std; a group whose std <= min_std is skipped
-                        (returns None) and counted by the caller.
+  group_advantages      GRPO: A_i = R_i - mean within a group of G episodes of the same scenario (v16, Dr.
+                        GRPO: no division by the group std; grpo_std_norm=True restores (R_i - mean) / (std
+                        + eps)); a group whose population std <= min_std is skipped (returns None) and
+                        counted by the caller.
   rloo_advantages       A_i = R_i - mean_{j != i} R_j (G >= 2).
   ppo_advantages        A = R - V (gamma = 1, reward only at the end, so the return of every Planner
                         step is the episode reward).
@@ -39,7 +40,10 @@ import random
 ALGOS = ("grpo", "rloo", "ppo")
 LORA = {"r": 16, "lora_alpha": 32, "lora_dropout": 0.0,
         "target_modules": ["q_proj", "k_proj", "v_proj", "o_proj"], "bias": "none"}
+# grpo_std_norm (v16, user 2026-09-28): False = Dr. GRPO advantages R - mean(R); a nearly uniform group no longer
+# blows a chance difference up to a unit-size advantage
 ALGO_DEFAULTS = {"tis_cap": 2.0, "clip_eps": 0.2, "adv_eps": 1e-6, "min_group_std": 1e-8, "epochs": 1, "minibatches": 1,
+                 "grpo_std_norm": False,
                  "max_grad_norm": 1.0, "vf_coef": 0.5, "value_hidden": 256, "value_lr": 1e-4,
                  "rloo_clipped": False, "ppo_adv_norm": True, "ratio_init_tol": 1e-4,
                  "forward_mode": "train_nodropout", "weight_decay": 0.0, "old_logp_grad_graph": False}
@@ -60,6 +64,8 @@ def algo_cfg(**over):
             raise ValueError("algo cfg %s=%r outside declared bounds [%g, %g]" % (k, cfg[k], lo, hi))
     if cfg["forward_mode"] not in ("train_nodropout", "eval"):
         raise ValueError(cfg["forward_mode"])
+    if not isinstance(cfg["grpo_std_norm"], bool):
+        raise ValueError("grpo_std_norm must be true or false")
     return cfg
 
 
@@ -73,21 +79,24 @@ def pstd(xs):
     return math.sqrt(sum((x - m) ** 2 for x in xs) / len(xs))
 
 
-def group_advantages(rewards, eps=1e-6, min_std=1e-8):
-    """GRPO. -> list of advantages, or None when the group has (near) zero spread (skipped)."""
+def group_advantages(rewards, eps=1e-6, min_std=1e-8, std_norm=False):
+    """GRPO. -> list of advantages, or None when the group has (near) zero spread (skipped).
+    std_norm=False (v16 default): A = R - mean(R); True: (R - mean) / (std + eps)."""
     if len(rewards) < 2:
         raise ValueError("a GRPO group needs at least 2 episodes")
     m, s = mean(rewards), pstd(rewards)
     if s <= min_std:
         return None
-    return [(r - m) / (s + eps) for r in rewards]
+    d = (s + eps) if std_norm else 1.0
+    return [(r - m) / d for r in rewards]
 
 
-def split_group_advantages(rewards, stop_parts, eps=1e-6, min_std=1e-8):
-    """GRPO with stop credit, normalised ONCE: A_i = (R_i - mean R) / std(R) is split into the part
+def split_group_advantages(rewards, stop_parts, eps=1e-6, min_std=1e-8, std_norm=False):
+    """GRPO with stop credit, normalised ONCE: A_i = (R_i - mean R) / d is split into the part
     caused by the length term S (-> end_session tokens) and the rest (-> every token):
-        A_stop_i = (S_i - mean S) / std(R),   A_seq_i = ((R_i - S_i) - mean(R - S)) / std(R),
-    so A_stop + A_seq = the plain GRPO advantage and the reward weights keep their effect.
+        A_stop_i = (S_i - mean S) / d,   A_seq_i = ((R_i - S_i) - mean(R - S)) / d,
+    so A_stop + A_seq = the plain GRPO advantage and the reward weights keep their effect; d = 1 (v16 default,
+    Dr. GRPO) or std(R) + eps with std_norm=True.
     -> (A_seq, A_stop) or (None, None) when the group has (near) zero spread."""
     if len(rewards) != len(stop_parts):
         raise ValueError("rewards / stop parts length mismatch")
@@ -98,7 +107,8 @@ def split_group_advantages(rewards, stop_parts, eps=1e-6, min_std=1e-8):
         return None, None
     rest = [r - q for r, q in zip(rewards, stop_parts)]
     ms, mr = mean(stop_parts), mean(rest)
-    return [(x - mr) / (s + eps) for x in rest], [(x - ms) / (s + eps) for x in stop_parts]
+    d = (s + eps) if std_norm else 1.0
+    return [(x - mr) / d for x in rest], [(x - ms) / d for x in stop_parts]
 
 
 class MismatchAbort(RuntimeError):
@@ -175,7 +185,7 @@ def advantages_for_groups(groups, algo, cfg):
     out, skipped = [], 0
     for rs in groups:
         if algo == "grpo":
-            a = group_advantages(rs, cfg["adv_eps"], cfg["min_group_std"])
+            a = group_advantages(rs, cfg["adv_eps"], cfg["min_group_std"], cfg["grpo_std_norm"])
         elif algo == "rloo":
             a = rloo_advantages(rs)
             if all(abs(x) <= cfg["min_group_std"] for x in a):
@@ -512,6 +522,18 @@ class TorchLearner:
         torch.save(self.optimizer.state_dict(), os.path.join(d, "optimizer.pt"))
         if self.value_head is not None:
             torch.save(self.value_head.state_dict(), os.path.join(d, "value_head.pt"))
+
+    def end_prob(self, x):
+        """v16 validation Task 1 metric: P(end_session = true) given the prompt and the policy's own greedy prefix
+        up to the value, normalised over the two values: exp(lp_true) / (exp(lp_true) + exp(lp_false)), each lp the
+        summed log-prob of that value's tokens (temperature 1, no grad)."""
+        import torch
+        with torch.no_grad():
+            ctx = list(x["prompt_ids"]) + list(x["prefix_ids"])
+            lt = float(token_logprobs(self.model, ctx, x["target_true"], 1.0)[0].sum())
+            lf = float(token_logprobs(self.model, ctx, x["target_false"], 1.0)[0].sum())
+        m = max(lt, lf)
+        return math.exp(lt - m) / (math.exp(lt - m) + math.exp(lf - m))
 
     def load(self, d):
         import os

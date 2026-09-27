@@ -164,7 +164,7 @@ def test_parallel_rollouts_equal_serial():
         assert all(r["conversation_id"] in sp_["train_all"] and r["conversation_id"] not in sp_["forbidden_for_training"] for r in ta)
         assert sorted({r["update"] for r in ta}) == [1, 2, 3]
         for r in ta:
-            assert r["real_final"] == (r["t"] == r["n_real"]) and len(r["samples"]) == 4
+            assert r["real_final"] == (r["t"] == r["n_real"]) and len(r["samples"]) == 8      # v16: --task1-G 8
             assert all(x["reward"] == float(x["ended_planner"] == r["real_final"]) for x in r["samples"])
         assert all(u["train_aggregate"]["task1_train"]["n"] > 0 for u in ua)
         # pend default: reward v4 (D1(b)) with the train-only p_h, and validation summaries carry the turn statistics

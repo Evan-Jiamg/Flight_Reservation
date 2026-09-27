@@ -66,6 +66,34 @@ def task1_stop_metrics(convs):
             "unparsed_rate": unparsed / rows_n, "n_emitted_capped_turns": capped}
 
 
+def task1_prob_metrics(points):
+    """v16 (user 2026-09-28) continuous Task 1 metric from teacher-forced end probabilities. points: one per
+    decision point (real turn t >= 2) {"real_final": bool, "p_end": float in [0, 1]} (an invalid decision point
+    carries p_end 0: the benchmark reads an unparsed plan as "not ending").
+      bal_p   = 1/2 mean_{final} p_end + 1/2 mean_{earlier} (1 - p_end)   (earlier part dropped when absent)
+      auc     = P(p_end at a final point > p_end at an earlier point), ties 1/2 (None without both kinds)
+      logloss = mean -log p(true label), p clipped to [1e-6, 1 - 1e-6]"""
+    import math
+    if not points:
+        raise ValueError("no decision points")
+    fin = [float(x["p_end"]) for x in points if x["real_final"]]
+    mid = [float(x["p_end"]) for x in points if not x["real_final"]]
+    for p in fin + mid:
+        if not (0.0 <= p <= 1.0):
+            raise ValueError("p_end %r outside [0, 1]" % p)
+    if not fin:
+        raise ValueError("no final decision point")
+    bal = 0.5 * sum(fin) / len(fin) + 0.5 * sum(1 - p for p in mid) / len(mid) if mid else sum(fin) / len(fin)
+    auc = None
+    if mid:
+        pairs = [(1.0 if a > b else 0.5 if a == b else 0.0) for a in fin for b in mid]
+        auc = sum(pairs) / len(pairs)
+    eps = 1e-6
+    ll = [-math.log(min(1 - eps, max(eps, p))) for p in fin] + [-math.log(min(1 - eps, max(eps, 1 - p))) for p in mid]
+    return {"bal_p": bal, "auc": auc, "logloss": sum(ll) / len(ll), "n_points": len(points), "n_final": len(fin),
+            "n_invalid": sum(1 for x in points if not x.get("valid", True))}
+
+
 def within_tolerance(metrics, base, tol):
     """No-degradation check against a base (e.g. the untrained policy): term_f1 may not drop, and
     premature may not rise, by more than tol (declared in advance)."""

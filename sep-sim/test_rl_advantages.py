@@ -18,9 +18,14 @@ def close(a, b, tol=1e-9):
 
 # ------------------------------------------------------------------ advantage math
 def test_group_advantages():
+    # v16 default (Dr. GRPO): A = R - mean(R)
     a = RA.group_advantages([1.0, 0.0, 0.0, 1.0], eps=0.0)
+    assert [round(x, 12) for x in a] == [0.5, -0.5, -0.5, 0.5]
+    assert RA.ALGO_DEFAULTS["grpo_std_norm"] is False
+    # the old normalisation stays available with std_norm=True
+    a = RA.group_advantages([1.0, 0.0, 0.0, 1.0], eps=0.0, std_norm=True)
     assert [round(x, 12) for x in a] == [1.0, -1.0, -1.0, 1.0]            # mean .5, population std .5
-    a = RA.group_advantages([3.0, 1.0], eps=1e-6)
+    a = RA.group_advantages([3.0, 1.0], eps=1e-6, std_norm=True)
     assert close(a[0], 1.0 / (1.0 + 1e-6)) and close(sum(a), 0.0)
     assert RA.group_advantages([0.7, 0.7, 0.7]) is None                    # zero spread -> skipped
     assert RA.group_advantages([0.7, 0.7 + 1e-12], min_std=1e-8) is None
@@ -170,10 +175,11 @@ def check_outputs(out, splits_p, n_updates):
     best = json.load(open(os.path.join(out, "best.json")))
     summ = [v for v in val if v["kind"] == "summary"]
     vs = {v["update"]: v["selection_score"] for v in summ if v["selection_score"] is not None}
-    # selection = w_sel_cov*coverage - w_sel_w1*W1 + w_sel_task1*term_f1, recomputed from the logged parts
+    # selection = w_sel_cov*coverage - w_sel_w1*W1 + w_sel_task1*bal_p (v16), recomputed from the logged parts
     for v in summ:
+        assert v["selection_task1_metric"] == "bal_p"
         if v["selection_score"] is not None:
-            t1 = v["task1"]["term_f1"] if v["task1"] else 0.0
+            t1 = v["task1"]["bal_p"] if v["task1"] else 0.0
             want = (v["w_sel_cov"] * v["turn_stats"]["coverage_mean"] - v["w_sel_w1"] * v["turn_stats"]["turn_w1"]
                     + v["w_sel_task1"] * t1)
             assert abs(v["selection_score"] - want) < 1e-9
