@@ -1,99 +1,99 @@
-# Draft — Introduction & Related Work
+# Draft — Introduction & Related Work (rev. 3)
 
-> 草稿（2026-09-28）。英文正文供之後貼進 `scai_sigconf/body.tex`；`> 註` 是給作者的說明，定稿時刪除。
-> **規則**：所有數字與文獻都來自下列來源（見文末「Sources」），文獻資料只照投影片 / repo 上寫的抄，
-> 缺的欄位標 `TODO`，**請在定稿前逐條對原文確認**。沒有任何文獻是憑記憶補的。
-> 版面：模板是 2 頁 extended abstract（Intro 約 250 words、無 Related Work 節）。本稿刻意寫完整，
-> 之後再依版面刪減；Related Work 可壓成 Intro 的一段，或放進投稿版全文。
+> 草稿 rev.3（2026-09-28，依 reviewer 第 1–3 輪意見修正）。英文正文供之後貼進 `scai_sigconf/body.tex`；`> 註` 是給作者的說明，定稿時刪除。
+> **規則**：所有數字與文獻都來自文末「Sources」，文獻只照來源抄，缺的欄位標 `TODO`，定稿前請逐條對原文確認。
+> 版面：模板是 2 頁 extended abstract（Intro 約 250 words、沒有 Related Work 節）。本稿 Intro 約 690 words（含小標與 TODO）、Related Work 約 560 words，
+> 放進模板時：Intro 刪到 Context 2 句 / Gap 3 句 / Approach 2 句；Related Work 併成 Intro 裡約 80 words 的一段（見 §2 末的濃縮版）。
 
 ---
 
 ## 1. Introduction
 
-**Context.** User simulators are increasingly used to evaluate and train conversational information-access systems, because recruiting real users for every system variant is slow and expensive [Balog & Zhai 2024]. The TREC 2026 User Simulation Track makes this concrete for *conversational data search*: a researcher looks for a relevant dataset through a search interface, and a simulator must either predict the next user utterance given the real history (Task 1) or generate a whole session from a persona and a goal — *including when to stop* (Task 2). Submissions are judged on whether their behaviour matches real logs and whether human raters can tell them apart from real users.
+**Context.** User simulators are increasingly used to evaluate and train conversational information-access systems [Balog & Zhai 2024]. The TREC 2026 User Simulation Track targets *conversational data search*, where a researcher looks for a relevant dataset through a search interface [Kreutz et al. 2025]. A simulator either predicts the next user utterance given a partial conversation history and the user's information need (Task 1), or generates a whole conversation and must itself decide when the goal is satisfied or when to give up (Task 2). The track compares the distributions of query length, turn count and clarification requests with real logs, alongside a human Turing test.
 
-**The gap.** Recent LLM-based simulators have made rapid progress on *turn-level* fidelity: they reproduce the distribution of user intents and dialogue acts, stay consistent with a persona, and write utterances that human-likeness judges accept [USP; UserLM; ConsistentPersona; Turing-RL]. Session-level behaviour — how long a user keeps going and when they are satisfied enough to leave — has received far less attention. Reinforcement-learning simulators score each *utterance* (persona consistency, profile recovery, a Turing-style judge), so no reward term measures a property that exists only at session scale; other work fixes the dialogue length in advance or suppresses the end token [ConsistentPersona; USP; UserLM]. Evidence from a shared internal benchmark for the track shows why this matters. The simulator with the best act-transition fidelity in the benchmark (Turing-RL; act-transition JSD 0.121, act-distribution TVD 0.185, length KS D 0.089) never ends a replayed human session when given one more turn (K+1 termination rate 0.000), ends only 3.8% of its free-running sessions, and runs 9.9 turns against a human mean of 4.4 — essentially always hitting the 10-turn cap. The opposite failure also occurs: UserLM-8b ends after 1.04 turns on average, and 72% of its stop decisions are premature. **Matching users turn by turn does not make a simulator stop like a user.**
+**The gap.** We call a simulator *session-level faithful* when its per-turn decisions to stop match those of real users — *when* to stop, not only *whether* — and, as a consequence, its distribution of session lengths matches theirs. Recent LLM simulators have become strong at turn-level fidelity (intent adherence, persona consistency, style) [Naous et al. 2026; Abdulhai et al. 2025; Wang et al. 2025], but on the track's data this does not carry over to the session level. In our lab's internal benchmark (not the official evaluation), a re-implementation of the Turing-RL recipe [Wang et al. 2026a] whose act transitions are within the human noise floor and whose act distribution is, with one other system, the closest to human in the benchmark (act TVD 0.185) never ends a replayed human session when offered one more turn (0/26 sessions) and runs 9.9 user turns against a human mean of 4.4; the public UserLM-8b [Naous et al. 2026], prompted with its native end token, instead emits END at 72% of the real mid-session turns where the human continued, and its sessions last 1.04 turns; zero-shot Ditto-8B comes close to the human mean (5.0 turns). Act-level fidelity thus does not predict session behaviour: one of the two simulators closest to human act distributions never stops, while Ditto-8B, further from them (act TVD 0.305), is close to the human session length. Stopping is also sensitive to the probe setup: a newer probe that adds one shared termination instruction (together with an updated system agent) moved Ditto-8B's K+1 end rate from 0.04 to 0.48. Existing RL rewards for simulators are per-utterance judgements or, in USP, one dialogue-level profile-similarity score; none compares a simulator's session lengths or stop positions with those of real users.
 
-**Our approach.** We build on a Planner–Speaker simulator in which stopping is an explicit decision rather than an absent or suppressed token. A small Planner (Qwen3-4B) reads the conversation, keeps an implicit profile of the user, judges whether the goal has been met, and decides whether to end the session; a frozen Speaker (Ditto-8B) writes candidate utterances in the user's style, and a selector picks one. Our earlier, training-free version of this design was competitive on turn-level metrics but inherited the field's session-level weakness: it ran 8.4 turns on average, 51 of 64 sessions hit the turn cap, and when the Planner decided to stop, the Speaker actually closed the conversation only 8% of the time. We therefore train the Planner with group-relative policy optimisation (GRPO) [DeepSeekMath], the RL method adopted by many recent simulator papers [UserLM-R1; Turing-RL; DITTO], but with *session-level* rewards: matching the real distribution of session lengths, covering the user's requirements, and agreeing with real users' stop decisions on held-out conversations, with the credit for the length reward routed to the Planner's end-session decision.
+**Our approach.** We use a Planner–Speaker simulator in which ending the session is a separate, binding decision of the Planner (Qwen3-4B-Instruct-2507); a frozen Speaker (Ditto-8B, whose own end token is masked; a blank Speaker message also ends the episode) writes candidates that a length-and-style selector ranks. Two training-free versions of this design show why stopping must be learned. In the first, the Speaker ignored the Planner's decision to stop (asked to close, it closed 8% of the time) and 51 of 64 sessions hit the 10-turn cap. A second version, which among other changes makes the Planner's decision binding, does close (K+1 end rate 0.05 → 0.48 against the first version without annotations) but ends too early (premature end rate 0.03 → 0.14). We therefore train the Planner with a GRPO variant (group-mean baseline without standard-deviation normalisation) on session-level rewards: a log-ratio term that moves the simulated turn-count distribution towards real users' turn counts in the training fold, LLM-judged requirement coverage, and agreement with the real user's stop decision at real decision points of training conversations. The advantage of the length term is credited only to the Planner's end-session tokens, and an auxiliary supervised loss on the same stop decisions (weight floor 0.5) stabilises training.
 
-> 註：下一段等 fold 2 test（u5 vs u0）與其他 fold 跑完再填；目前沒有任何可引用的 v16 結果。
+> 註：下一段等 fold 2 test（u5 vs u0）與其他 fold 跑完再填；目前沒有任何可引用的 v16 結果。比較協定（AUDIT_SPEC）是對 E1.6 在同一批 test sessions 上重新計分，**目前沒有核准其他 baseline**；若要與 benchmark 其他方法同表，須先證明我們 Task 2 環境（自架 R0／ledger judge）與 benchmark 的 system agent 設定（prompt v4、length_retry_v1）一致。輪數要寫清楚是 W1 還是 benchmark 的平均輪數（錨 4.446），或兩個都報。
 
-**Findings.** `TODO` — e.g. "On held-out conversations of the track's dataset, the trained Planner … turn-count W1 … while keeping act-level fidelity …, compared with <baselines> in the benchmark." (fill from the fold-2 test and the 3-fold pooled evaluation; report paired bootstrap intervals, not single numbers.)
+**Findings.** `TODO` (from the fold-2 test and the three-fold pooled evaluation; paired bootstrap intervals, n stated.)
 
 **Contributions.**
-- We document a gap between turn-level and session-level fidelity in current LLM user simulators for multi-turn conversational search: methods that match human intents and dialogue acts still fail to stop like humans, in both directions (never stopping and stopping immediately).
-- We design a Planner–Speaker simulator in which ending the session is an explicit, trainable Planner decision, and train it with GRPO using session-level rewards (session-length distribution matching, requirement coverage, and stop agreement with real users) instead of per-utterance rewards.
-- `TODO` We show that … (result), evaluated with goal- and persona-disjoint cross-validation against re-implemented and public simulators on the same benchmark.
+- We show, on the track's data, that act-level fidelity does not predict session-level fidelity: session behaviour ranges from never ending to ending almost immediately, independently of act fidelity, and is sensitive to the prompt and probe setup.
+- We make ending the session a separate, binding Planner decision and train it with GRPO against real users' session lengths and stop positions, with credit assigned to the end-session decision, instead of per-utterance rewards.
+- `TODO` (result, on goal- and persona-disjoint test sessions, compared with our training-free version under the same protocol.)
 
 > 註：
-> 1. 「shared internal benchmark」是學長的 repo（`/tmp2/hchsu/trec2026-usersim-benchmark`），README 自己寫「our internal instrument, not the official track evaluation」。定稿時要寫清楚它是誰維護的（README §7 記載 Lucas H.-C. Hsu；請確認要怎麼致謝／引用）。
-> 2. 上面 Turing-RL / UserLM-8b 的數字出自 `leaderboard/leaderboard.md`（main domain，system agent = 本地 gpt-oss-120b，probe v2）。Turing-RL 與 UserLM-R1 是**團隊重現版**（NOTICE §5：代表該配方在本域的表現，不是官方系統）——正文要寫 "re-implementation"。
-> 3. Leaderboard 所有 Friedman 檢定都不顯著，所以只能逐指標描述，**不要寫總排名**。
-> 4. v2fix 的數字（8.4375 turns、51/64 截斷、8.0% 關閉率）出自 Sep-1st-Simulator README §2.2/§4.1 與 PSS:39；K+1 0.0179 是舊 probe v1，v2 下每 fold 是 0.0。
-> 5. 官方 Task 1 是 next-utterance prediction；我們的「Task 1 stop decision／term_f1」是自己的 M2 對應（decision D7），benchmark 的 `termination_f1` 已在 9/26 退役。正文不要把它寫成官方指標。
+> 1. benchmark 是實驗室內部量測工具，NOTICE 說它「不是可引用的出版物；請引用 Track 與原始論文」。致謝 Lucas H.-C. Hsu（Sep-1st README §7），**不要引用 repo**。
+> 2. Turing-RL 的數字：probe v2、三個 fold test side 共 26 個 session（K+1 0/26、rollout 自己結束 1/26、平均 9.885 輪），`instruments/termination_probe_v2/README.md` 與 `leaderboard.md`。真人雜訊地板：act TVD（F1）0.155、transition JSD（F2）0.19——Turing-RL 的 transition JSD 0.121 在地板內，act TVD 0.185 **在地板之上**（但與 A1-s1 的 0.182 並列最接近真人）。Ditto 的提示敏感度：加一條共用 TERMINATION_INSTRUCTION 讓全語料 K+1 從 0.0357 變 0.4821（probe README 49-52；v1 的 system agent 也是舊設定，所以不能全歸功於那條指示）。它的「結束」在自己的格式裡是空訊息，所以「不結束」可能部分來自重現方式——正文已寫 re-implementation，必要時再加一句 hedge。
+> 3. UserLM-8b：**未入榜**，用它原生的 end token、沒有共用的 TERMINATION_INSTRUCTION（probe README 74-76）；72% = `teacher_forced_turn_with_end_decision_rate`（分母是所有真人繼續的中間輪）。Ditto-8B：K+1 0.577、4.962 輪，是 F10 family 最佳，而且就是我們的凍結 Speaker——reviewer 會問「為何不直接用 Ditto」，答案要在 Results 用「停在哪一輪」（premature、stop AUC）而不只是平均輪數來回答。
+> 4. 兩個免訓練版本的數字是**我們自己在 benchmark 較早協定下**的量測（v2fix：Qwen2.5-32B planner + UserLM-8b speaker，64 episodes；E1.6：K+1 0.0536→0.4821、premature 0.0321→0.1446，出自 v2fix_to_E1.6 投影片 p.4-5），**不可和上面 probe v2 的數字並列成同一張表**。8% 與 51/64 屬於 v2fix；0.0536 屬於 v2fix 去掉 annotations 的版本（原 v2fix 是 0.0179）；v2fix → E1.6 改了五件事（annotations、stop 權限、speaker 輸入、role header、開場取樣），所以正文寫「among other changes」。兩版用的模型也不同（v2fix：Qwen2.5-32B planner＋UserLM-8b speaker；E1.6 的 speaker 來源未寫明，請確認）。
+> 5. 方法描述對應 AUDIT_SPEC / SPEC_v16：Task 1 stop groups 用 train_all 對話（不是 held-out）；validation 只用來挑 checkpoint（bal_p）；coverage 由 gpt-oss-120b ledger judge 判斷；Dr. GRPO 需要引文（`TODO cite`，來源裡沒有書目）。
+> 6. 實驗室組員的 Unified Framework 投影片提出過 user 端的 termination reward（λ4·r_term），A1-s1 是他在同一 benchmark 的 RL 模擬器。**我們不宣稱「第一個獎勵 user 端結束」**，新穎性放在「對真人長度分佈與真人結束位置做最佳化、並把 credit 給結束決策」。若要正面比較，請確認 A1-s1 是否用了 r_term。
+> 7. 官方 Task 1 是 next-utterance prediction；我們自己的 Task 1 結束決策指標（M2 mapping, decision D7）不是官方指標；benchmark 的 `termination_f1` 已於 9/26 退役。
 
 ---
 
 ## 2. Related Work
 
-### 2.1 LLM-based user simulation
+**LLM user simulators.** User simulation evolved from agenda-based [Schatzmann et al. 2007] and neural sequence models [El Asri et al. 2016; Kreyssig et al. 2018] to LLMs trained to play the user [Balog & Zhai 2024]. USP [Wang et al. 2025] conditions generation on an implicit profile extracted from each dialogue (our Planner keeps a similar implicit profile); UserLM-8b [Naous et al. 2026] flips assistant dialogues to train a user model with an end-of-conversation token, and documents prompted assistants' reluctance to end a session; HumanLM [Wu et al. 2026] aligns latent user states; MUSE [Liu et al. 2026] optimises a profile by iterative self-critique against real dialogues; ProUtt [Wang et al. 2026b] predicts the user's next intent path. Most are evaluated at the turn level; UserLM also scores termination, learning to stop by imitating real ends and needing a guardrail against ending too early.
 
-User simulation has a long history in dialogue systems, from agenda-based simulators [Schatzmann et al. 2007] to neural sequence models [El Asri et al. 2016; Kreyssig et al. 2018]; Balog & Zhai [2024] survey its use for evaluating information-access systems. Recent work trains LLMs to play the user. USP [Wang et al. 2025] extracts an implicit profile from each dialogue and conditions generation on it; UserLM-8b [Naous et al. 2026] "flips" assistant dialogues to train a dedicated user model with an explicit end-of-conversation token; HumanLM [Wu et al. 2026] aligns latent user states; MUSE [Liu et al. 2026] evolves user profiles during the session; ProUtt [Wang et al. 2026] predicts the next user intent path. These models are evaluated mostly at the turn level (semantic and style similarity to the real next utterance, persona consistency, detectability). UserLM is the notable exception in scoring dialogue termination, yet its authors still add guardrails that stop the model from ending too early, and it is trained by supervised learning rather than RL.
+**RL for user simulators.** ConsistentPersona [Abdulhai et al. 2025] applies multi-turn PPO with a judge-scored persona-consistency reward; USP's RLCC stage [Wang et al. 2025] rewards one dialogue-level profile-similarity (cycle-consistency) score, repeated over the user turns, plus human-likeness; UserLM-R1 [Zhang et al. 2026] combines rule and rubric rewards with GRPO and judges "timing of hanging up" with an LLM; Turing-RL [Wang et al. 2026a] uses a pairwise Turing-style judge as the GRPO reward; MUSE averages turn-level rubric rewards over the session under GRPO; DITTO [Sun et al. 2026] adds verbal feedback to GRPO. Session length is either fixed (ConsistentPersona's 10, 20, 40 or 60 turns), capped (USP, up to 10 turns) or judged by an LLM; none of these rewards compares session lengths or stop positions with real users. Steering a frozen generator with a small trained planner has precedents — Dialogue Action Tokens [Li et al. 2024], PPDPP [Deng et al. 2024] and EPO (`TODO` authors, ACL 2025) — but none of them trains a *user's* decision to stop: PPDPP plans the system's moves, drops CraigslistBargain's terminal acts and caps dialogues at 8 turns, and DAT names leaving the chat as an open direction. We therefore do not claim the planner–generator split as new, only its use for a user whose stop decision is trained.
 
-> 註：UserLM 的 termination F1（論文 63.54 vs USP-8B 21.31）出自組員 UnifiedFramework:12 的轉述；Hao-Cheng 重現 60.24（UserLM8b_reproduction:5-6）。要引數字請回原論文確認。
-
-### 2.2 Reinforcement learning for user simulators
-
-Several recent simulators are fine-tuned with RL, using PPO [Schulman et al. 2017] or GRPO [Shao et al. 2024]. ConsistentPersona [Abdulhai et al. 2025] applies multi-turn PPO with a judge-scored persona-consistency reward; USP's RLCC stage [Wang et al. 2025] rewards profile recovery (cycle consistency) and human-likeness; UserLM-R1 [Zhang et al. 2026] combines rule-based and rubric rewards with GRPO over a dynamic profile; Turing-RL [Wang et al. 2026] uses a pairwise Turing-style judge as the GRPO reward; DITTO [Sun et al. 2026] adds verbal feedback to GRPO. In all of them the reward is computed per utterance (or, for USP, a session score copied back to each turn), and session length is either fixed in advance (ConsistentPersona's 10–60-turn dialogues, USP's 10-turn cap) or judged by an LLM rather than compared with real sessions (UserLM-R1's "timing of hanging up"). Our reward instead targets the distribution of real session lengths and real stop decisions.
-
-Architecturally, steering a frozen generator with a small trained planner has precedents: Dialogue Action Tokens [Li et al. 2024] train a planner on a per-utterance signal, and PPDPP (ICLR 2024) and EPO (ACL 2025) plug a trained or verbalised planner into a frozen dialogue agent. These works plan the *system's* moves and do not represent ending the session (PPDPP drops terminal acts and caps dialogues at 8 turns); we therefore do not claim the planner–generator split itself as new, but its use for a *user* whose stop decision is the object of training.
+**Evaluation and stopping.** Sim4IA-Bench [Kruff et al. 2026a] scores next-query and next-utterance prediction on real search sessions, but every task is single-step; Bernard & Balog [2024] formalise simulation objectives in conversational information access; Kruff et al. [2026b] propose a taxonomy of measures for validating query simulations; clem:todd [Chalamalasetti et al. 2025] benchmarks simulator × dialogue-system combinations, and SimEval-IR [Zerhoudi 2026] separates behavioural realism from tester reliability. Zhou et al. [2026] find that simulated users are more cooperative and disclose task information earlier than real ones, and recommend reporting behaviour, task outcome and subjective ratings separately — a session-level realism gap. In interactive IR, when users stop has long been modelled with stopping rules [Cooper 1973; Kraft & Lee 1979; Maxwell et al. 2015] and foraging theory [Charnov 1976; Pirolli & Card 1999]; LLM simulators learn to stop only by imitation (UserLM's end token) or through LLM-judged rubrics, and none is optimised against real users' session-length distribution. Finally, conversational search systems are increasingly optimised against learned or interactive feedback — reward-model reranking for query reformulation [Lai et al. 2025] and GRPO-trained agentic search [Mo et al. 2026] — so realistic session endings matter for training and evaluating them.
 
 > 註：
-> - 「PPDPP、EPO 不可宣稱新穎」是 README FW 裡自己寫的警語，照實保留。PPDPP / EPO 的完整書目投影片沒有（只有 arXiv 2311.00262 / 2502.12486），標 TODO。
-> - 組員 UnifiedFramework:9 說「termination reward 在 task-oriented dialogue RL 是標準做法（訓練 system 端）」但沒給出處——**沒有出處前不要寫進正文**。
+> - 作者先前在 Sep-1st 試過具名 stopping rules，**沒贏過單純的輪數計數器**（F1 0.442 vs 0.524/0.559，Sep-1st README）；benchmark 的 stop judgement 也顯示 `rule_turn_count` AUC 0.809。Results 要把「停在哪一輪」和這個 turn-count / hazard 基線比（不只和 E1.6 比），reviewer 會要求。
+> - UserLM 的 termination F1（論文 63.54）只出自組員轉述，要引請回原論文確認。
+> - UserRL [Qian 2025]、UserSimCRS v2 [Bernard & Balog 2026]、Chopra [2026]《Beyond Cooperative Simulators》在來源裡**只有標題與 venue**，沒有內容描述，所以**已從正文移除**；讀過原文、能寫出一句正確描述後再放回（Chopra 可能與 Zhou et al. 並列，UserRL 可能放 RL 段）。
+> - 空白的 Speaker 輸出也會結束 episode（AUDIT_SPEC），Method 節要寫清楚，避免讀者以為只有 Planner 能結束。
+> - UnifiedFramework 說「termination reward 在 task-oriented dialogue RL 是標準做法（訓練 system 端）」但沒給出處——**不寫進正文**。
 
-### 2.3 Evaluating user simulators and session behaviour
-
-Evaluation of simulators has moved from single metrics to suites. Sim4IA-Bench [Kruff et al. 2026] scores next-query and next-utterance prediction on real search sessions, but every task is a single-step prediction; Bernard & Balog [2024] formalise simulation objectives in conversational information access; Kruff et al. [2026] propose a taxonomy of measures for validating query simulations; SimEval-IR [Zerhoudi 2026] and clem:todd [Chalamalasetti et al. 2025] compare simulators through the systems they evaluate. Closest to our concern, Zhou et al. [2026] ("Mind the Sim2Real Gap") find that simulated users are more cooperative and disclose task information earlier than real users — a session-level mismatch — but do not propose a training remedy. In interactive IR, when and why users stop has long been modelled with stopping rules and foraging theory [Maxwell et al. 2015; Pirolli & Card 1999]; LLM simulators have not been trained against such behaviour. Finally, our setting is conversational *search*, where recent systems are themselves trained with RL — e.g. conversational query rewriting [AdaRewriter; Lai et al. 2025] and agentic conversational search with GRPO [Mo et al. 2026] — which makes a simulator that ends sessions realistically a prerequisite for training and evaluating them.
-
-> 註：最後一句是論點延伸，不是任何來源的結論；若版面不夠可刪。Maxwell 2015 / Pirolli & Card 1999 只在 PSS / README 以「作者＋年份＋venue」出現，書名缺，標 TODO。
+**Condensed version for the 2-page template (~80 words).** User simulators learn turn-level fidelity via SFT [Naous et al. 2026] or RL with per-utterance, rubric or dialogue-level similarity rewards [Abdulhai et al. 2025; Wang et al. 2025; Zhang et al. 2026; Wang et al. 2026a]; they stop by imitation, LLM-judged rubrics or caps. Benchmarks score single-step prediction [Kruff et al. 2026a]; simulated users are over-cooperative [Zhou et al. 2026]. IR models stopping [Maxwell et al. 2015; Pirolli & Card 1999], but no simulator's reward targets real users' session-length distribution.
 
 ---
 
 ## References (as written in the sources; verify before use)
 
-Bibliographic fields are copied from the Related Work Summary slide (RWS:19, "verified entry by entry"), the benchmark's `docs/metric_specs.md`, or the labmates' slides. `TODO` = not in the sources.
+`TODO` = not in the sources.
 
 | Key | Entry (as in source) | Source |
 |---|---|---|
-| Abdulhai et al. 2025 | Abdulhai, Cheng, Clay, Althoff, Levine, Jaques. *Consistently Simulating Human Personas with Multi-Turn Reinforcement Learning*. NeurIPS 2025. arXiv:2511.00222 | RWS:19; ConsistentPersona:1 |
-| Balog & Zhai 2024 | Balog, Zhai. *User Simulation for Evaluating Information Access Systems*. Foundations and Trends in IR, 2024 | RWS:19 |
+| Abdulhai et al. 2025 | Abdulhai, Cheng, Clay, Althoff, Levine, Jaques. *Consistently Simulating Human Personas with Multi-Turn Reinforcement Learning*. NeurIPS 2025. arXiv:2511.00222 | RWS p.19; ConsistentPersona p.1 |
+| Balog & Zhai 2024 | Balog, Zhai. *User Simulation for Evaluating Information Access Systems*. Foundations and Trends in IR, 2024 | RWS p.19 |
 | Bernard & Balog 2024 | Bernard, Balog. *Towards a Formal Characterization of User Simulation Objectives in Conversational Information Access*. ICTIR 2024. arXiv:2406.19007 | bench metric_specs [BB24] |
-| Chalamalasetti et al. 2025 | Chalamalasetti, Hakimov, Schlangen. *clem:todd*. SIGDIAL 2025 (full title TODO) | RWS:19 |
-| El Asri et al. 2016 | El Asri, He, Suleman. *A Sequence-to-Sequence Model for User Simulation in Spoken Dialogue Systems*. Interspeech 2016 | RWS:19 |
-| Kreyssig et al. 2018 | Kreyssig et al. *Neural User Simulation for Corpus-based Policy Optimisation*. SIGDIAL 2018 | RWS:19 |
-| Kruff et al. 2026a (Sim4IA-Bench) | Kruff, Kreutz, Breuer, Schaer, Balog. *Sim4IA-Bench: A User Simulation Benchmark Suite for Next Query and Utterance Prediction*. ECIR 2026. arXiv:2511.09329 | RWS:19; bench [S4IA26] |
-| Kruff et al. 2026b | Kruff, Bernard, Schaer. *Validating Search Query Simulations: A Taxonomy of Measures*. 2026. arXiv:2601.11412 (venue "ECIR 2026" not verified — TODO) | bench [KBS26] |
-| Lai et al. 2025 (AdaRewriter) | Lai, Wu, Wang, Zhou. *AdaRewriter: … Conversational Query Reformulation via Test-Time Adaptation*. EMNLP 2025. arXiv:2506.01381 (exact title TODO) | RWS:19; AdaRewriter:1-2 |
-| Li et al. 2024 (DAT) | Li, Wang, Viégas, Wattenberg. *Dialogue Action Tokens*. arXiv:2406.11978, 2024 (full title TODO) | RWS:19 |
-| Liu et al. 2026 (MUSE) | Liu et al. *MUSE*. arXiv:2604.13828, 2026 (title TODO) | RWS:19 |
-| Maxwell et al. 2015 | Maxwell et al. CIKM 2015 (title TODO) | PSS / README |
-| Mo et al. 2026 (ConvAgent) | Mo et al. *Agentic Conversational Search*. ACL 2026. arXiv:2601.13115 | RWS:19 |
-| Naous et al. 2026 (UserLM) | Naous, Laban, Xu, Neville. *Flipping the Dialogue: Training and Evaluating User Language Models*. ICLR 2026. arXiv:2510.06552 | RWS:19; UserLM:1 |
-| Pirolli & Card 1999 | Pirolli, Card. 1999 (title/venue TODO) | PSS / README |
-| PPDPP | Deng, Zhang, Lam, Ng, Chua. ICLR 2024. arXiv:2311.00262 (title TODO) | Sep-1st README |
-| EPO | ACL 2025. arXiv:2502.12486 (authors/title TODO) | README |
-| Schatzmann et al. 2007 | Schatzmann et al. *Agenda-Based User Simulation*. NAACL-HLT 2007 | RWS:19 |
-| Schulman et al. 2017 (PPO) | Schulman 2017 (title/venue TODO) | RWS Appendix |
-| Shao et al. 2024 (GRPO) | Shao et al. *DeepSeekMath*. arXiv:2402.03300, 2024 | RWS:19 |
-| Sun et al. 2026 (DITTO) | Sun, Zhou, Liu et al. *Reinforcing Human Behavior Simulation via Verbal Feedback*. arXiv:2605.20506, 2026 (venue TODO) | RWS:19 |
-| Wang et al. 2025 (USP) | Wang, Li, Yang, Zhou, Jiang, Li. *Know You First and Be You Better: Modeling Human-Like User Simulators via Implicit Profiles*. ACL 2025 | RWS:19; USP:1 |
-| Wang et al. 2026a (Turing-RL) | Wang et al. *Learning User Simulators with Turing Rewards*. arXiv:2606.19336, 2026 (venue TODO) | RWS:19 |
-| Wang et al. 2026b (ProUtt) | Wang et al. *LLM-Driven Preference Data Synthesis for Proactive Prediction of the Next User Utterance in Human-Machine Dialogue*. arXiv:2601.09713, 2026 | DITTO deck:21 |
-| Wu et al. 2026 (HumanLM) | Wu, Choi, Khatua et al. *HumanLM*. arXiv:2603.03303, 2026 (title TODO) | RWS:19 |
-| Zerhoudi 2026 (SimEval-IR) | Zerhoudi. *SimEval-IR*. SIGIR 2026 (title TODO) | RWS:19 |
-| Zhang et al. 2026 (UserLM-R1) | Zhang, Li, Zhang et al. *Modeling Human Reasoning in User Language Models with Multi-Reward Reinforcement Learning*. arXiv:2601.09215, 2026 | RWS:19; UserLM-R1:1 |
-| Zhou et al. 2026 | Zhou, Sun, Ma et al. *Mind the Sim2Real Gap in User Simulation*. COLM 2026 | RWS:19 |
+| Bernard & Balog 2026 | Bernard, Balog. *UserSimCRS v2*. ECIR 2026 (full title TODO；目前未在正文引用) | RWS Appendix |
+| Chalamalasetti et al. 2025 | Chalamalasetti, Hakimov, Schlangen. *clem:todd*. SIGDIAL 2025 (full title TODO) | RWS p.19 |
+| Charnov 1976 | Charnov. Theoretical Population Biology 9(2):129–136, 1976 (title TODO) | Sep-1st README |
+| Chopra 2026 | Chopra. *Beyond Cooperative Simulators*. arXiv 2026 (id/authors TODO；目前未在正文引用) | RWS Appendix |
+| Cooper 1973 | Cooper. JASIS 24(6):413–424, 1973 (title TODO) | Sep-1st README |
+| Deng et al. 2024 (PPDPP) | Deng, Zhang, Lam, Ng, Chua. ICLR 2024. arXiv:2311.00262 (title TODO) | Sep-1st README |
+| EPO | ACL 2025. arXiv:2502.12486 (authors/title TODO) | Sep-1st README |
+| El Asri et al. 2016 | El Asri, He, Suleman. *A Sequence-to-Sequence Model for User Simulation in Spoken Dialogue Systems*. Interspeech 2016 | RWS p.19 |
+| Kraft & Lee 1979 | Kraft, Lee. IPM 15(1):47–58, 1979 (title TODO) | Sep-1st README |
+| Kreutz et al. 2025 | Kreutz, Perry, Friedrich. *Data Discovery Using LLMs — A Study of Data User Behaviour*. TPDL 2025. arXiv:2507.04444 | bench metric_specs [K25] |
+| Kreyssig et al. 2018 | Kreyssig et al. *Neural User Simulation for Corpus-based Policy Optimisation*. SIGDIAL 2018 | RWS p.19 |
+| Kruff et al. 2026a (Sim4IA-Bench) | Kruff, Kreutz, Breuer, Schaer, Balog. *Sim4IA-Bench: A User Simulation Benchmark Suite for Next Query and Utterance Prediction*. ECIR 2026. arXiv:2511.09329 | RWS p.19; bench [S4IA26] |
+| Kruff et al. 2026b | Kruff, Bernard, Schaer. *Validating Search Query Simulations: A Taxonomy of Measures*. 2026. arXiv:2601.11412 (venue TODO) | bench [KBS26] |
+| Lai et al. 2025 | Lai, Wu, Wang, Zhou. *AdaRewriter: … Prompting-based Conversational Query Reformulation via Test-Time Adaptation*. EMNLP 2025. arXiv:2506.01381 (exact title TODO) | AdaRewriter p.1-3 |
+| Li et al. 2024 (DAT) | Li, Wang, Viégas, Wattenberg. *Dialogue Action Tokens*. arXiv:2406.11978, 2024 (full title TODO) | RWS p.19 |
+| Liu et al. 2026 (MUSE) | Liu et al. *MUSE*. arXiv:2604.13828, 2026 (full title TODO) | RWS p.19 |
+| Maxwell et al. 2015 | Maxwell et al. CIKM 2015 (title TODO) | Sep-1st README |
+| Mo et al. 2026 | Mo et al. *Agentic Conversational Search with Contextualized Reasoning via Reinforcement Learning*. ACL 2026. arXiv:2601.13115 | Agentic-Conv-Search slides p.1-3; RWS p.19 |
+| Naous et al. 2026 (UserLM) | Naous, Laban, Xu, Neville. *Flipping the Dialogue: Training and Evaluating User Language Models*. ICLR 2026. arXiv:2510.06552 | RWS p.19 |
+| Pirolli & Card 1999 | Pirolli, Card. Psychological Review 106:643–675, 1999 (title TODO) | Sep-1st README |
+| Qian 2025 (UserRL) | Qian. *UserRL*. arXiv 2025 (id/title/authors TODO；目前未在正文引用) | RWS Appendix |
+| Schatzmann et al. 2007 | Schatzmann et al. *Agenda-Based User Simulation*. NAACL-HLT 2007 Companion, pp. 149–152 | RWS p.19; Sep-1st README |
+| Sun et al. 2026 (DITTO) | Sun, Zhou, Liu et al. *Reinforcing Human Behavior Simulation via Verbal Feedback*. arXiv:2605.20506, 2026 (venue TODO) | RWS p.19 |
+| Wang et al. 2025 (USP) | Wang, Li, Yang, Zhou, Jiang, Li. *Know You First and Be You Better: Modeling Human-Like User Simulators via Implicit Profiles*. ACL 2025 | RWS p.19 |
+| Wang et al. 2026a (Turing-RL) | Wang, Zhang, Qiu, He, Li, Pentland, Levy, Kim. *Learning User Simulators with Turing Rewards*. arXiv:2606.19336, 2026 (venue TODO) | RWS; TuringRewardSim p.1 |
+| Wang et al. 2026b (ProUtt) | Wang et al. *LLM-Driven Preference Data Synthesis for Proactive Prediction of the Next User Utterance …*. arXiv:2601.09713, 2026 (the two sources give different titles — TODO) | ProUtt p.1; DITTO deck |
+| Wu et al. 2026 (HumanLM) | Wu, Choi, Khatua et al. *HumanLM*. arXiv:2603.03303, 2026 (full title TODO) | RWS p.19 |
+| Zerhoudi 2026 (SimEval-IR) | Zerhoudi. *SimEval-IR*. SIGIR 2026 (full title TODO) | RWS p.19 |
+| Zhang et al. 2026 (UserLM-R1) | Zhang, Li, Zhang et al. *Modeling Human Reasoning in User Language Models with Multi-Reward Reinforcement Learning*. arXiv:2601.09215, 2026 | RWS p.19 |
+| Zhou et al. 2026 | Zhou, Sun, Ma et al. *Mind the Sim2Real Gap in User Simulation*. COLM 2026 | RWS p.19 |
+| Dr. GRPO | TODO (not in the sources) | — |
 | TREC 2026 UserSim | Guidelines, https://trec.usersim.ai/guidelines (2026-09-23 version) | bench metric_specs |
 
 ---
@@ -101,7 +101,7 @@ Bibliographic fields are copied from the Related Work Summary slide (RWS:19, "ve
 ## Sources
 
 - 自己的報告：Google Drive「TREC-UserSim」R1–R4（2026-07-13 / 07-27 / 08-10 / 08-28）。
-- Internal Meeting 投影片：MingZhi（Related Work Summary、User Simulator for TREC 2026 UserSim、Planner_Speaker_Selector、Dynamic-Reasoning Planner、v2fix_to_E1.6 …）；組員 HaoCheng / HungChun / KuanWei 的論文報告與重現。
+- Internal Meeting 投影片：MingZhi（Related Work Summary、Planner_Speaker_Selector、v2fix_to_E1.6、MUSE、Agentic Conversational Search via RL …）；組員 HaoCheng / HungChun / KuanWei 的論文報告與重現。
 - `/home/mzjiang/Sep-1st-Simulator/README.md`、`REPRO.md`。
-- 學長 benchmark `/tmp2/hchsu/trec2026-usersim-benchmark`：`README.md`、`leaderboard/leaderboard.md`、`docs/metric_specs.md`、`protocols/*.md`、`instruments/termination_probe_v2/README.md`、`NOTICE.md`。
+- 實驗室內部 benchmark `/tmp2/hchsu/trec2026-usersim-benchmark`：`README.md`、`leaderboard/leaderboard.md`、`docs/metric_specs.md`、`protocols/*.md`、`instruments/termination_probe_v2/README.md`、`NOTICE.md`。
 - 現行系統：`ops/SPEC_v16_grpo_opt.md`、`ops/AUDIT_SPEC_pend_grpo.md`（stop-sft-stageB 分支）。
