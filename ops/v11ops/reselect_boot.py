@@ -1,6 +1,7 @@
 """Paired bootstrap over validation conversations for the checkpoint re-selection (reselect.jsonl).
 For every candidate vs u0 (untrained) and vs the re-selected best: selection score (Task 2 parts resampled, Task 1
-term_f1 of each checkpoint fixed: greedy, deterministic), turn W1, mean |sim - human| turns and coverage.
+term of each checkpoint fixed: the summary's selection_task1_metric - bal_p for v16 runs, term_f1 before - greedy,
+deterministic), turn W1, mean |sim - human| turns and coverage.
 Usage: python reselect_boot.py RUN_DIR"""
 import collections
 import json
@@ -39,7 +40,8 @@ def stats(u, keys):
     sim = [E[k]["emitted_user_turns"] for k in ks]
     hum = [min(int(E[k]["human_turns"]), T_MAX) for k in ks]
     cov = sum(float(E[k]["coverage"]) for k in ks) / len(ks)
-    t1 = (summ[u].get("task1") or {}).get("term_f1") or 0.0
+    m1 = summ[u].get("selection_task1_metric") or "term_f1"     # v16: bal_p; older runs: term_f1
+    t1 = (summ[u].get("task1") or {}).get(m1) or 0.0
     W = w1(sim, hum)
     return {"sel": W_COV * cov - W_W1 * W + W_T1 * t1, "w1": W, "cov": cov,
             "abs_err": sum(abs(a - b) for a, b in zip(sim, hum)) / len(ks), "sim": sum(sim) / len(sim),
