@@ -1,0 +1,17 @@
+##### v11 archive run/reselect.jsonl summaries
+##### v16 fold 2 run_meta start/resume times and updates timing
+run_meta start 09-28 05:32
+run_meta resume 09-28 09:42
+update 1 wall_s None time 09-28 06:43
+update 2 wall_s None time 09-28 07:21
+update 3 wall_s None time 09-28 07:59
+update 4 wall_s None time 09-28 08:46
+update 5 wall_s None time 09-28 09:25
+update 6 wall_s None time 09-28 10:17
+update 7 wall_s None time 09-28 10:49
+update 8 wall_s None time 09-28 11:37
+update 9 wall_s None time 09-28 12:20
+update 10 wall_s None time 09-28 13:05
+validation summary u0 at 09-28 05:58 (validation_s 1553.6)
+validation summary u5 at 09-28 09:42 (validation_s 994.2)
+validation summary u10 at 09-28 13:24 (validation_s 1134.3)

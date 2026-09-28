@@ -1,0 +1,47 @@
+METHOD (Planner–Speaker user simulator for multi-turn conversational data search; Task 2 = free-running session)
+
+The simulator plays a real user (a researcher looking for a dataset) talking to a search assistant (the task agent). Each user turn works as follows.
+
+1. Inputs. A scenario gives the user's persona and goal (topic, context, datasets they already know).
+2. Planner. A Planner LLM (Qwen3-4B-Instruct) reads the goal, the conversation so far and the accumulated profile notes, and writes a JSON plan with these fields: critique (what its previous plan got wrong), act_distribution (dialogue moves, each with a probability and a target length in words), goal_met (yes / partly / no), still_wanted, end_session (true if this is the user's last message), profile_note (how this person writes).
+3. Implicit profile. The profile_note of every turn is appended to a growing list of notes about how this person writes. The notes feed back into the Planner at the next turn and are also given to the Speaker.
+4. Few-shot pool. For every candidate, 3 real messages of other users with the same writing style are drawn from the training conversations (never the current goal or persona).
+5. Speaker. A frozen Speaker LLM (Ditto-8B) turns the plan, the notes and the examples into 4 candidate user messages.
+6. Guards and selector. Candidates that copy an example or break format are removed; a Borda selector ranks the rest by closeness to the planned length and by style similarity (SimCSE) and picks one message.
+7. The chosen message goes to the task agent (gpt-oss-120b), whose reply is appended to the conversation history, which the Planner reads at the next turn (a loop).
+8. Ending. If end_session is true, the chosen message is a closing message and the session ends after it; the session also ends if the chosen message is blank, or at 10 user messages.
+
+VISUAL SPECIFICATION (follow exactly)
+
+Style: flat 2D, pure white background, "Soft Tech & Scientific Pastels"; rounded rectangles (corner radius small) with thin outlines; no shadows, no gradients, no 3D; restrained icons only where they carry meaning (a small robot head on the two LLM boxes Planner and Speaker; a small magnifier/search icon on the task agent). No cartoon people.
+Colour roles: the Planner box is the only strongly coloured element (muted teal fill); Speaker box muted lavender; selector box light grey; task agent box light sand; memory stores (profile notes, few-shot pool) drawn as light-yellow cylinder or stacked-card shapes; the END output is a small rounded pill in muted coral.
+
+TEXT RULES: Only the text inside double quotes below may appear in the image, spelled exactly; no other words, no title, no caption, no legend, no watermark. Sans-serif labels. Every label's letter height at least 1/22 of the image height. Keep text minimal.
+
+LAYOUT (aspect 16:9, left-to-right main flow in the middle row, one feedback loop along the bottom):
+- Far left: box A "Persona + Goal".
+- Middle-left: box P "Planner" with small subtitle "Qwen3-4B". Under its title, a small stacked list inside the box with exactly these five short lines: "critique", "act + length", "goal_met", "end_session", "profile_note".
+- Above the Planner: store N "Profile notes" (stacked cards).
+- Centre: box S "Speaker" with subtitle "Ditto-8B (frozen)"; show four small overlapping message cards coming out of it labelled "4 candidates".
+- Above the Speaker: store F "Few-shot examples" (stacked cards), with a tiny subtitle "same style, other users".
+- Middle-right: box C "Guards + Borda selector".
+- Right: box U "User message".
+- Far right: box T "Task agent" with subtitle "gpt-oss-120b".
+- Bottom row, right to left: a long curved arrow from T back towards the Planner, passing a small box H "Conversation history".
+- Small pill E "END" placed below-right of the Planner, near box U.
+
+CONNECTIONS (draw exactly these arrows, solid unless stated):
+E1  A → P
+E2  N → P (dashed)
+E3  P → S, labelled "plan"
+E4  F → S (dashed)
+E5  N → S (dashed)
+E6  S → C
+E7  C → U
+E8  U → T
+E9  T → H (curved, along the bottom), labelled "reply"
+E10 H → P (curved, along the bottom, entering the Planner from below)
+E11 P → N (dashed), labelled "append note"
+E12 U → E (thin), labelled "if end_session or blank"
+
+FORBIDDEN: no arrow from the Speaker to the task agent directly; no arrow from the task agent to the Speaker; no arrow into the Few-shot examples store; no arrow between A and S; no extra boxes; no numbers other than those in quotes; no title or caption inside the image.

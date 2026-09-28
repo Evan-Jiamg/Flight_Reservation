@@ -1,0 +1,17 @@
+##### v16 fold 2 TRAIN rollouts: mean emitted user turns per update (clean episodes)
+u1 n=16 mean=6.38
+u2 n=16 mean=5.69
+u3 n=16 mean=6.31
+u4 n=16 mean=5.50
+u5 n=16 mean=5.69
+u6 n=16 mean=5.38
+u7 n=16 mean=4.69
+u8 n=16 mean=4.50
+u9 n=16 mean=3.69
+u10 n=16 mean=3.50
+##### v11 archive reselect files
+/tmp2/mzjiang_usersim/grpo_planner/archive/pend_f2_v11_u25_20260927/MANIFEST.sha256
+/tmp2/mzjiang_usersim/grpo_planner/archive/pend_f2_v11_u25_20260927/run/validation.jsonl
+/tmp2/mzjiang_usersim/grpo_planner/archive/pend_f2_v11_u25_20260927/run/verify_u20.txt
+/tmp2/mzjiang_usersim/grpo_planner/archive/pend_f2_v11_u25_20260927/run/rollouts_task1.jsonl
+/tmp2/mzjiang_usersim/grpo_planner/archive/pend_f2_v11_u25_20260927/run/reselect.jsonl

@@ -1,0 +1,72 @@
+##### test_boot.txt (fold 2 test)
+u0   Task 2 turn_stats         40 episodes: sim 5.65 human 5.60 W1 0.800 |diff| 1.80 cov 0.857
+u0   Task 2 turn_stats_seeds01 10 episodes: sim 5.80 human 5.60 W1 1.000 |diff| 2.00 cov 0.857
+u0   Task 1 9 convs: term_f1 0.500 bal_p 0.592 auc 0.826 premature 0.000 (unclean Task 2 episodes: 0)
+u5   Task 2 turn_stats         40 episodes: sim 5.42 human 5.60 W1 0.825 |diff| 1.88 cov 0.818
+u5   Task 2 turn_stats_seeds01 10 episodes: sim 5.80 human 5.60 W1 0.600 |diff| 1.80 cov 0.829
+u5   Task 1 9 convs: term_f1 0.182 bal_p 0.530 auc 0.758 premature 0.111 (unclean Task 2 episodes: 0)
+TEST CHECK PASSED
+u5 vs u0, Task 2 all seeds [0, 1, 2, 3, 4, 5, 6, 7]: 40 paired episodes on 5 conversations, 10000 resamples of conversations (few clusters: coarse intervals)
+   w1       u0 0.800 -> u5 0.825  diff 0.025  95% CI [-0.375, 0.650]  P(u5 better) 0.292  P(worse) 0.690
+   abs_err  u0 1.800 -> u5 1.875  diff 0.075  95% CI [-0.350, 0.500]  P(u5 better) 0.346  P(worse) 0.595
+   cov      u0 0.857 -> u5 0.818  diff -0.039  95% CI [-0.082, 0.004]  P(u5 better) 0.041  P(worse) 0.958
+   sim      u0 5.650 -> u5 5.425  diff -0.225  95% CI [-0.875, 0.325]
+u5 vs u0, Task 2 seeds 0/1 (spec D5): 10 paired episodes on 5 conversations, 10000 resamples of conversations (few clusters: coarse intervals)
+   w1       u0 1.000 -> u5 0.600  diff -0.400  95% CI [-0.700, 0.200]  P(u5 better) 0.876  P(worse) 0.091
+   abs_err  u0 2.000 -> u5 1.800  diff -0.200  95% CI [-0.400, 0.000]  P(u5 better) 0.924  P(worse) 0.000
+   cov      u0 0.857 -> u5 0.829  diff -0.029  95% CI [-0.071, 0.029]  P(u5 better) 0.199  P(worse) 0.801
+   sim      u0 5.800 -> u5 5.800  diff 0.000  95% CI [-1.000, 1.100]
+u5 vs u0, Task 1: 9 conversations, 10000 resamples
+   term_f1  u0 0.500 -> u5 0.182  diff -0.318  95% CI [-0.615, 0.000]  P(u5 better) 0.000  P(worse) 0.953
+   bal_p    u0 0.592 -> u5 0.530  diff -0.063  95% CI [-0.236, 0.110]  P(u5 better) 0.190  P(worse) 0.810
+   auc      u0 0.826 -> u5 0.758  diff -0.068  95% CI [-0.356, 0.206]  P(u5 better) 0.245  P(worse) 0.747
+##### reselect_boot.txt (fold 2 8-seed re-selection)
+candidates [0, 5, 10] re-selected best u5 seeds [0, 1, 2, 3, 4, 5, 6, 7]
+u0   sel=0.0976 n=32 unclean=0 sim=5.97 human=5.00 w1=1.344 cov=0.941 term_f1=0.0
+u5   sel=0.2135 n=32 unclean=0 sim=5.88 human=5.00 w1=1.188 cov=0.941 term_f1=0.0
+u10  sel=0.0948 n=32 unclean=0 sim=3.75 human=5.00 w1=1.25 cov=0.926 term_f1=0.2
+self-check: recomputed selection scores match the summaries
+u5 vs u0: 32 paired episodes on 4 conversations
+   sel     u0 0.098 -> u5 0.213  diff 0.116  95% CI [-0.486, 0.905]  P(u5 better) 0.738
+   w1      u0 1.344 -> u5 1.188  diff -0.156  95% CI [-0.938, 0.469]  P(u5 better) 0.785
+   abs_err u0 2.656 -> u5 2.438  diff -0.219  95% CI [-1.000, 0.406]  P(u5 better) 0.674
+   cov     u0 0.941 -> u5 0.941  diff 0.000  95% CI [-0.023, 0.023]  P(u5 better) 0.371
+u10 vs u0: 32 paired episodes on 4 conversations
+   sel     u0 0.098 -> u10 0.095  diff -0.003  95% CI [-1.655, 2.634]  P(u10 better) 0.480
+   w1      u0 1.344 -> u10 1.250  diff -0.094  95% CI [-2.781, 1.562]  P(u10 better) 0.571
+   abs_err u0 2.656 -> u10 1.750  diff -0.906  95% CI [-2.656, 0.875]  P(u10 better) 0.839
+   cov     u0 0.941 -> u10 0.926  diff -0.016  95% CI [-0.066, 0.016]  P(u10 better) 0.317
+u10 vs u5: 32 paired episodes on 4 conversations
+   sel     u5 0.213 -> u10 0.095  diff -0.119  95% CI [-1.767, 1.897]  P(u10 better) 0.450
+   w1      u5 1.188 -> u10 1.250  diff 0.062  95% CI [-2.000, 1.750]  P(u10 better) 0.450
+   abs_err u5 2.438 -> u10 1.750  diff -0.688  95% CI [-2.000, 0.906]  P(u10 better) 0.820
+   cov     u5 0.941 -> u10 0.926  diff -0.016  95% CI [-0.066, 0.031]  P(u10 better) 0.274
+##### validation.jsonl summaries (2-seed selection scores)
+validation.jsonl u0 selection_score 0.6507936242063668 seeds [0, 1]
+validation.jsonl u5 selection_score 0.4176740708593738 seeds [0, 1]
+validation.jsonl u10 selection_score 0.6489416128746763 seeds [0, 1]
+reselect.jsonl u0 selection_score 0.09764305633671311 seeds [0, 1, 2, 3, 4, 5, 6, 7]
+reselect.jsonl u5 selection_score 0.2134990496031382 seeds [0, 1, 2, 3, 4, 5, 6, 7]
+reselect.jsonl u10 selection_score 0.09480907942893929 seeds [0, 1, 2, 3, 4, 5, 6, 7]
+##### updates.jsonl: mean emitted user turns of TRAIN rollouts per update
+u1 turns_mean None keys ['algo', 'cfg_used', 'cfg_used_sha256', 'controller', 'controller_failures', 'controller_rollbacks', 'learner_stats', 'n_samples', 'next_cfg', 'policy_sha_after', 'policy_version_after', 'policy_version_rollouts']
+u2 turns_mean None keys 
+u3 turns_mean None keys 
+u4 turns_mean None keys 
+u5 turns_mean None keys 
+u6 turns_mean None keys 
+u7 turns_mean None keys 
+u8 turns_mean None keys 
+u9 turns_mean None keys 
+u10 turns_mean None keys 
+##### v11 archive re-selection (u5 2-seed vs 8-seed)
+archive: /tmp2/mzjiang_usersim/grpo_planner/archive/pend_f2_v11_u25_20260927/
+run/validation.jsonl u0 sel -1.296875 seeds [0, 1]
+run/validation.jsonl u5 sel 0.28125 seeds [0, 1]
+run/validation.jsonl u10 sel -0.5267857142857143 seeds [0, 1]
+run/validation.jsonl u15 sel -0.96875 seeds [0, 1]
+run/validation.jsonl u20 sel -0.625 seeds [0, 1]
+run/validation.jsonl u25 sel -0.484375 seeds [0, 1]
+##### v16 smoke: grad norms
+      2 "aux_grad_norm": 0.04032725108906202
+      2 "rl_grad_norm": 0.00030237787653050453
