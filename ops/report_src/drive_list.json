@@ -1,0 +1,474 @@
+[
+ {
+  "root": "TREC-reports",
+  "depth": 0,
+  "id": "1Q7GNIgvAN2JAM4BwQ2Xmv94uOClltmQy",
+  "name": "2026-07-13_R1_01_TREC-RAG.pdf",
+  "folder": false,
+  "aria": ""
+ },
+ {
+  "root": "TREC-reports",
+  "depth": 0,
+  "id": "1p4MKbSieFsgJP0VU63gOYALBH76bEDYc",
+  "name": "2026-07-13_R1_02_TREC-UserSim.pdf",
+  "folder": false,
+  "aria": ""
+ },
+ {
+  "root": "TREC-reports",
+  "depth": 0,
+  "id": "1uXJUnC5qqylpAlQrdoc3tYO1o5VtCqd6",
+  "name": "2026-07-13_R1_03_Fin-EC.pdf",
+  "folder": false,
+  "aria": ""
+ },
+ {
+  "root": "TREC-reports",
+  "depth": 0,
+  "id": "12Ldw_YWUi1_pD6pPbdEdfTVlfsVMfKXt",
+  "name": "2026-07-13_R1_04_Fin-Light.pdf.pdf",
+  "folder": false,
+  "aria": ""
+ },
+ {
+  "root": "TREC-reports",
+  "depth": 0,
+  "id": "199kmtUxM8p8D_r4Yi3n4770WoSfvaFZx",
+  "name": "2026-07-13_R1_05_Fin-Embeddings.pdf",
+  "folder": false,
+  "aria": ""
+ },
+ {
+  "root": "TREC-reports",
+  "depth": 0,
+  "id": "17JTEvO5cIokiYoZQT-gPqy-q6_5q_fnz",
+  "name": "2026-07-13_R1_07_Harness-Engineering.pdf",
+  "folder": false,
+  "aria": ""
+ },
+ {
+  "root": "TREC-reports",
+  "depth": 0,
+  "id": "1a8WQjqIjonLYhTeiwnTwcV2bkDOx89Jy",
+  "name": "2026-07-27_R2_01_Fin-Embeddings.pdf",
+  "folder": false,
+  "aria": ""
+ },
+ {
+  "root": "TREC-reports",
+  "depth": 0,
+  "id": "1Uz6P87NgFlDdaLWK9XLq6ukX-zSLAtD5",
+  "name": "2026-07-27_R2_03_TREC-RAG.pdf",
+  "folder": false,
+  "aria": ""
+ },
+ {
+  "root": "TREC-reports",
+  "depth": 0,
+  "id": "10vq-Q0ofHdhqZjWg4nzhToxpXww6q-vw",
+  "name": "2026-07-27_R2_04_Fin-Light.pdf.pdf",
+  "folder": false,
+  "aria": ""
+ },
+ {
+  "root": "TREC-reports",
+  "depth": 0,
+  "id": "1NY4cq15fEDDINirVh6ccHYnFsV3mMvkk",
+  "name": "2026-07-27_R2_05_Fin-EC.pdf",
+  "folder": false,
+  "aria": ""
+ },
+ {
+  "root": "TREC-reports",
+  "depth": 0,
+  "id": "1cFjaTtHDV5SjWbWMgC8LO_hGVlcUxgs9",
+  "name": "2026-07-27_R2_06_Harness-Engineering.pdf",
+  "folder": false,
+  "aria": ""
+ },
+ {
+  "root": "TREC-reports",
+  "depth": 0,
+  "id": "1IWMxOTA00KSZnNLq48KUlUFSVepam1zI",
+  "name": "2026-07-27_R2_07_TREC-UserSim.pdf",
+  "folder": false,
+  "aria": ""
+ },
+ {
+  "root": "TREC-reports",
+  "depth": 0,
+  "id": "12omG5kN6QkBO8YlefeHWvkQzJbHPzuV-",
+  "name": "2026-08-10_R3_01_Harness-Engineering.pdf",
+  "folder": false,
+  "aria": ""
+ },
+ {
+  "root": "TREC-reports",
+  "depth": 0,
+  "id": "15DdBlsVeRszfbAFzasFjQl0QZEYeIc8Q",
+  "name": "2026-08-10_R3_02_Fin-Embeddings.pdf",
+  "folder": false,
+  "aria": ""
+ },
+ {
+  "root": "TREC-reports",
+  "depth": 0,
+  "id": "1UV9kudN2Cy3sB75gP-Siy_FC-7_H7VN1",
+  "name": "2026-08-10_R3_03_TREC-UserSim.pdf",
+  "folder": false,
+  "aria": ""
+ },
+ {
+  "root": "TREC-reports",
+  "depth": 0,
+  "id": "1GHDse0d9lFwYKDV7adIxoOZa5JyOj6QJ",
+  "name": "2026-08-10_R3_04_Fin-CapitalGains.pdf",
+  "folder": false,
+  "aria": ""
+ },
+ {
+  "root": "TREC-reports",
+  "depth": 0,
+  "id": "1JePbRI8pv_dw5EV1ydjmNKQ6mHiUj0fW",
+  "name": "2026-08-10_R3_05_TREC-RAG.pdf",
+  "folder": false,
+  "aria": ""
+ },
+ {
+  "root": "TREC-reports",
+  "depth": 0,
+  "id": "1NsWYyHKQTGt9nNDpRcAnv9ZwQwFqdXeD",
+  "name": "2026-08-10_R3_06_Fin-Light.pdf",
+  "folder": false,
+  "aria": ""
+ },
+ {
+  "root": "TREC-reports",
+  "depth": 0,
+  "id": "1_baYpLHCr2hgnfX7m7EtyXPnCatwZB6J",
+  "name": "2026-08-10_R3_07_Fin-EC.pdf",
+  "folder": false,
+  "aria": ""
+ },
+ {
+  "root": "TREC-reports",
+  "depth": 0,
+  "id": "170TkcKSl3X3D-2jlHXp5Tk26nmZIyTZC",
+  "name": "2026-08-28_R4_01_Fin-EC.pdf",
+  "folder": false,
+  "aria": ""
+ },
+ {
+  "root": "TREC-reports",
+  "depth": 0,
+  "id": "1_qtjuK7ZyiXmSGukCQJIwq3ezPYCjgEo",
+  "name": "2026-08-28_R4_02_Fin-Light.pdf",
+  "folder": false,
+  "aria": ""
+ },
+ {
+  "root": "TREC-reports",
+  "depth": 0,
+  "id": "1IqQXJFnQfQaQSc_pdJ_7GQHOYl_DeFKX",
+  "name": "2026-08-28_R4_03_Harness-Engineering.pdf",
+  "folder": false,
+  "aria": ""
+ },
+ {
+  "root": "TREC-reports",
+  "depth": 0,
+  "id": "1NXc3TRYUPhGKYjbOdpvf-ao0-jLZac-k",
+  "name": "2026-08-28_R4_04_TREC-UserSim.pdf",
+  "folder": false,
+  "aria": ""
+ },
+ {
+  "root": "TREC-reports",
+  "depth": 0,
+  "id": "1TeHDErbC5dh45iChzzYwjHH3uWpOS-BD",
+  "name": "2026-08-28_R4_05_Fin-CapitalGains.pdf",
+  "folder": false,
+  "aria": ""
+ },
+ {
+  "root": "TREC-reports",
+  "depth": 0,
+  "id": "13pf8cJy-6-9WL6WjKSlvg5r3g_2UoFo_",
+  "name": "2026-08-28_R4_06_TREC-RAG.pdf",
+  "folder": false,
+  "aria": ""
+ },
+ {
+  "root": "TREC-reports",
+  "depth": 0,
+  "id": "1wzRzuIcM_s8AdNWQ391fZK1J9IwlJUsT",
+  "name": "2026-08-28_R4_07_Fin-Embeddings.pdf",
+  "folder": false,
+  "aria": ""
+ },
+ {
+  "root": "internal-meetings",
+  "depth": 0,
+  "id": "1oU6Zx_fvmt6T5bhpFYnxTrYEKdHfuTCz",
+  "name": "Hao-Cheng_five_component_followup1.pdf",
+  "folder": false,
+  "aria": ""
+ },
+ {
+  "root": "internal-meetings",
+  "depth": 0,
+  "id": "17S6csnlqmqnPWkMZBcI9H28CkExzzp6a",
+  "name": "Hao-Cheng_five_component_followup2.pdf",
+  "folder": false,
+  "aria": ""
+ },
+ {
+  "root": "internal-meetings",
+  "depth": 0,
+  "id": "1hKH63ohMUZue-t-TDovG9nzO7xBqEm7R",
+  "name": "Hao-Cheng_five_component.pdf",
+  "folder": false,
+  "aria": ""
+ },
+ {
+  "root": "internal-meetings",
+  "depth": 0,
+  "id": "1B8R7vewjI4h-J96Zj0XGto9BBCeb1zuF",
+  "name": "HaoCheng - Sim4IABench.pdf",
+  "folder": false,
+  "aria": ""
+ },
+ {
+  "root": "internal-meetings",
+  "depth": 0,
+  "id": "1Q7PBxruzpZsr4Ty6Ae_KZ5fKKidsWnvD",
+  "name": "HaoCheng - UserLM.pdf",
+  "folder": false,
+  "aria": ""
+ },
+ {
+  "root": "internal-meetings",
+  "depth": 0,
+  "id": "1HVOzkeGBmFQ-dWh60lTxbp3jr7iFDfI9",
+  "name": "HaoCheng-進度報告.pdf",
+  "folder": false,
+  "aria": ""
+ },
+ {
+  "root": "internal-meetings",
+  "depth": 0,
+  "id": "1U-zF7gc-nlp6k9BPWQpIuVvBXaWDfRbI",
+  "name": "HaoCheng-UserLM_reproduction_followup.pdf",
+  "folder": false,
+  "aria": ""
+ },
+ {
+  "root": "internal-meetings",
+  "depth": 0,
+  "id": "1_8bFh-p9J4pXv7RRoP82_m7o0SbD2cYf",
+  "name": "HaoCheng-UserLM-R1.pdf",
+  "folder": false,
+  "aria": ""
+ },
+ {
+  "root": "internal-meetings",
+  "depth": 0,
+  "id": "10ctJza-NnK9FKJ7AQrA5YIvH-8DzhOpf",
+  "name": "HaoCheng-UserLM8b_reproduction.pdf",
+  "folder": false,
+  "aria": ""
+ },
+ {
+  "root": "internal-meetings",
+  "depth": 0,
+  "id": "1XBoyvThUR4wpo_Dxpg9HvuAX2JB4tL92",
+  "name": "HungChun - AdaRewriter.pdf",
+  "folder": false,
+  "aria": ""
+ },
+ {
+  "root": "internal-meetings",
+  "depth": 0,
+  "id": "1GUJ7dggzBYazFGGVHtR3jZsa5RTPX-xr",
+  "name": "HungChun - ConsistentPersona.pdf",
+  "folder": false,
+  "aria": ""
+ },
+ {
+  "root": "internal-meetings",
+  "depth": 0,
+  "id": "1lr0L8XS7gM1IDs7kNLyaqiEap7C3d9L-",
+  "name": "HungChun - TuringRewardSim.pdf",
+  "folder": false,
+  "aria": ""
+ },
+ {
+  "root": "internal-meetings",
+  "depth": 0,
+  "id": "1daWEdwTdYblKnD_2LJCZxEB4omO3u2MR",
+  "name": "HungChun - UnifiedFramework.pdf",
+  "folder": false,
+  "aria": ""
+ },
+ {
+  "root": "internal-meetings",
+  "depth": 0,
+  "id": "1e8Yzm3StXadWfp1Py_DcRc_A215vi4tS",
+  "name": "KuanWe - From Cuasal Profile to Agentic User Simulator.pdf",
+  "folder": false,
+  "aria": ""
+ },
+ {
+  "root": "internal-meetings",
+  "depth": 0,
+  "id": "1CI45WzItqDTwVGJEuH8JxDZlkKgi4YAk",
+  "name": "KuanWei - ProUtt.pdf",
+  "folder": false,
+  "aria": ""
+ },
+ {
+  "root": "internal-meetings",
+  "depth": 0,
+  "id": "1llu_R8Ndxk4BjzE3z_3vYkFsqwb8ACd7",
+  "name": "KuanWei - USP Reproduce 1.pdf",
+  "folder": false,
+  "aria": ""
+ },
+ {
+  "root": "internal-meetings",
+  "depth": 0,
+  "id": "1yIZz_4brSUnmhGT0ySGSkT0KnnUu_Qgl",
+  "name": "KuanWei - USP Reproduction 2 & DITTO.pdf",
+  "folder": false,
+  "aria": ""
+ },
+ {
+  "root": "internal-meetings",
+  "depth": 0,
+  "id": "1PK6DIY3L9K-jG7443p_vVpN5eqfipCT5",
+  "name": "KuanWei - USP Reproduction 3.pdf",
+  "folder": false,
+  "aria": ""
+ },
+ {
+  "root": "internal-meetings",
+  "depth": 0,
+  "id": "16IrkMRV53ZJ61CEElZ9s6Gy7T7wkB4rl",
+  "name": "KuanWei - USP Reproduction 4.pdf",
+  "folder": false,
+  "aria": ""
+ },
+ {
+  "root": "internal-meetings",
+  "depth": 0,
+  "id": "1HkBPYA71UUDqCu0sfOizoiw-MsDP_Os7",
+  "name": "KuanWei - USP Reproduction 5.pdf.pdf",
+  "folder": false,
+  "aria": ""
+ },
+ {
+  "root": "internal-meetings",
+  "depth": 0,
+  "id": "1CbVxTDzOVtYouO-i7UW5ChFPufTSsHLP",
+  "name": "KuanWei - USP.pdf",
+  "folder": false,
+  "aria": ""
+ },
+ {
+  "root": "internal-meetings",
+  "depth": 0,
+  "id": "1Cpt7knPAZLjgka_HresqABIPshDfLQyn",
+  "name": "KuanWei - Week9-Internal-Meeting.pdf",
+  "folder": false,
+  "aria": ""
+ },
+ {
+  "root": "internal-meetings",
+  "depth": 0,
+  "id": "15rGKyIPGyvDSFUEhHgfT7UMHfOvUVNDY",
+  "name": "KuanWei - Week10-Internal-Meeting-Final.pdf",
+  "folder": false,
+  "aria": ""
+ },
+ {
+  "root": "internal-meetings",
+  "depth": 0,
+  "id": "1yYgjMPG2cdTg9g1qij5dQp7TJrlEPCRe",
+  "name": "MingZhi - Agentic Conversational Search via RL.pdf",
+  "folder": false,
+  "aria": ""
+ },
+ {
+  "root": "internal-meetings",
+  "depth": 0,
+  "id": "1RmEy4Ngbvlilb7r45xHVewHZxyMWy98u",
+  "name": "MingZhi - APCIR.pdf",
+  "folder": false,
+  "aria": ""
+ },
+ {
+  "root": "internal-meetings",
+  "depth": 0,
+  "id": "1rQJpbLzQn3BNN7yJNXTkOQnJGWzdzOwd",
+  "name": "MingZhi - Consistent LLMs Reproduction.pdf",
+  "folder": false,
+  "aria": ""
+ },
+ {
+  "root": "internal-meetings",
+  "depth": 0,
+  "id": "1GVG6hSJWYQzlo7fOJM7kcu9LfbtyTtun",
+  "name": "MingZhi - Consistent-LLMs to Profile Optimizer.pdf",
+  "folder": false,
+  "aria": ""
+ },
+ {
+  "root": "internal-meetings",
+  "depth": 0,
+  "id": "1v3L6kjYz8q6vyLwI9c-cxK25No2bz4fG",
+  "name": "MingZhi - Dynamic-Reasoning Planner with Two Realizers.pdf",
+  "folder": false,
+  "aria": ""
+ },
+ {
+  "root": "internal-meetings",
+  "depth": 0,
+  "id": "1ja6Td05QtnDDX9EiocR6T2rtJ_3FyZ7W",
+  "name": "MingZhi - MUSE.pdf",
+  "folder": false,
+  "aria": ""
+ },
+ {
+  "root": "internal-meetings",
+  "depth": 0,
+  "id": "11CwbDzTXG0twcDiY1LIcyaPwgIJa_Jha",
+  "name": "MingZhi - Planner_Speaker_Selector.pdf",
+  "folder": false,
+  "aria": ""
+ },
+ {
+  "root": "internal-meetings",
+  "depth": 0,
+  "id": "1vIusygoSiOuTjqPPOZE9gSv44P4Q9jxN",
+  "name": "MingZhi - Related Work Summary.pdf",
+  "folder": false,
+  "aria": ""
+ },
+ {
+  "root": "internal-meetings",
+  "depth": 0,
+  "id": "1ySHzWfaNOkpwFBj0F-LKlxyti7rs6h45",
+  "name": "MingZhi - User Simulator for TREC 2026 UserSim.pdf",
+  "folder": false,
+  "aria": ""
+ },
+ {
+  "root": "internal-meetings",
+  "depth": 0,
+  "id": "1cwVhU3o7KLIYNi6gT9Wo_3W9dQdbRNBV",
+  "name": "MingZhi - v2fix_to_E1.6.pdf",
+  "folder": false,
+  "aria": ""
+ }
+]

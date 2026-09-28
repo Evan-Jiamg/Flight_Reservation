@@ -1,0 +1,44 @@
+7cf8ccd 2026-09-27 00:18:22 +0000 naming(D2)!: the judge endpoint list is JUDGE_BASE_URLS and the system agent reads SYSTEM_AGENT_*; old names are refused
+40f93b1 2026-09-27 02:11:16 +0000 naming(D2): the system agent prompt constants take SYSTEM_AGENT_* names
+8d7e100 2026-09-27 02:10:29 +0000 naming(D2): refuse_non_local_instrument_hosts becomes refuse_known_commercial_instrument_hosts
+e636094 2026-09-27 02:19:52 +0000 naming(D2)!: the rollout episode interface and the termination file's provenance take their decided names; protocol 
+6ddb59c 2026-09-27 00:16:56 +0000 refactor(counters)!: the benchmark's n_* bookkeeping counters take num_* names; phase-4 rewrite map
+8a79ebf 2026-09-27 00:18:58 +0000 naming(D2)!: R0Client becomes SystemAgentClient; refuse_commercial becomes refuse_non_local_instrument_hosts
+=== diff stat
+ tools/r0_client.py | 35 +++++++++++++++++++----------------
+ 1 file changed, 19 insertions(+), 16 deletions(-)
+=== r0_client diff (code lines only, comments/docstrings dropped)
+-  R0Client   the system agent your simulator talks to. Prompted, never trained.
++  SystemAgentClient   the system agent your simulator talks to. Prompted, never trained.
+-  CoverageState     the requirement bookkeeping behind `coverage` and `complete`.
++  CoverageState     the requirement bookkeeping behind the episode keys
++             `llm_annotated_revealed_required_requirement_item_fraction` (coverage()) and
++             `llm_annotated_all_required_requirement_items_satisfied` (complete()).
+-    from r0_client import R0Client, CoverageState
+-    r0, coverage_state = R0Client(), CoverageState(req_items)      # req from data/req_shards_v1.json
++    from r0_client import SystemAgentClient, CoverageState
++    r0, coverage_state = SystemAgentClient(), CoverageState(req_items)      # req from data/req_shards_v1.json
+-    {"turns": t, "ended_by_token": e,
+-     "coverage": coverage_state.coverage(), "complete": coverage_state.complete()}
++    {"user_turns": t, "ended_by_end_decision_or_empty_output": e,
++     "llm_annotated_revealed_required_requirement_item_fraction": coverage_state.coverage(),
++     "llm_annotated_all_required_requirement_items_satisfied": coverage_state.complete()}
+-def refuse_commercial(urls, who: str) -> None:
++def refuse_known_commercial_instrument_hosts(urls, who: str) -> None:
+-R0_SYSTEM = (
++SYSTEM_AGENT_PROMPT_V4 = (
+-class R0Client:
++class SystemAgentClient:
+-            raise SystemExit("R0Client: set SYSTEM_AGENT_BASE_URL (or pass base_url) to a local "
++            raise SystemExit("SystemAgentClient: set SYSTEM_AGENT_BASE_URL (or pass base_url) to a local "
+-        refuse_commercial([self.url], "R0Client")
++        refuse_known_commercial_instrument_hosts([self.url], "SystemAgentClient")
+-                      "messages": [{"role": "system", "content": R0_SYSTEM}] + history}
++                      "messages": [{"role": "system", "content": SYSTEM_AGENT_PROMPT_V4}] + history}
+-        refuse_commercial(getattr(self.judge, "urls", None) or [getattr(self.judge, "url", "")],
++        refuse_known_commercial_instrument_hosts(getattr(self.judge, "urls", None) or [getattr(self.judge, "url", "")],
+-        return {"n_req": len(self.ids), "coverage": round(self.coverage(), 4),
++        return {"num_requirement_items": len(self.ids), "coverage": round(self.coverage(), 4),
+-    r0 = R0Client()
++    r0 = SystemAgentClient()
+=== judge.py diff

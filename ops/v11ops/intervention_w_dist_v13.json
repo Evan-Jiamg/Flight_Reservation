@@ -1,0 +1,4 @@
+{"set_cfg": {"w_dist": 1.0},
+ "controller_bounds": {"w_dist": [1.0, 5.0]},
+ "reason": "Planner ends conversations too early (train turns 4.75 -> 2.81 at u12, validation u10 sim 3.25 vs human 5.0) while the controller had halved w_dist at u5 and kept it at 0.5: w_dist back to its initial 1.0 and the controller may no longer lower it (it may still raise it).",
+ "approved": "user 2026-09-27, option B (after the u12 report)"}

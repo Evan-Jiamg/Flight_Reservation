@@ -1,0 +1,148 @@
+Ledger removed by: 56af021 2026-09-17 07:31:35 +0000 refactor(terms): land the 2026-09-16 rename with frozen instrument prompts restored
+PIN (its parent): ca13b33 2026-09-17 07:25:50 +0000 docs(notice): mark results produced through the commercial API as report-barred
+at PIN: class R0Client 1  class Ledger 1
+=== what changed in tools/metrics between 91b81bf and PIN
+=== judge.py code diff 91b81bf..PIN
+=== r0_client code diff PIN..HEAD (only renames expected)
+-"""The T2 environment contract: the R0 surrogate agent and the requirement ledger.
++"""The T2 environment contract: the surrogate system agent (`COMP-SYSTEM-AGENT`,
++formerly `R0`) and the requirement coverage_state.
+-  R0Client   the system agent your simulator talks to. Prompted `gpt-5-mini`,
+-             never trained. This is the canonical backend — see the note on
+-             `serve_r0.sh` in protocols/t2_rollout.md.
+-  Ledger     the requirement bookkeeping behind `coverage` and `complete`.
++  SystemAgentClient   the system agent your simulator talks to. Prompted, never trained.
++             It must run on a local OpenAI-compatible server (SYSTEM_AGENT_BASE_URL);
++             commercial endpoints are refused because a T2 episode carries TREC
++             corpus text. The published rollout_* numbers used gpt-5-mini, which
++             is no longer allowed (2026-09-17).
++  CoverageState     the requirement bookkeeping behind the episode keys
++             `llm_annotated_revealed_required_requirement_item_fraction` (coverage()) and
++             `llm_annotated_all_required_requirement_items_satisfied` (complete()).
+-    from r0_client import R0Client, Ledger
+-    r0, ledger = R0Client(), Ledger(req_items)      # req from data/req_shards_v1.json
++    from r0_client import SystemAgentClient, CoverageState
++    r0, coverage_state = SystemAgentClient(), CoverageState(req_items)      # req from data/req_shards_v1.json
+-    ledger.update(turn, user_utterance, reply)
++    coverage_state.update(turn, user_utterance, reply)
+-    {"turns": t, "ended_by_token": e,
+-     "coverage": ledger.coverage(), "complete": ledger.complete()}
++    {"user_turns": t, "ended_by_end_decision_or_empty_output": e,
++     "llm_annotated_revealed_required_requirement_item_fraction": coverage_state.coverage(),
++     "llm_annotated_all_required_requirement_items_satisfied": coverage_state.complete()}
+-Self-test (one round trip, ~US$0.001, proves your key and the contract work):
++Self-test (one round trip against your local servers, proves the contract works):
+-    python3 tools/r0_client.py --selftest
++    SYSTEM_AGENT_BASE_URL=http://127.0.0.1:8013/v1 JUDGE_BASE_URLS=http://127.0.0.1:8014/v1 \
++        python3 tools/r0_client.py --selftest
+-from metrics.judge import Judge, QuotaExhausted, jparse, load_dotenv  # noqa: E402
++from metrics.judge import Judge, QuotaExhausted, jparse, refuse_retired_environment_variables  # noqa: E402
+-DEFAULT_MODEL = "gpt-5-mini"
+-DEFAULT_BASE_URL = "https://api.openai.com/v1"
++DEFAULT_MODEL = "gpt-oss-120b"
++COMMERCIAL_HOSTS = ("api.openai.com", "api.anthropic.com",
++                    "generativelanguage.googleapis.com")   # lockstep with tools/score_method.py
++def refuse_known_commercial_instrument_hosts(urls, who: str) -> None:
++    """SystemExit when any endpoint is a commercial API host (TREC text may not go there)."""
++    bad = [u for u in urls if any(h in u for h in COMMERCIAL_HOSTS)]
++    if bad:
++        raise SystemExit(f"{who}: refusing commercial endpoint {bad[0]} -- T2 sends TREC "
++                         "corpus text; point it at a local server (see tools/r0_client.py)")
+-R0_SYSTEM = (
++SYSTEM_AGENT_PROMPT_V4 = (
+-class R0Client:
++class SystemAgentClient:
+-    `reasoning_effort` is `minimal` on purpose: R0 is a plain chat surrogate and
++    `reasoning_effort` is `minimal` on purpose: the system agent is a plain chat surrogate and
+-        load_dotenv()
+-        self.model = model or os.environ.get("R0_MODEL", DEFAULT_MODEL)
+-        base = (base_url or os.environ.get("R0_BASE_URL", DEFAULT_BASE_URL)).rstrip("/")
++        refuse_retired_environment_variables()   # R0_* was renamed SYSTEM_AGENT_* on 2026-09-27
++        self.model = model or os.environ.get("SYSTEM_AGENT_MODEL", DEFAULT_MODEL)
++        base = (base_url or os.environ.get("SYSTEM_AGENT_BASE_URL") or "").rstrip("/")
++        if not base:
++            raise SystemExit("SystemAgentClient: set SYSTEM_AGENT_BASE_URL (or pass base_url) to a local "
++                             "OpenAI-compatible server; there is no default endpoint")
+-        self.key = api_key or os.environ.get("OPENAI_API_KEY")
+-        if not self.key and "api.openai.com" in self.url:
+-            raise SystemExit(
+-                "No OPENAI_API_KEY found.\n"
+-                "  export OPENAI_API_KEY=sk-...      (or copy .env.example to .env)\n"
+-                "This repo ships no key; T2 runs on YOUR OpenAI account.")
++        refuse_known_commercial_instrument_hosts([self.url], "SystemAgentClient")
++        self.key = api_key or os.environ.get("SYSTEM_AGENT_API_KEY")   # local servers normally need none
+-        your simulator. Never put your own state/profile blocks in it: R0 and
+-        the ledger judge must not see them.
++        your simulator. Never put your own state/profile blocks in it: the system agent and
++        the coverage_state judge must not see them.
+-                      "messages": [{"role": "system", "content": R0_SYSTEM}] + history}
++                      "messages": [{"role": "system", "content": SYSTEM_AGENT_PROMPT_V4}] + history}
+-class Ledger:
++class CoverageState:
+-    Shards come from `data/req_shards_v1.json` keyed by `conversation_id`, and
+-    are numbered `req_0..req_{n-1}` in list order. Two monotone facts per shard:
++    Items come from `data/req_shards_v1.json` keyed by `conversation_id`, and
++    are numbered `req_0..req_{n-1}` in list order. Two monotone facts per item:
++        refuse_known_commercial_instrument_hosts(getattr(self.judge, "urls", None) or [getattr(self.judge, "url", "")],
+=== judge.py code diff PIN..HEAD
+-from concurrent.futures import ThreadPoolExecutor
++from concurrent.futures import Future, ThreadPoolExecutor
++DOTENV_NAMES = ("OPENAI_API_KEY", "JUDGE_BASE_URLS", "JUDGE_MODEL")
++RETIRED_ENVIRONMENT_VARIABLES = {
++    "R0_URL": "SYSTEM_AGENT_BASE_URL",  # naming-register: legacy-artifact
++    "R0_BASE_URL": "SYSTEM_AGENT_BASE_URL",  # naming-register: legacy-artifact
++    "R0_MODEL": "SYSTEM_AGENT_MODEL",  # naming-register: legacy-artifact
++    "R0_BACKEND": "SYSTEM_AGENT_BACKEND",  # naming-register: legacy-artifact
++    "R0_REASONING_EFFORT": "SYSTEM_AGENT_REASONING_EFFORT",  # naming-register: legacy-artifact
++    "R0_API_KEY": "SYSTEM_AGENT_API_KEY",  # naming-register: legacy-artifact
++    "R0_PROMPT_VERSION": "SYSTEM_AGENT_PROMPT_VERSION",  # naming-register: legacy-artifact
++    "R0_TRUNCATION_POLICY": "SYSTEM_AGENT_TRUNCATION_POLICY",  # naming-register: legacy-artifact
++    "R0_MIX_SEED": "SYSTEM_AGENT_PROMPT_MIXTURE_SEED",  # naming-register: legacy-artifact
++    "R0_SMI": "SYSTEM_AGENT_SMI",  # naming-register: legacy-artifact
++    "EVAL_R0_URL": "EVAL_SYSTEM_AGENT_BASE_URL",  # naming-register: legacy-artifact
++    "JUDGE_URLS": "JUDGE_BASE_URLS",  # naming-register: legacy-artifact
++    "JUDGE_BASE_URL": "JUDGE_BASE_URLS",  # naming-register: legacy-artifact
++    "JUDGE_URL": "JUDGE_BASE_URLS",  # naming-register: legacy-artifact
++}
++def refuse_retired_environment_variables(environ=None) -> None:
++    """Raise RuntimeError when a renamed environment variable is set and its new name is not."""
++    env = os.environ if environ is None else environ
++    hits = sorted((old, new) for old, new in RETIRED_ENVIRONMENT_VARIABLES.items()
++                  if env.get(old) is not None and env.get(new) is None)
++    if hits:
++        lines = "; ".join(f"{old} -> {new}" for old, new in hits)
++        raise RuntimeError(f"renamed environment variable(s) set under the old name on 2026-09-27: {lines}. "
++                           "Set the new name instead; the old one is no longer read.")
++PERSONAL_OPENAI_KEY_SUFFIXES = ("0pcA", "7hcA", "N8cA")
++PERSONAL_OPENAI_KEY_OPT_IN_ENV = "ALLOW_PERSONAL_OPENAI_KEY_FOR_THIS_RUN"
++def personal_openai_key_refusal(key: str | None) -> str | None:
++    """The refusal message when ``key`` is one of the user's personal keys and no opt-in is set, else None."""
++    if not key or not key.endswith(PERSONAL_OPENAI_KEY_SUFFIXES):
++        return None
++    if os.environ.get(PERSONAL_OPENAI_KEY_OPT_IN_ENV) == "1":
++        return None
++    return (f"refusing to continue: the OpenAI key ends with '...{key[-4:]}', one of the user's PERSONAL "
++            "API keys. Rule 'Personal API Keys' (~/claude-config/CLAUDE.md): ask the user and get explicit "
++            "approval before EVERY use of this key. If the user approved this run, set "
++            f"{PERSONAL_OPENAI_KEY_OPT_IN_ENV}=1 for this run only; the approval does not carry over to "
++            "another run. Otherwise export a non-personal key (e.g. the lab key) as OPENAI_API_KEY.")
+-    """Populate os.environ from a .env file without overriding a real env var."""
++    """Populate os.environ from a .env file without overriding a real env var.
++    Only ``DOTENV_NAMES`` are taken from the file; every other line is ignored. Values are never printed.
++    """
+-                os.environ.setdefault(k.strip(), v.strip())
++                if k.strip() in RETIRED_ENVIRONMENT_VARIABLES:
++                    raise SystemExit(f"{candidate}: {k.strip()} was renamed "
++                                     f"{RETIRED_ENVIRONMENT_VARIABLES[k.strip()]} on 2026-09-27; "
++                                     "rename that line (values not shown)")
++                if k.strip() in DOTENV_NAMES:
++                    os.environ.setdefault(k.strip(), v.strip())
++def _is_local(url: str) -> bool:
++    """True for an endpoint on this host (loopback), where no API key is needed or sent."""
++    from urllib.parse import urlparse
++    host = (urlparse(url.strip()).hostname or "").lower()
++    return host in ("127.0.0.1", "localhost", "::1")
+-        load_dotenv()
++        refuse_retired_environment_variables()   # the judge endpoint variables have one name since 2026-09-27
++        _raw0 = base_url or os.environ.get("JUDGE_BASE_URLS")
+PINSHA ca13b33
