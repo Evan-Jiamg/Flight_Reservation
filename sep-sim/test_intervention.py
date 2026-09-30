@@ -1,5 +1,6 @@
-"""User-approved intervention on the LLM (v4 factor) controller: values set once, bounds at every launch,
-rollback inside the bounds, provenance, and the verifier's rl.intervention check (dry-run loop, no GPU)."""
+"""User-approved intervention on the LLM (v4 factor) controller: values set once, bounds at every launch, rollback
+inside the bounds (rl_controllers); v17 (S9): the trainer refuses --intervention (fixed controller); the verifier's
+rl.intervention check is tested on the archived v16 run (test_v16). No GPU."""
 import json
 import os
 import sys
@@ -10,7 +11,6 @@ import pytest
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import rl_controllers as RC  # noqa: E402
 import train_planner_rl as T  # noqa: E402
-import verify_pipeline as V  # noqa: E402
 from test_rl_advantages import args, make_splits  # noqa: E402
 
 IV = {"set_cfg": {"w_dist": 1.0}, "controller_bounds": {"w_dist": [1.0, 5.0]},
@@ -55,39 +55,14 @@ def test_rollback_stays_inside_bounds():
     assert out["w_dist"] == 1.0              # rolled back, clamped to the tightened lower bound
 
 
-def _run(argv):
-    T.main(argv)
-
-
-def test_dry_run_intervention_resume_and_verify():
+def test_v17_refuses_an_intervention(tmp_path, capsys):
+    """SPEC v17 S9 (user 2026-09-30): the controller is fixed, so --intervention is refused with a reason; the verifier's
+    rl.intervention check still serves archived v16 runs (test_v16.test_intervention_verified_on_archived_run)."""
     d = tempfile.mkdtemp()
     sp, out = make_splits(d), os.path.join(d, "run")
-    ivp = os.path.join(d, "iv.json")
+    ivp = str(tmp_path / "iv.json")
     json.dump(IV, open(ivp, "w"))
-    _run(args(sp, out, controller="llm", updates=2))
-    _run(args(sp, out, "--resume", "--intervention", ivp, controller="llm", updates=4))
-    upd = T.read_jsonl(os.path.join(out, "updates.jsonl"))
-    assert [u["cfg_used"]["w_dist"] for u in upd if u["update"] >= 3][0] == 1.0
-    st = json.load(open(os.path.join(out, "ckpt", "u00004", "state.json")))
-    assert st["intervention"]["at_update"] == 3 and st["intervention"]["set_cfg"] == {"w_dist": 1.0}
-    rep = V.Report()
-    V.check_intervention(out, rep)
-    assert rep.checks["rl.intervention"]["fail"] == 0 and rep.checks["rl.intervention"]["n"] > 0
-    # a later launch without the file, or with a changed file, is refused
     with pytest.raises(SystemExit):
-        _run(args(sp, out, "--resume", controller="llm", updates=5))
-    json.dump({**IV, "reason": "changed"}, open(ivp, "w"))
-    with pytest.raises(SystemExit):
-        _run(args(sp, out, "--resume", "--intervention", ivp, controller="llm", updates=5))
-    json.dump(IV, open(ivp, "w"))
-    _run(args(sp, out, "--resume", "--intervention", ivp, controller="llm", updates=5))
-    st = json.load(open(os.path.join(out, "ckpt", "u00005", "state.json")))
-    assert st["intervention"]["at_update"] == 3                       # applied once
-    # the verifier catches a weight outside the intervention bounds
-    rows = T.read_jsonl(os.path.join(out, "updates.jsonl"))
-    rows[-1]["cfg_used"]["w_dist"] = 0.5
-    with open(os.path.join(out, "updates.jsonl"), "w") as f:
-        f.write("".join(json.dumps(r) + "\n" for r in rows))
-    rep = V.Report()
-    V.check_intervention(out, rep)
-    assert rep.checks["rl.intervention"]["fail"] == 1
+        T.main(args(sp, out, "--intervention", ivp, controller="llm", updates=2))
+    assert "not available in v17" in capsys.readouterr().err
+    assert not os.path.exists(os.path.join(out, "run_meta.jsonl"))

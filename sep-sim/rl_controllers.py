@@ -29,8 +29,9 @@ import time
 
 import rl_reward as RR
 
-# w_aux: weight of the auxiliary stop-token supervision on the Task 1 positions (D2 anneals it further);
-# a training knob like lr / kl_coef, not part of the reward (so the shadow / selection reward ignore it)
+# w_aux: weight of the auxiliary stop-token supervision on the Task 1 positions (v16: D2 annealed it further; v17: the
+# trainer's constant --aux-weight, S9); a training knob like lr / kl_coef, not part of the reward (so the shadow reward
+# ignores it). TRAIN_DEFAULTS stay the v16 values (v17 S10: the v17 lr 1e-5 / kl 0.01 live in the trainer's SPEC table)
 TRAIN_DEFAULTS = {"lr": 2e-5, "kl_coef": 0.04, "w_aux": 1.0}   # lr 2e-5: phase-0 KL at 1e-5 was ~1.1e-3/token
 TRAIN_BOUNDS = {"lr": (1e-7, 1e-4), "kl_coef": (0.0, 1.0), "w_aux": (0.0, 10.0)}
 CFG_BOUNDS = {**TRAIN_BOUNDS, **RR.REWARD_BOUNDS}
@@ -301,7 +302,7 @@ LLM4_DEFAULTS = {"model": "gpt-oss-120b", "every": 5, "window": 5, "rollback_win
                  "keys": ["w_cov", "w_dist", "lambda_unparsed", "lambda_hit_max_new", "w_aux"],
                  # v16 (user 2026-09-28): w_dist may not go below its initial 1.0 (lowering it collapsed the
                  # conversation length in the v11 run, u12-u17); it may still be raised
-                 "aux_floor": 0.0,
+                 "aux_floor": 0.0,           # v16 only (v17: no floor; kept so v16 configs still load)
                  "bounds": {"w_cov": [0.1, 5.0], "w_dist": [1.0, 5.0],
                             "lambda_unparsed": [0.1, 5.0], "lambda_hit_max_new": [0.1, 5.0],
                             "w_aux": [0.01, 5.0]},
@@ -313,12 +314,12 @@ LLM4_SYSTEM = (
     "message is the user's last. Reward = w_cov * coverage (share of the user's requirements the "
     "assistant addressed) + w_dist * dist (log p_human(T) - log q(T): how well the distribution of "
     "conversation lengths T matches real people's) - lambda_unparsed * (share of unreadable plans) "
-    "- lambda_hit_max_new * (share of plans cut by the length cap). Separately, w_aux weights an auxiliary "
-    "supervised loss that pulls the Planner's end_session decision towards the real person's on training "
-    "conversations (once validation Task 1 improves it is annealed towards a fixed floor of %g and never goes "
-    "below it); both share one optimizer step: compare aux_grad_norm with "
-    "rl_grad_norm (the RL part of the same step) to "
-    "judge whether it dominates or is negligible, and task1_train accuracy to judge whether it is still needed. "
+    "- lambda_hit_max_new * (share of plans cut by the length cap). Separately, an auxiliary supervised loss "
+    "pulls the Planner's end_session decision towards the real person's on training conversations; its examples "
+    "are split across the minibatches of the update and each share's gradient is added to the RL gradient of the "
+    "same optimizer step (the aux weight itself is fixed by the run): compare aux_grad_norm with "
+    "rl_grad_norm (the RL part of the same steps) to "
+    "judge whether it dominates or is negligible, and the task1_train Brier score to judge whether it is still needed. "
     "You see ONLY statistics of TRAINING "
     "rollouts, summarised per update, and your earlier decisions with what followed. "
     "For each weight choose one factor from %s (1.0 = keep). Keep changes small unless the statistics "
@@ -390,7 +391,7 @@ class LLMFactorController(Controller):
                          "kl": h.get("kl"), "rl_grad_norm": h.get("rl_grad_norm"),
                          "aux_weight_effective": h.get("aux_weight"), "aux": h.get("aux_stats"),
                          "task1_train": {k: (h.get("task1_train") or {}).get(k)
-                                         for k in ("acc", "end_at_final", "end_at_nonfinal")}})
+                                         for k in ("brier_mean", "end_at_final", "end_at_nonfinal")}})
         hist = [0] * len((win[-1].get("turn_hist") or []))
         for h in win:
             for i, v in enumerate(h.get("turn_hist") or []):
@@ -404,7 +405,7 @@ class LLMFactorController(Controller):
                    "bounds": {k: self.opt["bounds"][k] for k in self.opt["keys"]},
                    "earlier_decisions": self.decisions[-6:]}
         return {"model": self.opt["model"], "max_tokens": int(self.opt["max_tokens"]),
-                "messages": [{"role": "system", "content": LLM4_SYSTEM % (float(self.opt["aux_floor"]), self.opt["factors"],
+                "messages": [{"role": "system", "content": LLM4_SYSTEM % (self.opt["factors"],
                                                                           ", ".join(self.opt["keys"]))},
                              {"role": "user", "content": json.dumps(payload, sort_keys=True)}]}
 

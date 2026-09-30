@@ -1,7 +1,13 @@
-"""SPEC v16 (ops/SPEC_v16_grpo_opt.md, user 2026-09-28): one or more tests per item; dry-run loop, no GPU."""
+"""SPEC v16 (ops/SPEC_v16_grpo_opt.md, user 2026-09-28), kept for ARCHIVED runs (SPEC v17 B8/B9, user 2026-09-30).
+
+The v17 trainer no longer implements v16, so the v16 branch of verify_pipeline is tested on run directories the v16
+trainer wrote (fixtures_v16/, made once by fixtures_v16/make_fixtures_v16.py at commit 9afebdd): every check must pass on
+the untouched run and catch each tampering. The pure v16 pieces that remain in the code (Dr. GRPO advantages, the w_dist
+controller bound, the continuous Task 1 metric, the pooled Task 1 tool) keep their own tests. No GPU."""
 import json
 import math
 import os
+import shutil
 import sys
 import tempfile
 
@@ -14,27 +20,44 @@ import task1_pooled as TP  # noqa: E402
 import task1_stop as T1  # noqa: E402
 import train_planner_rl as T  # noqa: E402
 import verify_pipeline as V  # noqa: E402
-from test_rl_advantages import args, make_splits  # noqa: E402
+
+FIX = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures_v16")
 
 
-def run(sp, out, *extra, updates=4, controller="llm"):
-    return T.main(args(sp, out, *extra, controller=controller, updates=updates))
-
-
-def fresh(*extra, updates=4):
+def fixture(name):
+    """A private copy of an archived v16 run: (splits path, run dir)."""
     d = tempfile.mkdtemp()
-    sp, out = make_splits(d), os.path.join(d, "run")
-    run(sp, out, *extra, updates=updates)
-    return sp, out
+    shutil.copytree(os.path.join(FIX, name), os.path.join(d, name))
+    return os.path.join(d, name, "splits.json"), os.path.join(d, name, "run")
 
 
-def v16_report(out):
+def v16_report(out, sp):
     rep = V.Report()
-    V.check_v16(out, rep)
+    V.check_v16(out, rep, splits_path=sp)
     return rep
 
 
-# ------------------------------------------------------------------ item 3: Dr. GRPO advantages
+def no_fail(rep):
+    return all(c["fail"] == 0 for c in rep.checks.values())
+
+
+def _rewrite(path, rows):
+    with open(path, "w") as f:
+        f.write("".join(json.dumps(r) + "\n" for r in rows))
+
+
+def test_fixtures_are_v16_runs():
+    man = json.load(open(os.path.join(FIX, "MANIFEST.json")))
+    assert set(man["runs"]) == {"main", "d2", "cap", "iv"}
+    for name in man["runs"]:
+        sp, out = fixture(name)
+        assert V.spec_version(out) == "v16"                      # B8: no spec_version, task1_G -> the v16 branch
+        rep = v16_report(out, sp)
+        assert no_fail(rep), (name, {k: c for k, c in rep.checks.items() if c["fail"]})
+        assert rep.checks["rl.task1_refill"]["n"] > 0 and rep.checks["rl.task1_prob"]["n"] > 0
+
+
+# ------------------------------------------------------------------ item 3: Dr. GRPO advantages (still in rl_algos)
 def test_item3_no_std_norm():
     assert RA.ALGO_DEFAULTS["grpo_std_norm"] is False
     assert RA.group_advantages([0, 1, 1, 0]) == [-0.5, 0.5, 0.5, -0.5]
@@ -50,7 +73,7 @@ def test_item3_no_std_norm():
         RA.algo_cfg(grpo_std_norm="no")
 
 
-# ------------------------------------------------------------------ item 6: w_dist floor
+# ------------------------------------------------------------------ item 6: w_dist floor (controller bound)
 def test_item6_w_dist_floor():
     c = RC.LLMFactorController(RC.initial_cfg(version="v4", lambda_unparsed=1.0, lambda_hit_max_new=1.0),
                                transport=lambda req: {"choices": [{"message": {"content": json.dumps(
@@ -61,94 +84,77 @@ def test_item6_w_dist_floor():
     assert c.propose(hist)["w_dist"] == 1.0
 
 
-# ------------------------------------------------------------------ item 4: aux floor + controller prompt
-def test_item4_floor_args():
-    base = ["--fold", "0", "--out", "o", "--splits", "s"]
-    a = T.parse_args(base + ["--planner-path", "Qwen3-4B-Instruct-2507"])      # user 2026-09-28: spec floor 0.5
-    assert a.stop_sup_floor == 0.5 and a.task1_G == 8 and a.task1_convs == 8 and a.t1_trigger_margin == 0.10
-    assert T.parse_args(base + ["--dry-run"]).stop_sup_floor == 0.5
-    with pytest.raises(SystemExit):                                             # another floor is an ablation
-        T.parse_args(base + ["--dry-run", "--stop-sup-floor", "0.7"])
-    assert T.parse_args(base + ["--dry-run", "--stop-sup-floor", "0.7", "--ablation", "x"]).stop_sup_floor == 0.7
-    with pytest.raises(SystemExit):
-        T.parse_args(base + ["--dry-run", "--stop-sup-weight", "0", "--stop-sup-floor", "0.5", "--ablation", "x"])
-    assert T.parse_args(base + ["--dry-run", "--stop-sup-weight", "0", "--stop-sup-floor", "0", "--ablation", "x"])
-    with pytest.raises(SystemExit):
-        T.parse_args(base + ["--dry-run", "--stop-sup-floor", "6", "--ablation", "x"])
-    with pytest.raises(SystemExit):                                             # off-spec values need --ablation
-        T.parse_args(base + ["--dry-run", "--task1-G", "4"])
-
-
-def test_item4_floor_weight():
-    class A:
-        stop_sup_floor, stop_sup_anneal, stop_sup_weight = 0.5, 10, 1.0
-    tr = T.Trainer.__new__(T.Trainer)
-    tr.a, tr.aux_anneal_start = A(), None
-    assert tr.aux_weight(3, {"w_aux": 1.0}) == 1.0
-    tr.aux_anneal_start = 10
-    assert abs(tr.aux_weight(13, {"w_aux": 1.0}) - 0.7) < 1e-12
-    assert tr.aux_weight(18, {"w_aux": 1.0}) == 0.5                             # 0.2 -> floor
-    assert tr.aux_weight(40, {"w_aux": 1.0}) == 0.5
-    assert tr.aux_weight(3, {"w_aux": 0.2}) == 0.5                              # controller below the floor
-    # after the anneal the controller's w_aux still scales the supervision (factor floor = floor / initial weight)
-    assert tr.aux_weight(40, {"w_aux": 2.0}) == 1.0
-    assert tr.aux_weight(40, {"w_aux": 0.6}) == 0.5                             # never below the floor
-    A.stop_sup_floor = 0.0
-    assert tr.aux_weight(40, {"w_aux": 1.0}) == 0.0                             # floor 0 = the old behaviour
-
-
-def test_item4_controller_prompt_names_floor():
-    sp, out = fresh(updates=5)                                                  # spec floor 0.5
-    log = [json.loads(l) for l in open(os.path.join(out, "llm_controller.jsonl"))]
-    sysmsg = [r for r in log if r.get("request")][0]["request"]["messages"][0]["content"]
-    assert "fixed floor of 0.5" in sysmsg and "annealed to 0" not in sysmsg
-    for u in T.read_jsonl(os.path.join(out, "updates.jsonl")):
-        assert u["train_aggregate"]["aux_weight"] >= 0.5 and u["train_aggregate"]["aux_floor"] == 0.5
-
-
-# ------------------------------------------------------------------ items 1 + 2: Task 1 groups, refill
-def test_items12_task1_groups_and_refill():
-    sp, out = fresh(updates=4)
+# ------------------------------------------------------------------ items 1 + 2 + 4 on the archived run
+def test_items12_groups_refill_and_aux_verified():
+    sp, out = fixture("main")
     rows = T.read_jsonl(os.path.join(out, "rollouts_task1.jsonl"))
     assert rows and all(len(r["samples"]) == 8 for r in rows)
-    sp_ = json.load(open(sp))["folds"][0]
-    upd = {u["update"]: u for u in T.read_jsonl(os.path.join(out, "updates.jsonl"))}
-    saw_refill = False
-    for u in range(1, 5):
-        rs = [r for r in rows if r["update"] == u]
-        base = {r["conversation_id"] for r in rs if not r["refill"]}
-        ref = {r["conversation_id"] for r in rs if r["refill"]}
-        assert len(base) == 8 and not base & ref and len(ref) <= 8
-        assert (base | ref) <= set(sp_["train_all"])
-        th = upd[u]["train_aggregate"]["task1_train"]
-        assert th["n_base_groups"] == sum(1 for r in rs if not r["refill"])
-        assert th["n_refill_groups"] == sum(1 for r in rs if r["refill"])
-        assert th["refill_stop"] in ("filled", "pool_empty", "cap", "none_needed")
-        info = sum(1 for r in rs if RA.pstd([x["reward"] for x in r["samples"]]) > 1e-8)
-        assert th["n_informative_groups"] == info
-        if ref:
-            saw_refill = True
-            assert th["refill_stop"] != "none_needed"
-        else:
-            assert th["refill_stop"] in ("none_needed",) or info >= th["n_base_groups"] or th["refill_stop"] == "cap"
-        # aux only from the base groups
-        assert upd[u]["learner_stats"]["aux_n"] <= th["n_base_groups"]
-    assert saw_refill, "the dry run never exercised the refill"
-    rep = v16_report(out)
-    assert all(c["fail"] == 0 for c in rep.checks.values()), {k: c for k, c in rep.checks.items() if c["fail"]}
+    assert any(r["refill"] for r in rows), "the archived run exercised the refill"
+    rep = v16_report(out, sp)
+    assert no_fail(rep)
+    # tampering: a stop reason that does not fit, a floor that is not the run's, silent supervision, no adv log
+    p = os.path.join(out, "updates.jsonl")
+    ups = T.read_jsonl(p)
+    for u in ups:
+        th = u["train_aggregate"]["task1_train"]
+        th["refill_stop"] = "cap" if th["refill_stop"] != "cap" else "filled"
+    ups[0]["train_aggregate"]["aux_floor"] = 0.3
+    ups[1]["learner_stats"]["aux_n"] = 0
+    del ups[2]["learner_stats"]["adv_abs_mean"]
+    _rewrite(p, ups)
+    rep = v16_report(out, sp)
+    assert rep.checks["rl.task1_refill"]["fail"] >= 1 and rep.checks["rl.aux_floor"]["fail"] >= 2
+    assert rep.checks["rl.adv_norm"]["fail"] == 1
 
 
-def test_item1_refill_same_after_resume():
-    d = tempfile.mkdtemp()
-    sp = make_splits(d)
-    a, b = os.path.join(d, "a"), os.path.join(d, "b")
-    run(sp, a, updates=4)
-    run(sp, b, updates=2)
-    run(sp, b, "--resume", updates=4)
-    key = lambda r: (r["update"], r["conversation_id"], r["t"])
-    ra = sorted(((key(r), r["refill"], [x["reward"] for x in r["samples"]]) for r in T.read_jsonl(os.path.join(a, "rollouts_task1.jsonl"))))
-    rb = sorted(((key(r), r["refill"], [x["reward"] for x in r["samples"]]) for r in T.read_jsonl(os.path.join(b, "rollouts_task1.jsonl"))))
-    assert ra == rb
+def test_item1_refill_cap_verified():
+    sp, out = fixture("cap")
+    for u in T.read_jsonl(os.path.join(out, "updates.jsonl")):
+        th = u["train_aggregate"]["task1_train"]
+        assert th["refill_stop"] == "cap" and th["n_refill_convs"] == 8 and th["n_informative_groups"] == 0
+    assert no_fail(v16_report(out, sp))
+
+
+def test_r1_refill_conversation_without_rows_is_not_a_false_failure():
+    sp, out = fixture("cap")
+    pu, pt = os.path.join(out, "updates.jsonl"), os.path.join(out, "rollouts_task1.jsonl")
+    ups, t1 = T.read_jsonl(pu), T.read_jsonl(pt)
+    th = ups[0]["train_aggregate"]["task1_train"]
+    gone = th["refill_convs"][0]                                             # pretend it produced no row
+    th["refill_convs"] = th["refill_convs"][1:]
+    th["groups"] = [g for g in th["groups"] if g[0] != gone]
+    th["n_refill_groups"] = sum(1 for g in th["groups"] if g[2])
+    _rewrite(pu, ups)
+    _rewrite(pt, [r for r in t1 if not (r["conversation_id"] == gone and r["update"] == 1)])
+    rep = v16_report(out, sp)
+    assert rep.checks["rl.task1_refill"]["fail"] == 0, rep.checks["rl.task1_refill"]
+
+
+def test_verify_task1_rows_of_an_aborted_attempt_are_ignored():
+    sp, out = fixture("main")
+    p = os.path.join(out, "rollouts_task1.jsonl")
+    rows = T.read_jsonl(p)
+    extra = [dict(r, conversation_id="c13") for r in rows if r["update"] == 2][:2]   # stray rows of another attempt
+    _rewrite(p, extra + rows + [r for r in rows if r["update"] == 3])                # and duplicated u3 rows
+    assert no_fail(v16_report(out, sp))
+
+
+def test_n1_splits_path_from_cli_and_sha(tmp_path):
+    sp, out = fixture("main")
+    mp = os.path.join(out, "run_meta.jsonl")
+    meta = T.read_jsonl(mp)
+    for m in meta:
+        m["config"]["args"]["splits"] = str(tmp_path / "gone.json")          # the run's own path does not exist here
+    _rewrite(mp, meta)
+    rep = V.Report()
+    V.check_v16(out, rep)
+    assert rep.checks["rl.task1_refill"]["fail"] >= 1                        # never skipped silently
+    assert no_fail(v16_report(out, sp))                                      # the verifier's --splits
+    other = str(tmp_path / "other.json")
+    s_ = json.load(open(sp))
+    s_["folds"][0]["test"] = s_["folds"][0]["test"][:-1]
+    json.dump(s_, open(other, "w"))
+    assert v16_report(out, other).checks["rl.task1_refill"]["fail"] >= 1     # another split file: sha differs
 
 
 # ------------------------------------------------------------------ item 7: continuous Task 1 metric
@@ -159,81 +165,212 @@ def test_item7_prob_metrics_values():
     assert abs(m["bal_p"] - (0.5 * 0.6 + 0.5 * (0.8 + 0.6 + 1.0) / 3)) < 1e-12
     # pairs (final, earlier): 0.8>0.2,0.8>0.4,0.8>0 ; 0.4>0.2, 0.4=0.4 (1/2), 0.4>0  -> 5.5 / 6
     assert abs(m["auc"] - 5.5 / 6) < 1e-12
-    ll = [-math.log(0.8), -math.log(0.4), -math.log(0.8), -math.log(0.6), -math.log(1 - 1e-6)]
-    assert abs(m["logloss"] - sum(ll) / 5) < 1e-12
-    assert m["n_points"] == 5 and m["n_final"] == 2 and m["n_invalid"] == 1
+    # v17 B5: nll over the VALID points only (the invalid one is counted, not scored); logloss is its alias
+    ll = [-math.log(0.8), -math.log(0.4), -math.log(0.8), -math.log(0.6)]
+    assert abs(m["nll"] - sum(ll) / 4) < 1e-12 and m["logloss"] == m["nll"]
+    assert m["n_points"] == 5 and m["n_final"] == 2 and m["n_invalid"] == 1 and m["n_valid"] == 4
     assert T1.task1_prob_metrics([{"real_final": True, "p_end": 0.3}])["bal_p"] == 0.3
+    assert T1.task1_prob_metrics([{"real_final": True, "p_end": 0.0, "valid": False}])["nll"] is None
     with pytest.raises(ValueError):
         T1.task1_prob_metrics([{"real_final": False, "p_end": 0.3}])
     with pytest.raises(ValueError):
         T1.task1_prob_metrics([{"real_final": True, "p_end": 1.3}])
 
 
-def test_item7_validation_selection_and_verify():
-    sp, out = fresh(updates=4)
+def test_item7_validation_recomputed_and_tampering_caught():
+    sp, out = fixture("main")
     val = T.read_jsonl(os.path.join(out, "validation.jsonl"))
-    summ = [v for v in val if v["kind"] == "summary"]
-    for v in summ:
-        assert v["selection_task1_metric"] == "bal_p" and "bal_p" in v["task1"] and "auc" in v["task1"]
+    for v in [v for v in val if v["kind"] == "summary"]:
         rows = [r for r in val if r["kind"] == "task1" and r["update"] == v["update"]]
         pts = [p for r in rows for p in r["end_probs"]]
         assert len(pts) == sum(len(r["task1"]["turns"]) - 1 for r in rows)
-        assert all("user_prompt" not in x for r in rows for x in r["task1"]["turns"])      # prompts not logged
         assert abs(T1.task1_prob_metrics(pts)["bal_p"] - v["task1"]["bal_p"]) < 1e-12
-        if v["selection_score"] is not None:
-            want = (v["w_sel_cov"] * v["turn_stats"]["coverage_mean"] - v["w_sel_w1"] * v["turn_stats"]["turn_w1"]
-                    + v["w_sel_task1"] * v["task1"]["bal_p"])
-            assert abs(v["selection_score"] - want) < 1e-12
-    st = json.load(open(os.path.join(out, "ckpt", "u00004", "state.json")))
-    assert "bal_p" in st["task1_base"]
-    rep = v16_report(out)
-    assert all(c["fail"] == 0 for c in rep.checks.values())
-    # verify catches a tampered summary bal_p
     p = os.path.join(out, "validation.jsonl")
-    rows = T.read_jsonl(p)
-    for r in rows:
+    for r in val:
         if r["kind"] == "summary" and r["update"] == 2:
             r["task1"]["bal_p"] += 0.1
-    with open(p, "w") as f:
-        f.write("".join(json.dumps(r) + "\n" for r in rows))
-    rep = v16_report(out)
-    assert rep.checks["rl.task1_prob"]["fail"] == 1
+    _rewrite(p, val)
+    assert v16_report(out, sp).checks["rl.task1_prob"]["fail"] == 1
 
 
-def test_item7_d2_needs_two_consecutive():
-    # margin -1: every validation after the base is "over the margin" -> trigger exactly at the 2nd one (u4)
-    sp, out = fresh("--t1-trigger-margin", "-1", "--ablation", "test-d2", updates=6)
+def test_h_unscored_point_rule_and_n4_check():
+    tr = T.Trainer.__new__(T.Trainer)
+
+    class Env:
+        def run_task1(self, cid, keep_prompts=False):
+            return {"conversation_id": cid, "n_real": 3, "turns": [
+                {"t": t, "real_final": t == 3, "ended_planner": False, "user_prompt": "p"} for t in (1, 2, 3)]}
+
+        def task1_end_probe(self, cid, t, prompt, real_final):
+            if t == 2:
+                return {"valid": False, "decision_valid": False, "greedy_end": True}     # unparsed plan -> 0
+            return {"valid": False, "decision_valid": True, "greedy_end": True}          # no value located -> greedy
+    tr.env, tr.learner = Env(), None
+    row = tr.task1_eval_row(5, "sha", "c1")
+    ps = {p["t"]: p for p in row["end_probs"]}
+    assert ps[2]["p_end"] == 0.0 and ps[3]["p_end"] == 1.0 and ps[3]["decision_valid"] is True
+    assert all("user_prompt" not in x for x in row["task1"]["turns"])
+    # N4: the verifier checks the rule on the archived run's rows
+    sp, out = fixture("main")
+    pv = os.path.join(out, "validation.jsonl")
+    val = T.read_jsonl(pv)
+    for r in val:
+        if r["kind"] == "task1" and r["update"] == 2:
+            r["end_probs"][0].update(valid=False, decision_valid=False, greedy_end=True, p_end=0.5)
+            break
+    _rewrite(pv, val)
+    assert v16_report(out, sp).checks["rl.task1_prob"]["fail"] >= 1
+
+
+# ------------------------------------------------------------------ D2 trigger (recomputed, never trusted)
+def test_verify_d2_recomputed():
+    sp, out = fixture("d2")
     summ = [v for v in T.read_jsonl(os.path.join(out, "validation.jsonl")) if v["kind"] == "summary"]
     d2 = {v["update"]: v["d2"] for v in summ}
-    assert d2[0] is None and d2[2]["streak"] == 1 and d2[2]["triggered_at"] is None
-    assert d2[4]["streak"] == 2 and d2[4]["triggered_at"] == 4
-    st = json.load(open(os.path.join(out, "ckpt", "u00006", "state.json")))
-    assert st["aux_anneal_start"] == 4
-    upd = {u["update"]: u for u in T.read_jsonl(os.path.join(out, "updates.jsonl"))}
-    assert upd[5]["train_aggregate"]["aux_weight"] < upd[5]["cfg_used"]["w_aux"]      # annealing after u4
-    assert upd[4]["train_aggregate"]["aux_weight"] == upd[4]["cfg_used"]["w_aux"]
-    rep = v16_report(out)
-    assert all(c["fail"] == 0 for c in rep.checks.values())
-    # margin +1: never triggered, never annealed
-    sp, out = fresh("--t1-trigger-margin", "1", "--ablation", "test-d2", updates=4)
-    summ = [v for v in T.read_jsonl(os.path.join(out, "validation.jsonl")) if v["kind"] == "summary"]
-    assert all((v["d2"] or {}).get("triggered_at") is None for v in summ)
-
-
-def _rewrite(path, rows):
-    with open(path, "w") as f:
-        f.write("".join(json.dumps(r) + "\n" for r in rows))
+    assert d2[0] is None and d2[2]["streak"] == 1 and d2[4]["triggered_at"] == 4
+    assert no_fail(v16_report(out, sp))
+    pv = os.path.join(out, "validation.jsonl")
+    val = T.read_jsonl(pv)
+    for r in val:
+        if r["kind"] == "summary" and r["update"] == 2:
+            r["d2"]["streak"] = 2                                           # a logged streak that is not true
+    _rewrite(pv, val)
+    assert v16_report(out, sp).checks["rl.d2_trigger"]["fail"] >= 1
 
 
 def test_verify_catches_early_anneal_and_floor():
-    sp, out = fresh("--stop-sup-floor", "0.3", "--ablation", "test-floor", updates=4)
+    sp, out = fixture("main")
     p = os.path.join(out, "updates.jsonl")
     rows = T.read_jsonl(p)
     rows[1]["train_aggregate"]["aux_annealed"] = 0.2                          # an anneal without a D2 trigger
     rows[1]["train_aggregate"]["aux_weight"] = 0.2                            # ... and below the floor
     _rewrite(p, rows)
-    rep = v16_report(out)
+    rep = v16_report(out, sp)
     assert rep.checks["rl.aux_floor"]["fail"] >= 1 and rep.checks["rl.d2_trigger"]["fail"] == 1
+
+
+def _meta_run(summ):
+    d = tempfile.mkdtemp()
+    out = os.path.join(d, "run")
+    os.makedirs(out)
+    meta = {"kind": "start", "config": {"args": {"task1_G": 8, "task1_convs": 0, "t1_trigger_margin": 0.1, "splits": "x",
+                                                 "fold": 0}, "algo_cfg": {"grpo_std_norm": False}}}
+    _rewrite(os.path.join(out, "run_meta.jsonl"), [meta])
+    _rewrite(os.path.join(out, "validation.jsonl"), summ)
+    return out
+
+
+def test_verify_d2_streak_resets():
+    # met, not met, met: no trigger (recomputation from the summaries' bal_p)
+    summ = []
+    for u, b, streak in ((0, 0.5, None), (5, 0.7, 1), (10, 0.55, 0), (15, 0.7, 1)):
+        summ.append({"kind": "summary", "update": u, "policy_sha": "p%d" % u, "task1": {"bal_p": b},
+                     "d2": None if streak is None else {"met": b >= 0.6, "streak": streak, "triggered_at": None}})
+    out = _meta_run(summ)
+    rep = V.Report()
+    V.check_v16(out, rep)
+    assert rep.checks["rl.d2_trigger"]["fail"] == 0
+    summ[3]["d2"]["triggered_at"] = 15                                      # a trigger without two in a row
+    _rewrite(os.path.join(out, "validation.jsonl"), summ)
+    rep = V.Report()
+    V.check_v16(out, rep)
+    assert rep.checks["rl.d2_trigger"]["fail"] >= 1
+
+
+def test_n5_validation_without_task1_resets_the_streak():
+    out = _meta_run([{"kind": "summary", "update": 0, "task1": {"bal_p": 0.5}, "d2": None},
+                     {"kind": "summary", "update": 5, "task1": {"bal_p": 0.7}, "d2": {"met": True, "streak": 1, "triggered_at": None}},
+                     {"kind": "summary", "update": 10, "task1": None, "d2": None},
+                     {"kind": "summary", "update": 15, "task1": {"bal_p": 0.7}, "d2": {"met": True, "streak": 1, "triggered_at": None}}])
+    rep = V.Report()
+    V.check_v16(out, rep)
+    assert rep.checks["rl.d2_trigger"]["fail"] == 0
+
+
+# ------------------------------------------------------------------ selection / re-selection (v16 branch only)
+def _selection_fails(out):
+    rep = V.Report()
+    V.check_selection(os.path.join(out, "validation.jsonl"), out, rep)
+    return rep.checks["rl.selection"]["fail"]
+
+
+def test_f2_v16_run_must_select_on_bal_p():
+    sp, out = fixture("main")
+    assert _selection_fails(out) == 0
+    p = os.path.join(out, "validation.jsonl")
+    rows = T.read_jsonl(p)
+    for r in rows:
+        if r["kind"] == "summary":
+            r["selection_task1_metric"] = "term_f1"
+            if r["selection_score"] is not None:
+                r["selection_score"] += r["w_sel_task1"] * (r["task1"]["term_f1"] - r["task1"]["bal_p"])
+    _rewrite(p, rows)
+    assert _selection_fails(out) >= 1
+
+
+def test_f3_reselect_summaries_recomputed():
+    sp, out = fixture("main")
+    p = os.path.join(out, "reselect.jsonl")
+    rows = T.read_jsonl(p)
+    for r in rows:
+        if r["kind"] == "summary" and r["selection_score"] is not None:
+            r["selection_score"] += 0.25
+            break
+    _rewrite(p, rows)
+    assert v16_report(out, sp).checks["rl.selection"]["fail"] >= 1
+
+
+def test_reselect_ids_seeds_and_best():
+    sp, out = fixture("main")
+    f0 = json.load(open(sp))["folds"][0]
+    rep = V.Report()
+    V.check_reselect_ids(out, set(f0["validation"]), set(f0["train_all"]), rep)
+    assert no_fail(rep) and rep.checks["rl.reselect_seeds"]["n"] > 0
+    p = os.path.join(out, "reselect.jsonl")
+    rows = T.read_jsonl(p)
+    for r in rows:
+        if r["kind"] == "episode":
+            r["seed"] = 99
+            break
+    _rewrite(p, rows)
+    b = json.load(open(os.path.join(out, "reselect_best.json")))
+    b["best"]["update"] = 99
+    json.dump(b, open(os.path.join(out, "reselect_best.json"), "w"))
+    rep = V.Report()
+    V.check_reselect_ids(out, set(f0["validation"]), set(f0["train_all"]), rep)
+    assert rep.checks["rl.reselect_seeds"]["fail"] == 1 and rep.checks["rl.reselect_best"]["fail"] == 1
+
+
+def test_legacy_summaries_select_on_term_f1():
+    # a pre-v16 validation summary (no selection_task1_metric) is recomputed with term_f1
+    d = tempfile.mkdtemp()
+    vp = os.path.join(d, "validation.jsonl")
+    s_ = {"kind": "summary", "update": 5, "val_temperature": 0.7, "val_seeds": [0, 1], "selection_score": 0.906 - 0.625 + 0.25,
+          "w_sel_cov": 1.0, "w_sel_w1": 1.0, "w_sel_task1": 1.0, "turn_stats": {"coverage_mean": 0.906, "turn_w1": 0.625},
+          "task1": {"term_f1": 0.25}}
+    _rewrite(vp, [s_])
+    json.dump({"update": 5, "selection_score": s_["selection_score"]}, open(os.path.join(d, "best.json"), "w"))
+    rep = V.Report()
+    V.check_selection(vp, d, rep)
+    assert rep.checks["rl.selection"]["fail"] == 0
+    rep = V.Report()
+    V.check_v16(d, rep)                                                     # no run_meta: nothing to check
+    assert not any(c["fail"] for c in rep.checks.values())
+
+
+# ------------------------------------------------------------------ intervention (archived run with one)
+def test_intervention_verified_on_archived_run():
+    sp, out = fixture("iv")
+    rep = V.Report()
+    V.check_intervention(out, rep)
+    assert rep.checks["rl.intervention"]["fail"] == 0 and rep.checks["rl.intervention"]["n"] > 0
+    assert no_fail(v16_report(out, sp))
+    rows = T.read_jsonl(os.path.join(out, "updates.jsonl"))
+    rows[-1]["cfg_used"]["w_dist"] = 0.5                                    # outside the intervention bounds
+    _rewrite(os.path.join(out, "updates.jsonl"), rows)
+    rep = V.Report()
+    V.check_intervention(out, rep)
+    assert rep.checks["rl.intervention"]["fail"] == 1
 
 
 # ------------------------------------------------------------------ item 8: pooled Task 1 evaluation
@@ -270,140 +407,6 @@ def test_item8_pooled():
         TP.load_arm([f0, dup])                                               # a conversation in two folds
     with pytest.raises(SystemExit):
         TP.paired(TP.load_arm([f0]), TP.load_arm([g0, g1]), 10)               # different conversation sets
-
-
-# ------------------------------------------------------------------ audit-driven tests
-def make_big_splits(d, n_train=24, n_extra=6):
-    ids = ["b%03d" % i for i in range(n_train + n_extra + 12)]
-    tr, ex = ids[:n_train], ids[n_train:n_train + n_extra]
-    val, te = ids[n_train + n_extra:n_train + n_extra + 2], ids[n_train + n_extra + 2:]
-    sp = {"folds": [{"fold": 0, "train": tr, "validation": val, "test": te, "train_all": tr + ex,
-                     "validation_all": val, "test_all": te, "forbidden_for_training": val + te}]}
-    p = os.path.join(d, "big_splits.json")
-    json.dump(sp, open(p, "w"))
-    return p
-
-
-def test_item1_refill_cap(monkeypatch):
-    # every group degenerate (the fake policy never ends) -> refill until the cap (task1_convs extra conversations)
-    orig = T.FakeEnv.task1_sample
-
-    def never_end(self, *a, **k):
-        out = orig(self, *a, **k)
-        for x in out:
-            x["ended_planner"] = False
-            x["reward"] = float(not x["real_final"])
-        return out
-    monkeypatch.setattr(T.FakeEnv, "task1_sample", never_end)
-    d = tempfile.mkdtemp()
-    sp, out = make_big_splits(d), os.path.join(d, "run")
-    run(sp, out, updates=2)
-    for u in T.read_jsonl(os.path.join(out, "updates.jsonl")):
-        th = u["train_aggregate"]["task1_train"]
-        assert th["refill_stop"] == "cap" and th["n_refill_convs"] == 8 and th["n_informative_groups"] == 0
-        assert len(th["refill_convs"]) == 8 and not set(th["refill_convs"]) & set(th["base_convs"])
-    rep = v16_report(out)
-    assert all(c["fail"] == 0 for c in rep.checks.values()), {k: c for k, c in rep.checks.items() if c["fail"]}
-
-
-def test_item1_crash_mid_refill_then_resume(monkeypatch):
-    d = tempfile.mkdtemp()
-    sp = make_splits(d)
-    a, b = os.path.join(d, "a"), os.path.join(d, "b")
-    run(sp, a, updates=4)
-    orig, state = T.append_jsonl, {"n": 0, "armed": True}
-
-    def crashing(path, row):
-        orig(path, row)
-        if state["armed"] and path.endswith("rollouts_task1.jsonl") and row.get("refill") and row["update"] >= 2:
-            state["n"] += 1
-            if state["n"] == 2:
-                state["armed"] = False
-                raise SystemExit("simulated crash mid-refill")
-    monkeypatch.setattr(T, "append_jsonl", crashing)
-    with pytest.raises(SystemExit):
-        run(sp, b, updates=4)
-    assert not state["armed"], "the crash was never reached (no refill in the dry run?)"
-    monkeypatch.setattr(T, "append_jsonl", orig)
-    run(sp, b, "--resume", updates=4)
-    load = lambda p: sorted((r["update"], r["conversation_id"], r["t"], r["refill"], tuple(x["reward"] for x in r["samples"]))
-                            for r in T.read_jsonl(os.path.join(p, "rollouts_task1.jsonl")))
-    assert load(a) == load(b)
-    pa = [u["policy_sha_after"] for u in T.read_jsonl(os.path.join(a, "updates.jsonl"))]
-    pb = [u["policy_sha_after"] for u in T.read_jsonl(os.path.join(b, "updates.jsonl"))]
-    assert pa == pb
-    rep = v16_report(b)
-    assert all(c["fail"] == 0 for c in rep.checks.values())
-
-
-def test_verify_task1_rows_of_an_aborted_attempt_are_ignored():
-    sp, out = fresh(updates=3)
-    p = os.path.join(out, "rollouts_task1.jsonl")
-    rows = T.read_jsonl(p)
-    extra = [dict(r, conversation_id="c13") for r in rows if r["update"] == 2][:2]   # stray rows of another attempt
-    _rewrite(p, extra + rows + [r for r in rows if r["update"] == 3])                # and duplicated u3 rows
-    rep = v16_report(out)
-    assert all(c["fail"] == 0 for c in rep.checks.values()), {k: c for k, c in rep.checks.items() if c["fail"]}
-
-
-def test_verify_d2_recomputed_and_aux_n_and_adv():
-    sp, out = fresh("--t1-trigger-margin", "-1", "--ablation", "test-d2", updates=6)
-    assert all(c["fail"] == 0 for c in v16_report(out).checks.values())
-    pv = os.path.join(out, "validation.jsonl")
-    val = T.read_jsonl(pv)
-    for r in val:
-        if r["kind"] == "summary" and r["update"] == 2:
-            r["d2"]["streak"] = 2                                           # a logged streak that is not true
-    _rewrite(pv, val)
-    assert v16_report(out).checks["rl.d2_trigger"]["fail"] >= 1
-    sp, out = fresh(updates=3)
-    pu = os.path.join(out, "updates.jsonl")
-    ups = T.read_jsonl(pu)
-    ups[0]["learner_stats"]["aux_n"] = 0                                    # supervision silently empty
-    del ups[1]["learner_stats"]["adv_abs_mean"]
-    _rewrite(pu, ups)
-    rep = v16_report(out)
-    assert rep.checks["rl.aux_floor"]["fail"] == 1 and rep.checks["rl.adv_norm"]["fail"] == 1
-
-
-def test_verify_d2_streak_resets():
-    # met, not met, met: no trigger (recomputation from the summaries' bal_p)
-    d = tempfile.mkdtemp()
-    out = os.path.join(d, "run")
-    os.makedirs(out)
-    meta = {"kind": "start", "config": {"args": {"task1_G": 8, "task1_convs": 0, "t1_trigger_margin": 0.1, "splits": "x",
-                                                 "fold": 0}, "algo_cfg": {"grpo_std_norm": False}}}
-    _rewrite(os.path.join(out, "run_meta.jsonl"), [meta])
-    summ = []
-    for u, b, streak in ((0, 0.5, None), (5, 0.7, 1), (10, 0.55, 0), (15, 0.7, 1)):
-        summ.append({"kind": "summary", "update": u, "policy_sha": "p%d" % u, "task1": {"bal_p": b},
-                     "d2": None if streak is None else {"met": b >= 0.6, "streak": streak, "triggered_at": None}})
-    _rewrite(os.path.join(out, "validation.jsonl"), summ)
-    rep = V.Report()
-    V.check_v16(out, rep)
-    assert rep.checks["rl.d2_trigger"]["fail"] == 0
-    summ[3]["d2"]["triggered_at"] = 15                                      # a trigger without two in a row
-    _rewrite(os.path.join(out, "validation.jsonl"), summ)
-    rep = V.Report()
-    V.check_v16(out, rep)
-    assert rep.checks["rl.d2_trigger"]["fail"] >= 1
-
-
-def test_legacy_summaries_select_on_term_f1():
-    # a pre-v16 validation summary (no selection_task1_metric) is recomputed with term_f1
-    d = tempfile.mkdtemp()
-    vp = os.path.join(d, "validation.jsonl")
-    s_ = {"kind": "summary", "update": 5, "val_temperature": 0.7, "val_seeds": [0, 1], "selection_score": 0.906 - 0.625 + 0.25,
-          "w_sel_cov": 1.0, "w_sel_w1": 1.0, "w_sel_task1": 1.0, "turn_stats": {"coverage_mean": 0.906, "turn_w1": 0.625},
-          "task1": {"term_f1": 0.25}}
-    _rewrite(vp, [s_])
-    json.dump({"update": 5, "selection_score": s_["selection_score"]}, open(os.path.join(d, "best.json"), "w"))
-    rep = V.Report()
-    V.check_selection(vp, d, rep)
-    assert rep.checks["rl.selection"]["fail"] == 0
-    rep = V.Report()
-    V.check_v16(d, rep)                                                     # no run_meta: nothing to check
-    assert not any(c["fail"] for c in rep.checks.values())
 
 
 def test_item8_pooled_equals_task1_stop():

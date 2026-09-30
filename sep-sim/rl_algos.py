@@ -12,17 +12,25 @@ Pure-python part (no torch; tested locally in test_rl_advantages.py):
   clipped_surrogate, k3 scalar reference versions of the token-level terms the torch loss uses.
   episode_samples       every Planner step of an episode -> one sample (prompt_ids, gen_ids exactly as
                         recorded at rollout time; never re-tokenised, never truncated).
+  token_advantages      SPEC v17 S2: the per-token advantage adv*(1-note) + adv_prefix*prefix_mask*(1-note)
+                        + adv_stop*stop_mask (one definition for the torch learner and the dry-run fake).
+  aux_split             SPEC v17 S4: the stop-supervision examples of one epoch, in a given order, cut into
+                        the epoch's minibatches (each example once per epoch).
 
 Torch part (imported lazily, exercised by test_rl_algos_server.py on the server):
   setup_policy          new LoRA (r=16, alpha=32, q/k/v/o, dropout 0.0) on the Planner, fp32 trainable
-                        params, bf16 base; an --init-adapter is merged into the base first, so the KL
-                        reference (model.disable_adapter()) is exactly the starting policy.
+                        params, bf16 base; the LoRA init is seeded (v17 B1: the start policy is the same at
+                        every launch); no init adapter (v17: the SFT warm-up happens inside the run).
+  load_ref_adapter      v17 §2/B4: the SFT policy u0 as a second, frozen adapter "ref" (the KL reference).
+  value_nll_loss        v17 §1.2/S4: -sum w log p(target | prompt + prefix) / norm_tokens, the loss of the SFT
+                        warm-up AND of the auxiliary stop supervision.
   token_logprobs        per-token log-probs of gen_ids given prompt_ids, one sequence at a time,
                         logits only for the generated positions, scaled by the rollout temperature.
-  TorchLearner          old log-probs (theta_old = the rollout policy) and reference log-probs computed
-                        once before the first epoch, then epochs x minibatches of clipped updates with
-                        gradient accumulation one sequence at a time. Records max |ratio - 1| at the
-                        start of the update (must be ~0: on-policy, no dropout).
+  TorchLearner          old log-probs (theta_old = the rollout policy) and reference log-probs (the "ref"
+                        adapter) computed once before the first epoch, then epochs x minibatches of clipped
+                        updates with gradient accumulation one sequence at a time, the stop supervision split
+                        across the minibatches. Records max |ratio - 1| at the start of the update (must be
+                        ~0: on-policy, no dropout).
 
 Mode note: HF only activates gradient checkpointing when module.training is True. To keep
 checkpointing AND make every forward numerically identical to eval mode, the default forward mode is
@@ -42,7 +50,8 @@ LORA = {"r": 16, "lora_alpha": 32, "lora_dropout": 0.0,
         "target_modules": ["q_proj", "k_proj", "v_proj", "o_proj"], "bias": "none"}
 # grpo_std_norm (v16, user 2026-09-28): False = Dr. GRPO advantages R - mean(R); a nearly uniform group no longer
 # blows a chance difference up to a unit-size advantage
-ALGO_DEFAULTS = {"tis_cap": 2.0, "clip_eps": 0.2, "adv_eps": 1e-6, "min_group_std": 1e-8, "epochs": 1, "minibatches": 1,
+# epochs 2 x minibatches 4 (SPEC v17 §3.4, user 2026-09-30): 8 optimizer steps per update
+ALGO_DEFAULTS = {"tis_cap": 2.0, "clip_eps": 0.2, "adv_eps": 1e-6, "min_group_std": 1e-8, "epochs": 2, "minibatches": 4,
                  "grpo_std_norm": False,
                  "max_grad_norm": 1.0, "vf_coef": 0.5, "value_hidden": 256, "value_lr": 1e-4,
                  "rloo_clipped": False, "ppo_adv_norm": True, "ratio_init_tol": 1e-4,
@@ -80,10 +89,11 @@ def pstd(xs):
 
 
 def group_advantages(rewards, eps=1e-6, min_std=1e-8, std_norm=False):
-    """GRPO. -> list of advantages, or None when the group has (near) zero spread (skipped).
+    """GRPO. -> list of advantages, or None when the group is skipped: fewer than 2 members (v17 B7: e.g. a Task 1
+    group left with one sample after the mask-mismatch drops; the caller counts it) or (near) zero spread.
     std_norm=False (v16 default): A = R - mean(R); True: (R - mean) / (std + eps)."""
     if len(rewards) < 2:
-        raise ValueError("a GRPO group needs at least 2 episodes")
+        return None
     m, s = mean(rewards), pstd(rewards)
     if s <= min_std:
         return None
@@ -173,17 +183,76 @@ def episode_samples(episode, policy_version=None):
                     "temperature": float(g["temperature"]), "policy_version": policy_version,
                     "stop_mask": list(g["stop_mask"]) if g.get("stop_mask") is not None else None,
                     "note_mask": list(g["note_mask"]) if g.get("note_mask") is not None else None,
+                    # v17 S2: the tokens before the end_session value (Task 1 samples with a located value)
+                    "prefix_mask": list(g["prefix_mask"]) if g.get("prefix_mask") is not None else None,
                     "behav_logp": list(g["gen_logprobs"]) if g.get("gen_logprobs") is not None else None,
                     "gen_adapter": g.get("gen_adapter")})
+    return out
+
+
+def prefix_mask_of(stop_mask):
+    """v17 §3.2: 1 on every generated token before the first end_session value token, else 0 (None without a mask)."""
+    if not stop_mask or 1 not in stop_mask:
+        return None
+    i = list(stop_mask).index(1)
+    return [1] * i + [0] * (len(stop_mask) - i)
+
+
+def token_advantages(s, n_tokens):
+    """SPEC v17 S2 (user 2026-09-30): the advantage of every generated token of sample s,
+        adv * (1 - note) + adv_prefix * prefix_mask * (1 - note) + adv_stop * stop_mask,
+    note_mask None = all 0 (D4: profile_note tokens carry no sequence / prefix advantage, only the KL term). A mask of
+    another length than the generation, or a prefix_mask overlapping the stop_mask, raises. -> list of floats."""
+    def mask(key):
+        m = s.get(key)
+        if m is None:
+            return None
+        if len(m) != n_tokens:
+            raise AssertionError("%s length %d != %d generated tokens" % (key, len(m), n_tokens))
+        return [float(v) for v in m]
+    note, pm, sm = mask("note_mask"), mask("prefix_mask"), mask("stop_mask")
+    if pm is not None and sm is not None and any(a and b for a, b in zip(pm, sm)):
+        raise AssertionError("prefix_mask and stop_mask overlap")
+    a, ap, ast = float(s.get("adv") or 0.0), float(s.get("adv_prefix") or 0.0), float(s.get("adv_stop") or 0.0)
+    if ap and pm is None:
+        raise AssertionError("adv_prefix without a prefix_mask")
+    out = []
+    for i in range(n_tokens):
+        keep = 1.0 - (note[i] if note is not None else 0.0)
+        v = a * keep
+        if pm is not None:
+            v += ap * pm[i] * keep
+        if sm is not None:
+            v += ast * sm[i]
+        out.append(v)
+    return out
+
+
+def aux_split(n_aux, order, k):
+    """v17 S4: the stop-supervision examples of one epoch in `order` (a permutation of range(n_aux)), cut in order into
+    k consecutive parts of near-equal size (the first n_aux % k parts one longer); with fewer examples than k some
+    minibatches get none. Every example is used exactly once per epoch. -> list of k index lists."""
+    if sorted(order) != list(range(n_aux)):
+        raise ValueError("aux order is not a permutation of the %d examples" % n_aux)
+    q, r = divmod(n_aux, k)
+    out, i = [], 0
+    for j in range(k):
+        m = q + (1 if j < r else 0)
+        out.append(list(order[i:i + m]))
+        i += m
     return out
 
 
 def advantages_for_groups(groups, algo, cfg):
     """groups: list of lists of rewards (one list per scenario group).
     -> (list of per-episode advantages or None per group, n_skipped). PPO returns None here (per-step
-    advantages need the value head)."""
+    advantages need the value head). v17 B7: a group with fewer than 2 members gets None and is NOT counted in
+    n_skipped (the zero-spread count); the caller counts those groups itself."""
     out, skipped = [], 0
     for rs in groups:
+        if len(rs) < 2:
+            out.append(None)
+            continue
         if algo == "grpo":
             a = group_advantages(rs, cfg["adv_eps"], cfg["min_group_std"], cfg["grpo_std_norm"])
         elif algo == "rloo":
@@ -218,19 +287,23 @@ def assert_no_dropout(model):
         raise AssertionError("dropout must be 0 for exact on-policy ratios: %s" % bad[:5])
 
 
-def setup_policy(planner, init_adapter=None, gradient_checkpointing=True):
-    """Put a NEW trainable LoRA on planner.model (a PlannerLM loaded WITHOUT adapter)."""
+def setup_policy(planner, lora_init_seed, gradient_checkpointing=True, init_adapter=None):
+    """Put a NEW trainable LoRA (adapter "default") on planner.model (a PlannerLM loaded WITHOUT adapter).
+    v17 B1 (user 2026-09-30): torch is seeded with lora_init_seed (the trainer passes seed_of(seed, "lora_init"))
+    right before get_peft_model, so the start policy (LoRA B = 0, A drawn from the seed) and its sha are the same at
+    every launch. v17: an init adapter is refused (the SFT warm-up runs inside the trainer; the KL reference is the
+    SFT policy u0, loaded as the adapter "ref")."""
+    if init_adapter:
+        raise ValueError("v17: no --init-adapter (the SFT warm-up runs inside train_planner_rl.py)")
+    if lora_init_seed is None:
+        raise ValueError("v17 B1: the LoRA initialisation must be seeded")
     import torch
     from peft import LoraConfig, get_peft_model
     model = planner.model
-    if init_adapter:
-        from peft import PeftModel
-        if getattr(model, "is_loaded_in_4bit", False) or getattr(model, "quantization_method", None):
-            raise NotImplementedError("merging an init adapter into a quantized base is not supported")
-        model = PeftModel.from_pretrained(model, init_adapter).merge_and_unload()
     if gradient_checkpointing:
         model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
     model.config.use_cache = True        # generation keeps its KV cache; training forwards pass use_cache=False
+    torch.manual_seed(int(lora_init_seed))
     model = get_peft_model(model, LoraConfig(task_type="CAUSAL_LM", **LORA))
     for p in model.parameters():
         if p.requires_grad:
@@ -253,6 +326,61 @@ def tensor_sha(state):
         h.update(k.encode())
         h.update(t.numpy().tobytes())
     return h.hexdigest()
+
+
+REF_ADAPTER = "ref"
+
+
+def ref_param_names(model):
+    return [n for n, _ in model.named_parameters() if (".%s." % REF_ADAPTER) in n]
+
+
+def load_ref_adapter(model, path, optimizer=None):
+    """v17 §2 / B4 (user 2026-09-30): load the adapter at `path` (the SFT policy u0) as a second, FROZEN adapter named
+    "ref" -- the KL reference. Called after the optimizer exists; the active adapter stays "default", the trainable
+    parameter set and the optimizer's parameter set are asserted unchanged and every ref parameter has
+    requires_grad False. Checkpoints save "default" only (TorchLearner.save). -> number of ref parameters."""
+    if REF_ADAPTER in (getattr(model, "peft_config", None) or {}):
+        raise AssertionError("the ref adapter is already loaded")
+    names0 = [n for n, p in model.named_parameters() if p.requires_grad]
+    opt0 = [id(p) for g in optimizer.param_groups for p in g["params"]] if optimizer is not None else None
+    model.load_adapter(path, adapter_name=REF_ADAPTER, is_trainable=False)
+    model.set_adapter("default")
+    names1 = [n for n, p in model.named_parameters() if p.requires_grad]
+    if names1 != names0:
+        raise AssertionError("loading the ref adapter changed the trainable parameters (%d -> %d)" % (len(names0), len(names1)))
+    refs = [p for n, p in model.named_parameters() if (".%s." % REF_ADAPTER) in n]
+    if not refs:
+        raise AssertionError("no parameter of the ref adapter found after loading %s" % path)
+    if any(p.requires_grad for p in refs):
+        raise AssertionError("a ref adapter parameter is trainable")
+    if optimizer is not None:
+        opt1 = [id(p) for g in optimizer.param_groups for p in g["params"]]
+        pol = [id(p) for g in optimizer.param_groups if g.get("name") == "policy" for p in g["params"]]
+        if opt1 != opt0 or set(pol) != {id(p) for p in model.parameters() if p.requires_grad}:
+            raise AssertionError("the optimizer's parameter set is not the trainable set after loading the ref adapter")
+    return len(refs)
+
+
+def value_nll_loss(model, examples, norm_tokens, backward=True):
+    """v17 §1.2 / S4 (user 2026-09-30): the loss of the SFT warm-up AND of the auxiliary stop supervision,
+        -sum_x w_x log p(target_x | prompt_x + prefix_x) / norm_tokens,
+    one sequence at a time (backward per example, so the graph of one example is freed before the next; no grad and
+    no backward with backward=False). norm_tokens = the summed gen_len of the generations the values belong to (the
+    GRPO loss's normalisation, user 2026-09-26). -> (loss value, [p(target) of each example in this forward])."""
+    import torch
+    if not norm_tokens or norm_tokens <= 0:
+        raise ValueError("value_nll_loss needs a positive token count")
+    tot, ps = 0.0, []
+    for x in examples:
+        with (torch.enable_grad() if backward else torch.no_grad()):
+            lp, _ = token_logprobs(model, list(x["prompt_ids"]) + list(x["prefix_ids"]), x["target_ids"], 1.0)
+            loss = -float(x["weight"]) * lp.sum() / float(norm_tokens)
+            if backward:
+                loss.backward()
+        ps.append(float(lp.detach().sum().exp()))
+        tot += float(loss.detach())
+    return tot, ps
 
 
 def _set_mode(model, mode):
@@ -294,8 +422,25 @@ def make_value_head(hidden_size, width):
     return head.float()
 
 
+def step_stats(steps):
+    """v17 §3.4: per-step mean and max of rl_grad_norm, aux_grad_norm (over the steps that carried supervision), kl and
+    clip_frac, plus the steps themselves (shared by the torch learner and the dry-run fake)."""
+    def mm(key, rows):
+        xs = [float(r[key]) for r in rows if r.get(key) is not None]
+        return (sum(xs) / len(xs), max(xs)) if xs else (None, None)
+    out = {"steps": steps}
+    for key, name in (("rl_grad_norm", "rl_grad_norm"), ("aux_grad_norm", "aux_grad_norm"), ("kl", "kl_step"),
+                      ("clip_frac", "clip_frac_step")):
+        m, x = mm(key, steps)
+        out[name if key in ("rl_grad_norm", "aux_grad_norm") else name + "_mean"] = m
+        out[name + "_max"] = x
+    return out
+
+
 class TorchLearner:
-    """Holds the PEFT policy, optional value head and the optimizer. One sequence per forward."""
+    """Holds the PEFT policy, optional value head and the optimizer. One sequence per forward.
+    v17: the KL reference is the frozen adapter "ref" (load_ref: the SFT policy u0); the SFT warm-up has its own AdamW
+    (sft_begin / sft_step), separate from the GRPO optimizer."""
 
     def __init__(self, model, algo, acfg, lr, seed=0):
         import torch
@@ -310,6 +455,8 @@ class TorchLearner:
             self.value_head = make_value_head(model.config.hidden_size, int(self.acfg["value_hidden"])).to(dev)
             groups.append({"params": list(self.value_head.parameters()), "lr": self.acfg["value_lr"], "name": "value"})
         self.optimizer = torch.optim.AdamW(groups, weight_decay=self.acfg["weight_decay"])
+        self.has_ref, self.ref_path, self._trainable0 = False, None, None
+        self.sft_opt = None
 
     def trainable_names(self):
         names = [n for n, p in self.model.named_parameters() if p.requires_grad]
@@ -318,14 +465,36 @@ class TorchLearner:
     def policy_sha(self):
         return tensor_sha(lora_state(self.model))
 
+    # -------------------------------------------------------- KL reference (v17 §2, B4)
+    def load_ref(self, path):
+        """The SFT policy u0 (path = ckpt/u00000/adapter) as the frozen adapter "ref"; after the optimizer exists."""
+        load_ref_adapter(self.model, path, self.optimizer)
+        self.has_ref, self.ref_path = True, path
+        self._trainable0 = self.trainable_names()
+
+    def _check_adapters(self):
+        if self.trainable_names() != self._trainable0:
+            raise AssertionError("the trainable parameters changed around the ref forward")
+        if any(p.requires_grad for n, p in self.model.named_parameters() if (".%s." % REF_ADAPTER) in n):
+            raise AssertionError("a ref adapter parameter is trainable after switching back to the policy")
+
     # -------------------------------------------------------- per-sample passes
     def _logp(self, s, grad, hidden=False, reference=False):
         import torch
         ctx = torch.enable_grad() if grad else torch.no_grad()
         with ctx:
             if reference:
-                with self.model.disable_adapter():
+                if not self.has_ref:
+                    raise AssertionError("no KL reference loaded (v17: the SFT policy u0 as the adapter 'ref')")
+                # v17 B4: switch the whole model to the frozen ref adapter for this forward only (set_adapter also
+                # flips requires_grad, so the trainable set is checked after switching back); no per-forward
+                # adapter_names=
+                try:
+                    self.model.set_adapter(REF_ADAPTER)
                     return token_logprobs(self.model, s["prompt_ids"], s["gen_ids"], s["temperature"], hidden)
+                finally:
+                    self.model.set_adapter("default")
+                    self._check_adapters()
             return token_logprobs(self.model, s["prompt_ids"], s["gen_ids"], s["temperature"], hidden)
 
     def prepare(self, samples):
@@ -350,15 +519,31 @@ class TorchLearner:
             for s, a in zip(samples, adv):
                 s["adv"] = a
 
-    def update(self, samples, cfg, seed, aux=None, mismatch_abort=None):
+    def _grad_sq(self, params):
+        return sum(float((p.grad.detach().float() ** 2).sum()) for p in params if p.grad is not None)
+
+    def update(self, samples, cfg, seed, aux=None, aux_orders=None, mismatch_abort=None):
         """cfg: controller cfg (lr, kl_coef). aux: optional stop-token supervision examples
-        {prompt_ids, prefix_ids, target_ids, want_end, weight}. mismatch_abort: raise MismatchAbort before any
-        optimizer step when the mean |log pi_old - log pi_behaviour| of vLLM-sampled tokens exceeds it. -> stats."""
+        {prompt_ids, prefix_ids, target_ids, want_end, weight, gen_len}; aux_orders: one permutation of the aux examples
+        per epoch (the trainer draws them with seed_of(seed, "aux_mb", u, epoch)). mismatch_abort: raise MismatchAbort
+        before any optimizer step when the mean |log pi_old - log pi_behaviour| of vLLM-sampled tokens exceeds it.
+        v17 §3.4 (user 2026-09-30): epochs x min(minibatches, n) optimizer steps (8 with n >= 4 samples); per step the
+        RL gradient of the minibatch plus the aux gradient of that minibatch's share of the supervision (S4: each
+        example once per epoch, normalised by the share's summed gen_len), one clip, one step; an update with
+        supervision only is one step (flag aux_only). -> stats (per-step mean and max of rl_grad_norm, aux_grad_norm,
+        kl and clip_frac; optimizer_steps; aux_p_correct_before measured without grad before step 1)."""
         import torch
+        samples = list(samples or [])
+        aux = list(aux or [])
         if not samples and not aux:
-            return {"n_samples": 0, "n_tokens": 0, "skipped_update": True}
-        if not samples:
-            samples = []
+            return {"n_samples": 0, "n_tokens": 0, "skipped_update": True, "optimizer_steps": 0}
+        if aux and any("gen_len" not in x for x in aux):
+            raise ValueError("aux example without gen_len: cannot normalise like the GRPO loss")
+        n_ep = int(self.acfg["epochs"])
+        k = min(int(self.acfg["minibatches"]), len(samples)) if samples else 1
+        if aux and samples:
+            if aux_orders is None or len(aux_orders) != n_ep:
+                raise ValueError("the stop supervision needs one example order per epoch")
         for g in self.optimizer.param_groups:
             if g["name"] == "policy":
                 g["lr"] = cfg["lr"]
@@ -376,67 +561,51 @@ class TorchLearner:
                 raise MismatchAbort(tot / n)
         _set_mode(self.model, self.acfg["forward_mode"])
         st = {"n_samples": len(samples), "loss": 0.0, "kl": 0.0, "ratio_mean": 0.0, "clip_frac": 0.0,
-              "n_tokens": 0, "grad_norm": [], "value_mse": 0.0, "ratio_init_maxdev": None, "optimizer_steps": 0}
+              "n_tokens": 0, "grad_norm": [], "value_mse": 0.0, "ratio_init_maxdev": None, "optimizer_steps": 0,
+              "n_minibatches": k if samples else 0, "aux_only": bool(aux and not samples)}
         params = [p for g in self.optimizer.param_groups for p in g["params"]]
         tok_seen = 0
-        if aux and any("gen_len" not in x for x in aux):
-            raise ValueError("aux example without gen_len: cannot normalise like the GRPO loss")
+        steps = []
+        if aux:
+            # before step 1, without grad (v17 S4): how often the supervision's values are already the human's
+            _, p_before = value_nll_loss(self.model, [dict(x, weight=1.0) for x in aux], 1, backward=False)
+            st["aux_n"] = len(aux)
+            st["aux_p_correct_before"] = sum(p_before) / len(p_before)
+            st["aux_p_correct_end"] = (sum(p for p, x in zip(p_before, aux) if x["want_end"]) /
+                                       max(1, sum(1 for x in aux if x["want_end"])))
+            st["aux_loss"] = 0.0
 
-        def aux_backward():
-            """Auxiliary stop-token supervision: -w * log p(the human's end_session value | prompt + the policy's
-            own prefix), normalised like the GRPO loss by the GENERATED tokens of the generations the values
-            belong to. Its gradient is ADDED to the current .grad (the RL gradient of the last minibatch), so
-            RL and aux share one clipped optimizer step; its own norm is measured for the controller."""
+        def aux_part(idx):
+            """The aux gradient of these examples ADDED to the current .grad (the step's RL gradient); its own norm."""
+            if not idx:
+                return None
+            ex = [aux[i] for i in idx]
             before = [p.grad.detach().clone() if p.grad is not None else None for p in params]
-            n_t = sum(int(x["gen_len"]) for x in aux)
-            p_before = []
-            for x in aux:
-                lp, _ = token_logprobs(self.model, list(x["prompt_ids"]) + list(x["prefix_ids"]),
-                                       x["target_ids"], 1.0)
-                p_before.append(float(lp.detach().sum().exp()))
-                loss = -float(x["weight"]) * lp.sum() / n_t
-                loss.backward()
-                st["aux_loss"] = st.get("aux_loss", 0.0) + float(loss.detach())
+            loss, _ = value_nll_loss(self.model, ex, sum(int(x["gen_len"]) for x in ex), backward=True)
+            st["aux_loss"] += loss
             sq = 0.0
             for p, b in zip(params, before):
                 if p.grad is not None:
                     d = p.grad.detach().float() - (b.float() if b is not None else 0.0)
                     sq += float((d ** 2).sum())
-            st["aux_grad_norm"] = sq ** 0.5
-            st["aux_n"] = len(aux)
-            st["aux_p_correct_before"] = sum(p_before) / len(p_before)
-            st["aux_p_correct_end"] = (sum(p for p, x in zip(p_before, aux) if x["want_end"]) /
-                                       max(1, sum(1 for x in aux if x["want_end"])))
+            return sq ** 0.5
 
-        n_ep = int(self.acfg["epochs"])
-        for ep in range(n_ep):
-            mbs = list(minibatches(len(samples), int(self.acfg["minibatches"]), seed * 1000 + ep))
+        for ep in (range(n_ep) if samples else ()):
+            mbs = list(minibatches(len(samples), k, seed * 1000 + ep))
+            parts = aux_split(len(aux), aux_orders[ep], k) if aux else [[] for _ in mbs]
             for k_mb, mb in enumerate(mbs):
-                last_mb = ep == n_ep - 1 and k_mb == len(mbs) - 1
                 n_tok = sum(len(samples[i]["gen_ids"]) for i in mb)
                 self.optimizer.zero_grad(set_to_none=True)
-                first = ep == 0 and st["optimizer_steps"] == 0
-                maxdev = 0.0
+                first = st["optimizer_steps"] == 0
+                maxdev, kl_s, clip_s, tok_s = 0.0, 0.0, 0.0, 0
                 for i in mb:
                     s = samples[i]
                     logp, h = self._logp(s, grad=True, hidden=False)
                     old = s["old_logp"].to(logp.device)
                     ref = s["ref_logp"].to(logp.device)
                     ratio = torch.exp(logp - old)
-                    # per-token advantage: the sequence advantage on every token, plus the stop
-                    # advantage on the tokens of the end_session value only (stop credit assignment)
-                    adv = torch.full_like(logp, float(s["adv"]))
-                    if s.get("note_mask") and float(s["adv"]) != 0.0:
-                        # D4: the profile_note tokens carry no sequence advantage (only the KL term)
-                        nm = torch.tensor(s["note_mask"], dtype=logp.dtype, device=logp.device)
-                        if nm.shape != logp.shape:
-                            raise AssertionError("note_mask length %d != %d generated tokens" % (nm.shape[0], logp.shape[0]))
-                        adv = adv * (1.0 - nm)
-                    if s.get("adv_stop") and s.get("stop_mask"):
-                        m = torch.tensor(s["stop_mask"], dtype=logp.dtype, device=logp.device)
-                        if m.shape != logp.shape:
-                            raise AssertionError("stop_mask length %d != %d generated tokens" % (m.shape[0], logp.shape[0]))
-                        adv = adv + float(s["adv_stop"]) * m
+                    # v17 S2: adv*(1-note) + adv_prefix*prefix_mask*(1-note) + adv_stop*stop_mask, per token
+                    adv = torch.tensor(token_advantages(s, int(logp.shape[0])), dtype=logp.dtype, device=logp.device)
                     if clipped:
                         surr = torch.minimum(ratio * adv, torch.clamp(ratio, 1 - eps, 1 + eps) * adv)
                     else:
@@ -467,35 +636,39 @@ class TorchLearner:
                         if first:
                             maxdev = max(maxdev, float((ratio - 1).abs().max()))
                         st["loss"] += float(loss.detach())
-                        st["kl"] += float(kl.sum())
+                        kl_s += float(kl.sum())
                         st["ratio_mean"] += float(ratio.sum())
-                        st["clip_frac"] += float(((ratio - 1).abs() > eps).float().sum())
-                        tok_seen += len(s["gen_ids"])
+                        clip_s += float(((ratio - 1).abs() > eps).float().sum())
+                        tok_s += len(s["gen_ids"])
                 if first:
+                    # ratio_init only at the first step (later steps are off the rollout policy by construction)
                     st["ratio_init_maxdev"] = maxdev
                     if maxdev > self.acfg["ratio_init_tol"]:
                         raise AssertionError("off-policy start: max |ratio-1| = %.3g > %.3g"
                                              % (maxdev, self.acfg["ratio_init_tol"]))
-                if last_mb:
-                    st["rl_grad_norm"] = sum(float((p.grad.detach().float() ** 2).sum())
-                                             for p in params if p.grad is not None) ** 0.5
-                    if aux:
-                        aux_backward()        # same backward pass, same clip, same optimizer step
+                rl_gn = self._grad_sq(params) ** 0.5
+                aux_gn = aux_part(parts[k_mb])            # same backward pass, same clip, same optimizer step
                 gn = torch.nn.utils.clip_grad_norm_(params, self.acfg["max_grad_norm"])
                 st["grad_norm"].append(float(gn))
                 self.optimizer.step()
                 st["optimizer_steps"] += 1
+                st["kl"] += kl_s
+                st["clip_frac"] += clip_s
+                tok_seen += tok_s
+                steps.append({"rl_grad_norm": rl_gn, "aux_grad_norm": aux_gn, "n_aux": len(parts[k_mb]),
+                              "kl": kl_s / max(1, tok_s), "clip_frac": clip_s / max(1, tok_s), "grad_norm": float(gn)})
         self.optimizer.zero_grad(set_to_none=True)
         if aux and not samples:
-            # an update with supervision only (no RL sample survived): one step for the aux loss alone
+            # v17 S3: an update with supervision only (no RL sample survived): ONE step on the whole supervision
             _set_mode(self.model, self.acfg["forward_mode"])
-            st["rl_grad_norm"] = 0.0
-            aux_backward()
+            aux_gn = aux_part(list(range(len(aux))))
             gn = torch.nn.utils.clip_grad_norm_(params, self.acfg["max_grad_norm"])
             st["grad_norm"].append(float(gn))
             self.optimizer.step()
             self.optimizer.zero_grad(set_to_none=True)
             st["optimizer_steps"] += 1
+            steps.append({"rl_grad_norm": 0.0, "aux_grad_norm": aux_gn, "n_aux": len(aux), "kl": 0.0, "clip_frac": 0.0,
+                          "grad_norm": float(gn)})
         self.model.eval()
         n_mb = max(1, st["optimizer_steps"])
         tok_div = max(1, tok_seen)          # 0 only for an aux-only update
@@ -505,23 +678,59 @@ class TorchLearner:
             st["tis_capped_frac"] = st.pop("tis_capped") / n_tis
             st["behav_mismatch_mean"] = st.pop("behav_absdiff_sum") / n_tis     # mean |log pi_old - log pi_vllm|
             st["tis_tokens"] = n_tis // max(1, int(self.acfg["epochs"]))
+        st.update(step_stats(steps))
+        if aux:
+            st["aux_loss"] = st["aux_loss"] / (n_ep if samples else 1)         # per pass over the supervision
         st.update(n_tokens=tok_seen, kl=st["kl"] / tok_div, ratio_mean=st["ratio_mean"] / tok_div,
                   clip_frac=st["clip_frac"] / tok_div, loss=st["loss"] / n_mb,
                   grad_norm=max(st["grad_norm"]) if st["grad_norm"] else 0.0,
                   value_mse=st["value_mse"] / max(1, len(samples) * int(self.acfg["epochs"])) if self.algo == "ppo" else None)
         for s in samples:          # free tensors
-            for k in ("old_logp", "ref_logp", "hidden"):
-                s.pop(k, None)
+            for key in ("old_logp", "ref_logp", "hidden"):
+                s.pop(key, None)
         return st
+
+    # -------------------------------------------------------- SFT warm-up (v17 §1.2)
+    def sft_begin(self, lr):
+        """A separate AdamW for the SFT warm-up (never the GRPO optimizer), weight decay 0 (v17 N3)."""
+        import torch
+        self.sft_opt = torch.optim.AdamW([p for p in self.model.parameters() if p.requires_grad], lr=float(lr),
+                                         weight_decay=0.0)
+
+    def sft_step(self, batch):
+        """One SFT step: value_nll_loss over the batch (normalised by its summed gen_len), clip 1.0, the SFT AdamW
+        step; forward mode train_nodropout (v17 N3). -> {loss, grad_norm, n}."""
+        import torch
+        if self.sft_opt is None:
+            raise AssertionError("sft_begin first")
+        params = [p for p in self.model.parameters() if p.requires_grad]
+        _set_mode(self.model, "train_nodropout")
+        self.sft_opt.zero_grad(set_to_none=True)
+        loss, _ = value_nll_loss(self.model, batch, sum(int(x["gen_len"]) for x in batch), backward=True)
+        gn = torch.nn.utils.clip_grad_norm_(params, 1.0)
+        self.sft_opt.step()
+        self.sft_opt.zero_grad(set_to_none=True)
+        self.model.eval()
+        return {"loss": loss, "grad_norm": float(gn), "n": len(batch)}
+
+    def sft_end(self):
+        self.sft_opt = None
 
     # -------------------------------------------------------- checkpoint
     def save(self, d):
         import os
         import torch
-        self.model.save_pretrained(os.path.join(d, "adapter"))
+        self.save_adapter(d)
         torch.save(self.optimizer.state_dict(), os.path.join(d, "optimizer.pt"))
         if self.value_head is not None:
             torch.save(self.value_head.state_dict(), os.path.join(d, "value_head.pt"))
+
+    def save_adapter(self, d):
+        """The policy adapter only (v17 B4: selected_adapters=["default"] -- the frozen "ref" is never saved)."""
+        import os
+        self.model.save_pretrained(os.path.join(d, "adapter"), selected_adapters=["default"])
+        if os.path.isdir(os.path.join(d, "adapter", REF_ADAPTER)):
+            raise AssertionError("the ref adapter was saved into %s" % d)
 
     def end_prob(self, x):
         """v16 validation Task 1 metric: P(end_session = true) given the prompt and the policy's own greedy prefix
@@ -535,6 +744,12 @@ class TorchLearner:
         m = max(lt, lf)
         return math.exp(lt - m) / (math.exp(lt - m) + math.exp(lf - m))
 
+    def p_end_batch(self, items):
+        """v17 §3.2 / S1: end_prob of each item (prompt_ids, prefix_ids = the sample's OWN prefix, target_true,
+        target_false), no grad, eval mode. -> list of floats in [0, 1]."""
+        self.model.eval()
+        return [self.end_prob(x) for x in items]
+
     def load(self, d):
         import os
         import torch
@@ -545,8 +760,9 @@ class TorchLearner:
         self.optimizer.load_state_dict(torch.load(os.path.join(d, "optimizer.pt"), map_location=dev))
 
     def load_policy(self, d):
-        """The LoRA policy of a checkpoint only (no optimizer: old checkpoints keep only their adapter).
-        Used to evaluate earlier checkpoints (checkpoint re-selection)."""
+        """The LoRA policy ("default" adapter) of a checkpoint only (no optimizer: old checkpoints keep only their
+        adapter). v17: loads the chosen SFT epoch (ckpt/sft_e<k>) before u0 is saved, and u0 / the final update for the
+        test evaluation; the frozen "ref" adapter is never touched."""
         import os
         import torch
         from peft import set_peft_model_state_dict

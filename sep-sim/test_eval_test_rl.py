@@ -1,6 +1,8 @@
-"""Test-split evaluation (eval_test_rl.py) and its check / bootstrap (eval_test_boot.py): gates, no side effect on any run
-file, ids = splits test / test_all, test once, resume after a crash, unclean episodes left out of the paired
-comparison, the checker recomputes and catches tampering (dry-run loop, no GPU)."""
+"""Test-split evaluation (eval_test_rl.py) and its check / bootstrap (eval_test_boot.py), SPEC v17 §5 (user 2026-09-30):
+the updates are exactly {0 = SFT, final.json's final}; gates (final.json, Task 2 validation of both, --final, provenance);
+no side effect on any run file; ids = splits test / test_all; test once; resume after a crash; unclean episodes left out of
+the paired comparison; --include-base (the start policy ckpt/sft_e0 -> test_base.jsonl); the checker recomputes and
+catches tampering (dry-run loop, no GPU)."""
 import hashlib
 import json
 import os
@@ -15,20 +17,18 @@ sys.path.insert(0, HERE)
 import eval_test_rl as E  # noqa: E402
 import train_planner_rl as T  # noqa: E402
 from test_rl_advantages import args, make_splits  # noqa: E402
-from test_reselect import SEEDS  # noqa: E402
 
 TEST = ["--final", "--test-seeds", "0", "1", "2"]
+N_UP = 2
 
 
 def _setup():
     d = tempfile.mkdtemp()
     sp, out = make_splits(d), os.path.join(d, "run")
-    T.main(args(sp, out, controller="llm", updates=4))
-    rec = T.main(args(sp, out, *SEEDS, controller="llm", updates=4))
-    bu = rec["best"]["update"]
-    if bu == 0:
-        pytest.skip("the dry-run re-selection chose u0")
-    return sp, out, sorted({0, bu})
+    T.main(args(sp, out, updates=N_UP))
+    fin = json.load(open(os.path.join(out, "final.json")))
+    assert fin["final_update"] == N_UP and fin["validated"]
+    return sp, out, [0, N_UP]
 
 
 def run_files_sha(out):
@@ -43,8 +43,8 @@ def run_files_sha(out):
     return h.hexdigest()
 
 
-def ev(sp, out, ups):
-    return E.main(TEST + ["--test-updates"] + [str(u) for u in ups] + args(sp, out, controller="llm", updates=4))
+def ev(sp, out, ups, *extra):
+    return E.main(TEST + ["--test-updates"] + [str(u) for u in ups] + list(extra) + args(sp, out, updates=N_UP))
 
 
 def boot(out):
@@ -55,7 +55,7 @@ def test_eval_and_check():
     sp, out, ups = _setup()
     before = run_files_sha(out)
     ev(sp, out, ups)
-    assert run_files_sha(out) == before                   # no run file (training, re-selection, checkpoints) touched
+    assert run_files_sha(out) == before                   # no run file (training, SFT, checkpoints, final.json) touched
     rows = T.read_jsonl(os.path.join(out, "test.jsonl"))
     f0 = json.load(open(sp))["folds"][0]
     summ = {r["update"]: r for r in rows if r["kind"] == "summary"}
@@ -69,9 +69,17 @@ def test_eval_and_check():
         assert s["turn_stats_seeds01"]["n_episodes"] == 2 * len(f0["test"])
     meta = T.read_jsonl(os.path.join(out, "test_meta.jsonl"))[-1]
     assert set(meta["eval_code_sha256"]) == {"eval_test_rl.py", "eval_test_boot.py"}
+    assert meta["final_update"] == N_UP and meta["final_json_sha256"] == T.sha_file(os.path.join(out, "final.json"))
+    assert not os.path.exists(os.path.join(out, "test_base.jsonl"))
     r = boot(out)
     assert r.returncode == 0 and "TEST CHECK PASSED" in r.stdout and "seeds 0/1" in r.stdout \
-        and "Task 1:" in r.stdout and "WARNING" not in r.stdout, r.stdout + r.stderr
+        and "Task 1:" in r.stdout and "WARNING" not in r.stdout and "SFT (u0)" in r.stdout \
+        and "final (GRPO)" in r.stdout, r.stdout + r.stderr
+    # the verifier's v17 test check: the tested updates are exactly {0, final}
+    import verify_pipeline as V
+    rep = V.Report()
+    V.check_v17(out, rep, sp)
+    assert rep.checks["rl.v17_test"]["fail"] == 0 and rep.checks["rl.v17_test"]["n"] == 1
     # test once: a second run evaluates nothing again
     n = len(rows)
     ev(sp, out, ups)
@@ -85,6 +93,25 @@ def test_eval_and_check():
     open(p, "w").write("".join(json.dumps(x) + "\n" for x in rows))
     r = boot(out)
     assert r.returncode == 1 and "bal_p" in r.stdout
+    tm = T.read_jsonl(os.path.join(out, "test_meta.jsonl"))
+    tm[-1]["updates"] = [0, 1]
+    open(os.path.join(out, "test_meta.jsonl"), "w").write("".join(json.dumps(x) + "\n" for x in tm))
+    rep = V.Report()
+    V.check_v17(out, rep, sp)
+    assert rep.checks["rl.v17_test"]["fail"] == 1
+
+
+def test_include_base():
+    sp, out, ups = _setup()
+    ev(sp, out, ups, "--include-base")
+    base = T.read_jsonl(os.path.join(out, "test_base.jsonl"))
+    s = [r for r in base if r["kind"] == "summary"]
+    assert len(s) == 1 and s[0]["update"] == "base"
+    assert s[0]["policy_sha"] == json.load(open(os.path.join(out, "ckpt", "sft_e0", "state.json")))["policy_sha"]
+    assert all(r["update"] == "base" and r["split"] == "test" for r in base)
+    assert T.read_jsonl(os.path.join(out, "test_meta.jsonl"))[-1]["include_base"] is True
+    r = boot(out)
+    assert r.returncode == 0 and "TEST CHECK PASSED" in r.stdout and r.stdout.count("vs base, Task 1") == 2, r.stdout + r.stderr
 
 
 def test_resume_after_crash(monkeypatch):
@@ -137,15 +164,32 @@ def test_unclean_pair_left_out(monkeypatch):
 
 def test_gates():
     sp, out, ups = _setup()
-    base = args(sp, out, controller="llm", updates=4)
+    base = args(sp, out, updates=N_UP)
     with pytest.raises(SystemExit):                                   # no --final
         E.main(["--test-seeds", "0", "--test-updates"] + [str(u) for u in ups] + base)
-    with pytest.raises(SystemExit):                                   # not the re-selected checkpoint
-        E.main(TEST + ["--test-updates", "0", "3"] + base)
+    with pytest.raises(SystemExit):                                   # not the final update of final.json
+        E.main(TEST + ["--test-updates", "0", "1"] + base)
     with pytest.raises(SystemExit):                                   # changed training argument (provenance)
         E.main(TEST + ["--test-updates"] + [str(u) for u in ups] + base + ["--seed", "7"])
-    with pytest.raises(SystemExit):                                   # re-selection flags are not accepted
-        E.main(TEST + ["--test-updates"] + [str(u) for u in ups] + base + ["--reselect-seeds", "0"])
+    with pytest.raises(SystemExit):                                   # --resume is not accepted
+        E.main(TEST + ["--test-updates"] + [str(u) for u in ups] + base + ["--resume"])
+    assert not os.path.exists(os.path.join(out, "test.jsonl"))
+
+
+def test_final_needs_a_task2_validation():
+    """S6 / S13: a Task-1-only summary of the final update does not satisfy the final validation."""
+    sp, out, ups = _setup()
+    p = os.path.join(out, "validation.jsonl")
+    rows = T.read_jsonl(p)
+    kept = [r for r in rows if not (r["kind"] == "summary" and r["update"] == N_UP and r["task2"])]
+    open(p, "w").write("".join(json.dumps(x) + "\n" for x in kept))
+    base = args(sp, out, updates=N_UP)
+    with pytest.raises(SystemExit):
+        E.main(TEST + ["--test-updates"] + [str(u) for u in ups] + base)
+    # an unfinished run (no final.json) is refused too
+    os.remove(os.path.join(out, "final.json"))
+    with pytest.raises(SystemExit):
+        E.main(TEST + ["--test-updates"] + [str(u) for u in ups] + base)
     assert not os.path.exists(os.path.join(out, "test.jsonl"))
 
 
@@ -155,6 +199,6 @@ def test_test_ids_must_be_forbidden():
     s = json.load(open(sp))
     s["folds"][0]["test_all"] = s["folds"][0]["test_all"] + [s["folds"][0]["train"][0]]   # a training id in test_all
     json.dump(s, open(sp, "w"))
-    a = T.parse_args(args(sp, os.path.join(d, "run"), controller="llm", updates=4))
+    a = T.parse_args(args(sp, os.path.join(d, "run"), updates=N_UP))
     with pytest.raises(AssertionError):
         E.test_ids(a, T.load_split(sp, 0))

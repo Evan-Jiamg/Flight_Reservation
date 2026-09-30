@@ -72,7 +72,10 @@ def task1_prob_metrics(points):
     carries p_end 0: the benchmark reads an unparsed plan as "not ending").
       bal_p   = 1/2 mean_{final} p_end + 1/2 mean_{earlier} (1 - p_end)   (earlier part dropped when absent)
       auc     = P(p_end at a final point > p_end at an earlier point), ties 1/2 (None without both kinds)
-      logloss = mean -log p(true label), p clipped to [1e-6, 1 - 1e-6]"""
+      nll     = mean -log p(true label) over the VALID points only (v17 B5, user 2026-09-30: an unparsed / capped
+                plan or one whose value tokens could not be located has no probability to score; they are counted in
+                n_invalid), p clipped to [1e-6, 1 - 1e-6]; None without a valid point
+      logloss = nll (the v16 name, kept as an alias with the same value)"""
     import math
     if not points:
         raise ValueError("no decision points")
@@ -89,9 +92,11 @@ def task1_prob_metrics(points):
         pairs = [(1.0 if a > b else 0.5 if a == b else 0.0) for a in fin for b in mid]
         auc = sum(pairs) / len(pairs)
     eps = 1e-6
-    ll = [-math.log(min(1 - eps, max(eps, p))) for p in fin] + [-math.log(min(1 - eps, max(eps, 1 - p))) for p in mid]
-    return {"bal_p": bal, "auc": auc, "logloss": sum(ll) / len(ll), "n_points": len(points), "n_final": len(fin),
-            "n_invalid": sum(1 for x in points if not x.get("valid", True))}
+    ll = [-math.log(min(1 - eps, max(eps, float(x["p_end"]) if x["real_final"] else 1 - float(x["p_end"]))))
+          for x in points if x.get("valid", True)]
+    nll = sum(ll) / len(ll) if ll else None
+    return {"bal_p": bal, "auc": auc, "nll": nll, "logloss": nll, "n_points": len(points), "n_final": len(fin),
+            "n_valid": len(ll), "n_invalid": sum(1 for x in points if not x.get("valid", True))}
 
 
 def within_tolerance(metrics, base, tol):

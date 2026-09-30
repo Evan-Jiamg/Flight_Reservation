@@ -1,0 +1,1 @@
+{"bounds": {"lambda_hit_max_new": [0.1, 5.0], "lambda_unparsed": [0.1, 5.0], "w_aux": [0.01, 5.0], "w_cov": [0.1, 5.0], "w_dist": [1.0, 5.0]}, "cfg_after": {"lambda_hit_max_new": 1.0, "lambda_unparsed": 1.0, "w_aux": 1.0, "w_cov": 1.0, "w_dist": 1.0}, "human_intervention": {"w_dist": 1.0}, "ok": true, "reason": "test", "time": 1790765555.5637505, "update": 3}

@@ -1,6 +1,6 @@
-"""Pure-python tests: advantage math (rl_algos) and the --dry-run full loop of train_planner_rl
-(fake env + pure-python learner): checkpoint every update, resume (also after a crash in the middle of an
-update's rollouts), on-policy versions, train-only rollouts, validation-only best selection, leak gates.
+"""Pure-python tests: advantage math (rl_algos) and the --dry-run full loop of train_planner_rl (SPEC v17; fake env +
+pure-python learner): SFT stage, checkpoint every update, resume (also after a crash in the middle of an update's
+rollouts), on-policy versions, train-only rollouts, the v17 validation schedule and final.json, leak gates.
 Run: python test_rl_advantages.py"""
 import json
 import math
@@ -29,12 +29,7 @@ def test_group_advantages():
     assert close(a[0], 1.0 / (1.0 + 1e-6)) and close(sum(a), 0.0)
     assert RA.group_advantages([0.7, 0.7, 0.7]) is None                    # zero spread -> skipped
     assert RA.group_advantages([0.7, 0.7 + 1e-12], min_std=1e-8) is None
-    try:
-        RA.group_advantages([1.0])
-    except ValueError:
-        pass
-    else:
-        raise AssertionError
+    assert RA.group_advantages([1.0]) is None                              # v17 B7: < 2 members -> skipped
 
 
 def test_split_advantages_keep_weights():
@@ -68,6 +63,9 @@ def test_groups_and_skip_count():
     cfg = RA.algo_cfg()
     advs, skipped = RA.advantages_for_groups([[1, 0], [0.5, 0.5], [0, 0, 1]], "grpo", cfg)
     assert skipped == 1 and advs[1] is None and len(advs[2]) == 3
+    # v17 B7: a group with fewer than 2 members is skipped but not counted as zero-spread (the caller counts it)
+    advs, skipped = RA.advantages_for_groups([[1.0], [1, 0]], "grpo", cfg)
+    assert advs[0] is None and advs[1] == [0.5, -0.5] and skipped == 0
     advs, skipped = RA.advantages_for_groups([[1, 1], [0, 1]], "rloo", cfg)
     assert skipped == 1 and advs[1] == [-1.0, 1.0]
 
@@ -108,23 +106,26 @@ def test_algo_cfg_bounds():
     assert RA.LORA["lora_dropout"] == 0.0 and RA.LORA["r"] == 16 and RA.LORA["lora_alpha"] == 32
 
 
-# ------------------------------------------------------------------ dry-run full loop
+# ------------------------------------------------------------------ dry-run full loop (v17)
 IDS = ["c%02d" % i for i in range(30)]
 
 
 def make_splits(d):
+    # v17: validation_all (Task 1 validation) holds one more session than validation (Task 2)
     s = {"folds": [{"fold": 0, "train": IDS[:14], "validation": IDS[14:15], "test": IDS[15:24],
-                    "train_all": IDS[:14] + ["x_noshard"], "validation_all": IDS[14:15], "test_all": IDS[15:24],
-                    "forbidden_for_training": IDS[14:24]}]}
+                    "train_all": IDS[:14] + ["x_noshard"], "validation_all": IDS[14:15] + IDS[24:25],
+                    "test_all": IDS[15:24], "forbidden_for_training": IDS[14:25]}]}
     p = os.path.join(d, "splits.json")
     json.dump(s, open(p, "w"))
     return p
 
 
-def args(splits, out, *extra, controller="dual", updates=5):
+def args(splits, out, *extra, controller="fixed", updates=5, margin=100.0):
+    """v17 dry-run arguments: 3 scenarios per update; the fake episodes are shorter than the fake people, so the
+    length-drift stop is moved out of the way (--length-drift-margin 100) unless a test sets it."""
     return ["--dry-run", "--fold", "0", "--splits", splits, "--out", out, "--updates", str(updates),
-            "--G", "4", "--scenarios-per-update", "3", "--val-every", "2", "--val-seeds", "0", "1",
-            "--controller", controller] + (["--ablation", "test-" + controller] if controller != "llm" else []) + list(extra)
+            "--G", "4", "--scenarios-per-update", "3", "--length-drift-margin", str(margin),
+            "--controller", controller, "--ablation", "test"] + list(extra)
 
 
 def strip(rows):
@@ -150,6 +151,8 @@ def run_crash(argv):
 
 
 def check_outputs(out, splits_p, n_updates):
+    """v17 layout: SFT stage, updates 1..n, validation u0 + final with Task 2 (validation x seeds 0..7), u1..u(n-1)
+    Task 1 only on validation_all; final.json; no best.json."""
     sp = json.load(open(splits_p))["folds"][0]
     train, forb = set(sp["train"]), set(sp["forbidden_for_training"])
     rolls = T.read_jsonl(os.path.join(out, "rollouts.jsonl"))
@@ -168,23 +171,18 @@ def check_outputs(out, splits_p, n_updates):
     for u in range(0, n_updates + 1):
         assert os.path.exists(os.path.join(out, "ckpt", "u%05d" % u, "state.json")), u
     val = T.read_jsonl(os.path.join(out, "validation.jsonl"))
-    assert val and all(v["split"] == "validation" and v["conversation_id"] in sp["validation"]
-                       for v in val if v["kind"] == "episode")
-    summ = [v["update"] for v in val if v["kind"] == "summary"]
-    assert summ == [u for u in range(0, n_updates + 1) if u % 2 == 0], summ
-    best = json.load(open(os.path.join(out, "best.json")))
-    summ = [v for v in val if v["kind"] == "summary"]
-    vs = {v["update"]: v["selection_score"] for v in summ if v["selection_score"] is not None}
-    # selection = w_sel_cov*coverage - w_sel_w1*W1 + w_sel_task1*bal_p (v16), recomputed from the logged parts
-    for v in summ:
-        assert v["selection_task1_metric"] == "bal_p"
-        if v["selection_score"] is not None:
-            t1 = v["task1"]["bal_p"] if v["task1"] else 0.0
-            want = (v["w_sel_cov"] * v["turn_stats"]["coverage_mean"] - v["w_sel_w1"] * v["turn_stats"]["turn_w1"]
-                    + v["w_sel_task1"] * t1)
-            assert abs(v["selection_score"] - want) < 1e-9
-    assert all(v["task1"] is not None for v in summ)               # Task 1 validation always runs (D2 / selection)
-    assert best["selection_score"] == max(vs.values()) and best["update"] in vs
+    assert all(v["split"] == "validation" and v["conversation_id"] in sp["validation"] for v in val if v["kind"] == "episode")
+    assert all(v["conversation_id"] in sp["validation_all"] for v in val if v["kind"] == "task1")
+    summ = [(v["update"], v["task2"]) for v in val if v["kind"] == "summary"]
+    assert summ == [(0, True)] + [(u, False) for u in range(1, n_updates)] + [(n_updates, True)], summ
+    assert {v["update"] for v in val if v["kind"] == "episode"} == {0, n_updates}
+    for v in val:
+        if v["kind"] == "summary":
+            assert v["task1_ids"] == sorted(sp["validation_all"]) and v["task1"]["nll"] is not None
+            assert v["val_seeds"] == (list(range(8)) if v["task2"] else [])
+    assert not os.path.exists(os.path.join(out, "best.json"))
+    fin = json.load(open(os.path.join(out, "final.json")))
+    assert fin["final_update"] == n_updates and fin["validated"] and fin["stop_reason"] == "max_updates"
     # no validation id ever reached the controller history
     st = json.load(open(os.path.join(out, "ckpt", "u%05d" % n_updates, "state.json")))
     for h in st["history"]:
@@ -193,26 +191,30 @@ def check_outputs(out, splits_p, n_updates):
 
 
 def test_dry_run_resume_equals_uninterrupted():
-    for algo in ("grpo",):
-        d = tempfile.mkdtemp()
-        try:
-            sp = make_splits(d)
-            full, part = os.path.join(d, "full"), os.path.join(d, "part")
-            run_ok(args(sp, full, "--algo", algo))
-            u_full, r_full, v_full = check_outputs(full, sp, 5)
-            run_ok(args(sp, part, "--algo", algo, updates=3))
-            run_ok(args(sp, part, "--algo", algo, "--resume"))
-            u_part, r_part, v_part = check_outputs(part, sp, 5)
-            assert strip(u_full) == strip(u_part), "resume diverged from the uninterrupted run"
-            assert strip(r_full) == strip(r_part)
-            assert json.load(open(os.path.join(full, "best.json"))) == json.load(open(os.path.join(part, "best.json")))
-            meta = T.read_jsonl(os.path.join(part, "run_meta.jsonl"))
-            assert [m["kind"] for m in meta] == ["start", "resume"]
-            assert all(len(v) == 64 for v in meta[0]["code_sha256"].values()) and meta[0]["splits_sha256"]
-            # the policy actually moved
-            assert u_full[-1]["policy_sha_after"] != T.read_jsonl(os.path.join(full, "rollouts.jsonl"))[0]["policy_sha"]
-        finally:
-            shutil.rmtree(d, ignore_errors=True)
+    d = tempfile.mkdtemp()
+    try:
+        sp = make_splits(d)
+        full, part = os.path.join(d, "full"), os.path.join(d, "part")
+        run_ok(args(sp, full))
+        u_full, r_full, v_full = check_outputs(full, sp, 5)
+        # crash after 30 new episodes (update 3 in progress), then resume (v17 B2: --updates cannot change)
+        assert "simulated crash" in run_crash(args(sp, part, "--dry-run-crash-after-episodes", "30"))
+        run_ok(args(sp, part, "--resume"))
+        u_part, r_part, v_part = check_outputs(part, sp, 5)
+        assert strip(u_full) == strip(u_part), "resume diverged from the uninterrupted run"
+        assert sorted(json.dumps(x, sort_keys=True) for x in strip(r_full)) == \
+            sorted(json.dumps(x, sort_keys=True) for x in strip(r_part))
+        for f in ("final.json", "sft_examples_meta.json"):
+            a_, b_ = json.load(open(os.path.join(full, f))), json.load(open(os.path.join(part, f)))
+            assert strip([a_]) == strip([b_]), f
+        meta = T.read_jsonl(os.path.join(part, "run_meta.jsonl"))
+        assert [m["kind"] for m in meta] == ["start", "sft", "resume", "stop"]
+        assert all(len(v) == 64 for v in meta[0]["code_sha256"].values()) and meta[0]["splits_sha256"]
+        assert all(m["spec_version"] == "v17" for m in meta)
+        # the policy actually moved
+        assert u_full[-1]["policy_sha_after"] != T.read_jsonl(os.path.join(full, "rollouts.jsonl"))[0]["policy_sha"]
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
 
 
 def test_dry_run_crash_mid_rollouts_then_resume():
@@ -240,15 +242,17 @@ def test_dry_run_fixed_and_llm_controllers_run():
     try:
         sp = make_splits(d)
         o1 = os.path.join(d, "fixed")
-        run_ok(args(sp, o1, controller="fixed", updates=2))
+        run_ok(args(sp, o1, updates=2))
         upd = T.read_jsonl(os.path.join(o1, "updates.jsonl"))
-        assert upd[0]["cfg_used"] == upd[1]["cfg_used"]                     # fixed: nothing moves
+        assert upd[0]["cfg_used"] == upd[1]["cfg_used"]                     # fixed: nothing moves (v17 spec)
         o2 = os.path.join(d, "llm")
-        run_ok(args(sp, o2, controller="llm", updates=5))
+        run_ok(args(sp, o2, controller="llm", updates=5))                     # an ablation in v17
         # v4 reward -> the factor controller: one decision every 5 updates, factors from the allowed set
         log = T.read_jsonl(os.path.join(o2, "llm_controller.jsonl"))
         assert len(log) == 1 and log[0]["ok"] and log[0]["changed"]
         assert all(v["factor"] == 1.25 for v in log[0]["applied"].values())
+        sysmsg = log[0]["request"]["messages"][0]["content"]
+        assert "split across the minibatches" in sysmsg and "floor" not in sysmsg and "share one optimizer step" not in sysmsg
     finally:
         shutil.rmtree(d, ignore_errors=True)
 
@@ -259,7 +263,11 @@ def test_refuses_existing_out_without_resume_and_leaks():
         sp = make_splits(d)
         o = os.path.join(d, "o")
         run_ok(args(sp, o, updates=1))
-        msg = run_crash(args(sp, o, updates=2))
+        msg = run_crash(args(sp, o, updates=1))
+        assert "finished" in msg                                                # v17 B2: a finished run never trains again
+        o2 = os.path.join(d, "o2")
+        run_crash(args(sp, o2, "--dry-run-crash-after-episodes", "5", updates=2))
+        msg = run_crash(args(sp, o2, updates=2))
         assert "--resume" in msg
         # leak: a split whose train list contains a forbidden id
         bad = json.load(open(sp))

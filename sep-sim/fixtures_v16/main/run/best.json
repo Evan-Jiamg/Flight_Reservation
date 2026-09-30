@@ -1,0 +1,8 @@
+{
+ "checkpoint": "ckpt/u00004",
+ "mean_reward_selection": -0.08157540490284054,
+ "policy_sha": "ffd20de4c198a13e9d034e0cb7718559d179aecc1ab0d39b066d0a76c4a2fc56",
+ "selection_cfg_sha256": "59fac750072e08a8ed01d3de77770828aadc83a23d1f57d7f7f7543602acbd35",
+ "selection_score": -4.295311315837811,
+ "update": 4
+}

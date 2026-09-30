@@ -371,6 +371,8 @@ class RLRuns(Base):
                     with open(os.path.join(d, "rl_manifest.json"), "w") as f:
                         json.dump({"train_scenarios": ["tr1", "tr2"], "train_conversations": ["tr1", "tr2"],
                                    "fewshot_pool": []}, f)
+        # a pre-v17 layout (no config.spec_version): the v16 branch, which still requires best.json and the D5 seeds
+        # (SPEC v17 B8: archived v16 / v11 runs keep verifying)
         self.write("rl/validation.jsonl", [{"kind": "summary", "update": 1, "split": "validation", "val_temperature": 0.7,
                                             "val_seeds": [0, 1], "selection_score": None}], jsonl=True)
         self.write("rl/best.json", {"update": 1})
@@ -441,10 +443,31 @@ class RLRuns(Base):
         self.assertEqual((rc, rep.status("leak.validation_ids"), rep.status("leak.manifest")), (1, "FAIL", "FAIL"), out)
 
     def test_rl_missing_best(self):
+        """v16 branch (pinned: a run without spec_version): best.json is required."""
         rl = self.make_rl()
+        self.assertNotEqual(V.spec_version(rl), "v17")
         os.remove(os.path.join(rl, "best.json"))
         rc, rep, out = self.run_rl(rl)
         self.assertEqual((rc, rep.status("rl.best")), (1, "FAIL"), out)
+
+    def test_v17_branch_has_no_best(self):
+        """SPEC v17 B8: a run whose run_meta says spec_version v17 takes the v17 branch: no best.json (a stale one
+        FAILs), Task 1 validation rows on validation_all, and the v16 checks are not run."""
+        rl = self.make_rl()
+        meta = [dict(run_meta_row(), config=dict(run_meta_row()["config"], spec_version="v17", args={"fold": 0}))]
+        self.write("rl/run_meta.jsonl", meta, jsonl=True)
+        self.assertEqual(V.spec_version(rl), "v17")
+        rep = V.Report()
+        V.check_rl_selection(rl, json.load(open(self.splits)), 0, rep)
+        self.assertEqual(rep.status("rl.best"), "FAIL")                 # best.json exists: not a v17 artifact
+        os.remove(os.path.join(rl, "best.json"))
+        rep = V.Report()
+        V.check_rl_selection(rl, json.load(open(self.splits)), 0, rep)
+        self.assertEqual(rep.status("rl.best"), "PASS")
+        rep = V.Report()
+        V.check_rl(rl, [], "ckpt/u{update:05d}", rep, self.splits)
+        self.assertNotIn("rl.task1_refill", rep.checks)                 # the v16 checks did not run
+        self.assertIn("rl.v17_settings", rep.checks)
 
     def test_rl_missing_checkpoint(self):
         rl = self.make_rl()

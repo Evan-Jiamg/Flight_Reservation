@@ -1,0 +1,27 @@
+{
+ "best": {
+  "checkpoint": "ckpt/u00004",
+  "policy_sha": "ffd20de4c198a13e9d034e0cb7718559d179aecc1ab0d39b066d0a76c4a2fc56",
+  "selection_score": -4.045311315837811,
+  "update": 4
+ },
+ "candidates": {
+  "0": -4.091212761903178,
+  "2": -4.073377135189226,
+  "4": -4.045311315837811
+ },
+ "seeds": [
+  0,
+  1,
+  2,
+  3,
+  4,
+  5,
+  6,
+  7
+ ],
+ "selection_cfg_sha256": "59fac750072e08a8ed01d3de77770828aadc83a23d1f57d7f7f7543602acbd35",
+ "selection_formula": "w_sel_cov*coverage_mean - w_sel_w1*turn_w1 + w_sel_task1*task1.bal_p",
+ "time": 1790765549.4375422,
+ "withheld": []
+}

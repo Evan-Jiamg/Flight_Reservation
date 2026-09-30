@@ -1,16 +1,19 @@
-"""Test-split evaluation of a finished pend GRPO run (user 2026-09-28: "先測 u5" / "u5 和 u0，u10 先不要", 8 seeds):
-the re-selected checkpoint (reselect_best.json) and the untrained policy u0, on splits[fold].test (Task 2, the ids with
+"""Test-split evaluation of a finished pend run, SPEC v17 §5 (user 2026-09-30): exactly SFT (u0) and the final update
+(final.json: the last completed GRPO update, max_updates or length_drift) on splits[fold].test (Task 2, the ids with
 requirement shards) and splits[fold].test_all (Task 1, as the benchmark / task1_v4.py), with exactly the validation
 procedure of train_planner_rl.validate(): Task 2 = sampled Planner (--val-temperature, one replicate per seed, an
 unclean episode re-run up to VAL_RETRIES times), Task 1 = greedy run + teacher-forced end probabilities
 (Trainer.task1_eval_row). Writes RUN/test.jsonl (episode / task1 / summary rows, split "test") and RUN/test_meta.jsonl;
-never writes a training file (checkpoints, validation.jsonl, best.json, reselect*).
+never writes a training file (checkpoints, validation.jsonl, final.json, sft*).
+--include-base (v17 B6, folds 0 / 1): also the untrained start policy "base" (ckpt/sft_e0, served as sft_e0-<sha>) with
+the same procedure -> RUN/test_base.jsonl (fold 2's base numbers already exist: the v16 run's u0 test rows).
 
-Gates: --final; the trainer arguments are the run's own (check_provenance: same code, splits, arguments); the updates are
-exactly {0, re-selected best}; every test id is in forbidden_for_training and in no training / validation / few-shot /
-p_h list; an update whose test summary exists is never evaluated again (test once), an unfinished one is resumed.
+Gates: --final; the trainer arguments are the run's own (check_provenance: same code, splits, arguments); final.json is
+validated and the updates are exactly {0, final}, both with a validation summary that includes Task 2 (S13); every test id
+is in forbidden_for_training and in no training / validation / few-shot / p_h list; an update whose test summary exists is
+never evaluated again (test once), an unfinished one is resumed.
 
-Usage: python eval_test_rl.py --final --test-seeds 0 1 2 3 4 5 6 7 --test-updates 0 5  <the trainer arguments of the run>
+Usage: python eval_test_rl.py --final --test-seeds 0 1 2 3 4 5 6 7 --test-updates 0 5 [--include-base] <the trainer arguments>
 """
 import argparse
 import json
@@ -30,12 +33,14 @@ def parse(argv=None):
     ap.add_argument("--final", action="store_true", help="required: this reads the test split")
     ap.add_argument("--test-seeds", type=int, nargs="+", required=True)
     ap.add_argument("--test-updates", type=int, nargs="+", required=True)
+    ap.add_argument("--include-base", action="store_true",
+                    help="v17 B6: also evaluate the untrained start policy (ckpt/sft_e0) -> test_base.jsonl")
     own, rest = ap.parse_known_args(argv)
     if not own.final:
         ap.error("the test split is read only with --final")
     a = TP.parse_args(rest)
-    if a.reselect_seeds or a.resume:
-        ap.error("pass the trainer arguments without --reselect-* / --resume")
+    if a.resume:
+        ap.error("pass the trainer arguments without --resume")
     return own, a
 
 
@@ -84,25 +89,29 @@ def summarize(tr, u, psha, seeds, vrows, t1rows, t0):
             "task2_ids": sorted({r["conversation_id"] for r in vrows}),
             "task1_ids": sorted(r["conversation_id"] for r in t1rows),
             "turn_stats": turn_stats(vrows),
-            # the spec's D5 seeds (0 and 1) alone: comparable with a two-seed evaluation
+            # the seeds 0/1 subset alone: comparable with a two-seed evaluation
             "turn_stats_seeds01": turn_stats([r for r in vrows if r["seed"] in (0, 1)]),
             "task1": t1, "test_s": round(time.time() - t0, 1), "time": time.time()}
 
 
 def evaluate(tr, u, seeds, test, test_all, p_out):
+    """u: an update (int) -> ckpt/u<u>; "base" -> the start policy ckpt/sft_e0 (v17 B6)."""
     t0 = time.time()
     prev = TP.read_jsonl(p_out)
     for r in prev:
         if r.get("kind") == "summary" and r["update"] == u:
-            print("u%d: test summary exists - not evaluated again" % u, flush=True)
+            print("u%s: test summary exists - not evaluated again" % u, flush=True)
             return r
-    d = tr.ckpt_dir(u)
+    d = tr.sft_dir(0) if u == "base" else tr.ckpt_dir(u)
     cst = json.load(open(os.path.join(d, "state.json")))
     tr.learner.load_policy(d)
     psha = tr.learner.policy_sha()
     if psha != cst["policy_sha"]:
-        raise AssertionError("checkpoint u%d: loaded policy sha differs from its record" % u)
-    tr.sync_generation_policy(u)            # vLLM generates with this checkpoint's adapter (name p<u>-<sha>)
+        raise AssertionError("checkpoint %s: loaded policy sha differs from its record" % d)
+    if u == "base":
+        tr.sync_generation_policy(path=os.path.join(d, "adapter"), tag="sft_e0")
+    else:
+        tr.sync_generation_policy(u)        # vLLM generates with this checkpoint's adapter (name p<u>-<sha>)
     a = tr.a
     done = {(r["conversation_id"], r["seed"]): r for r in prev if r.get("kind") == "episode" and r["update"] == u}
     done_t1 = {r["conversation_id"]: r for r in prev if r.get("kind") == "task1" and r["update"] == u}
@@ -145,15 +154,20 @@ def evaluate(tr, u, seeds, test, test_all, p_out):
 
 def main(argv=None):
     own, a = parse(argv)
-    best = json.load(open(os.path.join(a.out, "reselect_best.json")))
-    bu = (best.get("best") or {}).get("update")
-    if bu is None:
-        raise SystemExit("reselect_best.json has no re-selected checkpoint")
+    fp = os.path.join(a.out, "final.json")
+    if not os.path.exists(fp):
+        raise SystemExit("%s has no final.json: the run is not finished" % a.out)
+    fin = json.load(open(fp, encoding="utf-8"))
+    bu = fin.get("final_update")
+    if bu is None or not fin.get("validated"):
+        raise SystemExit("final.json has no validated final update: %r" % fin)
     if sorted(set(own.test_updates)) != sorted({0, bu}) or len(own.test_updates) != len(set(own.test_updates)):
-        raise SystemExit("--test-updates must be exactly u0 and the re-selected u%d, got %s" % (bu, own.test_updates))
-    validated = {r["update"] for r in TP.read_jsonl(os.path.join(a.out, "validation.jsonl")) if r.get("kind") == "summary"}
+        raise SystemExit("--test-updates must be exactly u0 (SFT) and the final u%d, got %s" % (bu, own.test_updates))
+    # S13: both need a validation summary that INCLUDES Task 2 (a Task-1-only summary does not count)
+    validated = {r["update"] for r in TP.read_jsonl(os.path.join(a.out, "validation.jsonl"))
+                 if r.get("kind") == "summary" and r.get("task2")}
     if set(own.test_updates) - validated:
-        raise SystemExit("updates %s were never validated" % sorted(set(own.test_updates) - validated))
+        raise SystemExit("updates %s have no validation with Task 2" % sorted(set(own.test_updates) - validated))
     if not TP.read_jsonl(os.path.join(a.out, "run_meta.jsonl")):
         raise SystemExit("%s has no run_meta.jsonl: provenance cannot be checked" % a.out)
     tr = TP.Trainer(a)
@@ -167,19 +181,25 @@ def main(argv=None):
     tr.update_done = json.load(open(os.path.join(tr.ckpt_root, "LATEST.json")))["update"]
     row = tr.meta("test")
     tr.check_provenance(row)                # same code, splits and arguments as the training run
+    if own.include_base:
+        b0 = json.load(open(os.path.join(tr.sft_dir(0), "state.json")))
+        assert b0["epoch"] == 0, "ckpt/sft_e0 is not the start policy"
     TP.append_jsonl(os.path.join(a.out, "test_meta.jsonl"),
                     {**row, "final": True, "updates": list(own.test_updates), "seeds": list(own.test_seeds),
-                     "reselect_best_sha256": TP.sha_file(os.path.join(a.out, "reselect_best.json")),
-                     "reselect_best_update": bu, "task2_ids": test, "task1_ids": test_all, "argv": sys.argv,
+                     "final_json_sha256": TP.sha_file(fp), "final_update": bu, "stop_reason": fin.get("stop_reason"),
+                     "include_base": bool(own.include_base), "task2_ids": test, "task1_ids": test_all, "argv": sys.argv,
                      "eval_code_sha256": {f: TP.sha_file(os.path.join(HERE, f)) for f in ("eval_test_rl.py", "eval_test_boot.py")}})
     p_out = os.path.join(a.out, "test.jsonl")
-    for u in own.test_updates:
-        s = evaluate(tr, u, own.test_seeds, test, test_all, p_out)
+    jobs = [(u, p_out) for u in own.test_updates] + ([("base", os.path.join(a.out, "test_base.jsonl"))]
+                                                     if own.include_base else [])
+    for u, p in jobs:
+        s = evaluate(tr, u, own.test_seeds, test, test_all, p)
         ts, t1 = s["turn_stats"] or {}, s["task1"] or {}
         print(json.dumps({"test_update": u, "n_episodes": s["n_episodes"], "unclean": s["n_unclean_episodes"],
                           "sim_turns": ts.get("sim_turns_mean"), "human_turns": ts.get("human_turns_mean"),
                           "turn_w1": ts.get("turn_w1"), "coverage": ts.get("coverage_mean"),
-                          "term_f1": t1.get("term_f1"), "bal_p": t1.get("bal_p"), "auc": t1.get("auc")}), flush=True)
+                          "term_f1": t1.get("term_f1"), "bal_p": t1.get("bal_p"), "auc": t1.get("auc"),
+                          "nll": t1.get("nll")}), flush=True)
 
 
 if __name__ == "__main__":

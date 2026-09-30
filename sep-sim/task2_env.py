@@ -766,6 +766,13 @@ class Task2Env:
                 "implicit_profile": self.ip, "fewshot": self.fewshot.describe() if self.fewshot else None,
                 "selector": self.selector, "speaker_max_new": self.speaker.max_new, "planner_max_new": self.planner.max_new,
                 "judge_cache_dir": getattr(self, "judge_cache_dir", None), "task1_only": self.task1_only,
+                # v17 S12: the Speaker is Ditto-8B, which has NO conversation-end token (endconv None): a session ends
+                # only by the Planner's end_session or a blank selected message; the Ditto guardrail redraws a blank
+                # (up to 6 times) and the selector prefers non-blank candidates, so in practice the end comes from
+                # planner_end or t_max. No UserLM end-token mechanism applies.
+                "speaker_path": getattr(self.speaker, "path", None),
+                "speaker_class": [c.__module__ + "." + c.__name__ for c in type(self.speaker).__mro__],
+                "speaker_endconv_is_none": getattr(self.speaker, "endconv", "missing") is None,
                 "endpoint_bypass": os.environ.get("PEND_ALLOW_OTHER_ENDPOINTS") == "1",
                 "batching": None if self.planner_batcher is None else {
                     "planner": self.planner_batcher.max_batch, "speaker": self.speaker_batcher.max_batch}}
@@ -1281,10 +1288,12 @@ class Task2Env:
 
     def task1_sample(self, conversation_id, t, user_prompt, real_final, G, temperature, top_p, seed):
         """G sampled Planner decisions at one real turn t >= 2 (turn 1 cannot end, so it teaches nothing about
-        stopping); reward 1 if end_session == (message t was the person's last), else 0. A sample whose plan
-        was not parsed, was cut by the token cap, or has no valid end_session value is not a decision: reward
-        0, no stop mask (so no stop credit), never used as the supervision example. Returned in the rollout
-        schema (one step with planner_gen each)."""
+        stopping); "correct" 1 if end_session == (message t was the person's last), else 0 (v17: logged only; the
+        trainer's reward is the Brier score of the learner's P(end) on the sample's own prefix). A sample whose plan
+        was not parsed, was cut by the token cap, or has no valid end_session value is not a decision: correct 0,
+        no stop mask (so no stop credit), never used as the supervision example. A valid sample with a located
+        value carries mask_ok, prefix_ids, target_true and target_false (v17 S1). Returned in the rollout schema
+        (one step with planner_gen each)."""
         if self.arm != "pend":
             raise ValueError("task1_sample is implemented for the pend arm")
         if t < 2:
@@ -1312,10 +1321,22 @@ class Task2Env:
             # whether the stop mask could be located; without a mask the sample just gets no stop credit)
             valid = (not unparsed and not gen["hit_max_new"] and (diag or {}).get("end_session_valid") is True
                      and not (diag or {}).get("end_session_t1_ignored"))
+            # v17 S1 (user 2026-09-30): a valid sample with a located value carries its OWN prefix and the value
+            # re-encoded as true and as false, so the learner can score P(end) on it (the Brier reward); a value
+            # that cannot be re-encoded both ways with the same prefix counts as "mask not found" (mask_ok False)
+            tt = tf = None
+            if valid and sm is not None:
+                tt = self.planner.stop_target(gen["gen_ids"], sm, True)
+                tf = self.planner.stop_target(gen["gen_ids"], sm, False)
+            mask_ok = bool(tt is not None and tf is not None and tt["prefix_ids"] == tf["prefix_ids"])
             out.append({"t": t, "replicate": g, "real_final": bool(real_final), "ended_planner": bool(end),
                         "planner_unparsed": unparsed, "planner_hit_max_new": gen["hit_max_new"],
                         "decision_valid": valid, "planner_diag": diag, "planner_fit": gen.get("fit"),
-                        "reward": float(valid and bool(end) == bool(real_final)),
+                        # v17: the 0/1 agreement is logged only (the reward is the trainer's Brier score)
+                        "correct": float(valid and bool(end) == bool(real_final)),
+                        "mask_ok": mask_ok, "prefix_ids": tt["prefix_ids"] if mask_ok else None,
+                        "target_true": tt["target_ids"] if mask_ok else None,
+                        "target_false": tf["target_ids"] if mask_ok else None,
                         "planner_gen": {"prompt_ids": gen["prompt_ids"], "gen_ids": gen["gen_ids"], "stop_mask": sm,
                                         "note_mask": nm, "hit_max_new": gen["hit_max_new"],
                                         "gen_logprobs": gen.get("gen_logprobs"), "gen_adapter": gen.get("gen_adapter"),

@@ -41,6 +41,10 @@ Checks (name: what a FAIL means)
                   Speaker pending line = judge unmet text, judge step 1 NOT ASSESSED + raw outputs later
   a0.*            original prompt present (ledger, WHAT THEY STILL WANT, HOW LONG THEY WRITE), no GOAL STATUS
   rl.*            planner_gen, update index, checkpoints, reward components
+  RL runs branch on run_meta config.spec_version (SPEC v17 B8, user 2026-09-30): "v17" -> check_v17 (SFT data and
+  choice, the ref adapter, Brier Task 1 groups and where their advantages act, the stop supervision, 8 optimizer steps,
+  the length drift / stop reason, the validation schedule, the tested updates, the Ditto architecture); anything else
+  (v16 runs with task1_G, older runs) -> the v16 checks (refill, D2, aux floor, selection, re-selection, best.json).
 """
 from __future__ import annotations
 
@@ -656,13 +660,29 @@ _ADAPTER_NAMES = {}
 
 
 def adapter_name(rl_dir, pv):
-    """The name the trainer serves checkpoint pv's adapter under: p<pv>-<sha12 of the adapter directory>."""
+    """The name the trainer serves an adapter under: checkpoint pv (int) -> p<pv>-<sha12 of ckpt/u<pv>/adapter>;
+    v17 B3: an SFT candidate ("sft_e<k>") -> sft_e<k>-<sha12 of ckpt/sft_e<k>/adapter>."""
     key = (rl_dir, pv)
     if key not in _ADAPTER_NAMES:
         import vllm_planner
-        d = os.path.join(rl_dir, "ckpt", "u%05d" % pv, "adapter")
-        _ADAPTER_NAMES[key] = ("p%d-%s" % (pv, vllm_planner.sha_dir(d)[:12])) if os.path.isdir(d) else None
+        if isinstance(pv, str):
+            if not (pv.startswith("sft_e") and pv[5:].isdigit()):
+                raise ValueError("adapter tag %r" % pv)
+            d, tag = os.path.join(rl_dir, "ckpt", pv, "adapter"), pv
+        else:
+            d, tag = os.path.join(rl_dir, "ckpt", "u%05d" % pv, "adapter"), "p%d" % pv
+        _ADAPTER_NAMES[key] = ("%s-%s" % (tag, vllm_planner.sha_dir(d)[:12])) if os.path.isdir(d) else None
     return _ADAPTER_NAMES[key]
+
+
+def spec_version(rl_dir):
+    """v17 B8: the branch of an RL run = run_meta config.spec_version; a run without it is v16 (with task1_G) or older,
+    and both take the v16 branch. None without run_meta."""
+    meta = _jl(os.path.join(rl_dir, "run_meta.jsonl")) if rl_dir else []
+    if not meta:
+        return None
+    cfg = meta[0].get("config") or {}
+    return cfg.get("spec_version") or ("v16" if "task1_G" in (cfg.get("args") or {}) else "pre-v16")
 
 
 def check_vllm_generation(rl_dir, rollouts, meta, rep, abort=0.1):
@@ -919,6 +939,409 @@ def check_v16(rl_dir, rep, splits_path=None):
         _check_t1prob_file(rl_dir, fname, rep, real_vllm)
 
 
+# ------------------------------------------------------------------ SPEC v17 (user 2026-09-30)
+V17_SPEC = {"kl": 0.01, "lr": 1e-5, "controller": "fixed", "aux_weight": 0.5, "updates": 5, "task1_G": 4,
+            "task1_convs": 8, "sft_lr": 5e-5, "sft_epochs_max": 3, "sft_samples_per_point": 2,
+            "length_drift_margin": 1.0, "task1_reward": "brier", "task1_positions": "all", "val_every": 1,
+            "stop_credit": 1}
+V17_VAL_SEEDS = [0, 1, 2, 3, 4, 5, 6, 7]
+
+
+def _v17_nll(points):
+    xs = [p for p in points if p.get("valid", True)]
+    if not xs:
+        return None
+    return sum(-math.log(min(1 - 1e-6, max(1e-6, float(p["p_end"]) if p["real_final"] else 1 - float(p["p_end"]))))
+               for p in xs) / len(xs)
+
+
+def _pstd(xs):
+    m = sum(xs) / len(xs)
+    return (sum((x - m) ** 2 for x in xs) / len(xs)) ** 0.5
+
+
+def _unscored_ok(p):
+    """The unscored-point rule (v16 item 7): an invalid plan reads as 0, a valid decision without a located value as its
+    greedy decision."""
+    if p.get("valid", True):
+        return 0.0 <= float(p["p_end"]) <= 1.0
+    return float(p["p_end"]) == (1.0 if (p.get("decision_valid") and p.get("greedy_end")) else 0.0)
+
+
+def check_v17(rl_dir, rep, splits_path=None):
+    """SPEC v17 §9 (user 2026-09-30), recomputed from the run's logs: settings, SFT data and choice, the ref adapter,
+    the Task 1 groups (Brier rewards, drops, advantages and where they act), the stop supervision, the optimizer steps,
+    the length drift and the stop reason, the validation schedule, the test update set, the Ditto architecture."""
+    import task1_stop as T1
+    meta = _jl(os.path.join(rl_dir, "run_meta.jsonl"))
+    if not rep.ok("rl.v17_settings", bool(meta), rl_dir, "run_meta.jsonl missing"):
+        return
+    cfg0 = meta[0].get("config") or {}
+    args, acfg = cfg0.get("args") or {}, cfg0.get("algo_cfg") or {}
+    abl = bool(args.get("ablation"))
+    dry = bool(args.get("dry_run"))
+    real_vllm = args.get("planner_backend") == "vllm" and not dry
+    # ---- settings (§8)
+    rep.ok("rl.v17_settings", all((m.get("config") or {}).get("spec_version") == "v17" for m in meta), "run_meta",
+           "a run_meta row of another spec version")
+    for k, want in V17_SPEC.items():
+        rep.ok("rl.v17_settings", args.get(k) == want or abl, "run_meta", "%s = %r (spec v17: %r)" % (k, args.get(k), want))
+    rep.ok("rl.v17_settings", sorted(args.get("val_seeds") or []) == V17_VAL_SEEDS or abl, "run_meta",
+           "val_seeds %r (spec v17: 0..7)" % args.get("val_seeds"))
+    rep.ok("rl.v17_settings", (acfg.get("epochs"), acfg.get("minibatches")) == (2, 4) or abl, "run_meta",
+           "algo epochs x minibatches %r x %r (spec v17: 2 x 4)" % (acfg.get("epochs"), acfg.get("minibatches")))
+    rep.ok("rl.adv_norm", acfg.get("grpo_std_norm") is False, "run_meta", "grpo_std_norm %r" % acfg.get("grpo_std_norm"))
+    rep.ok("rl.v17_settings", args.get("init_adapter") is None and all(m.get("init_adapter_sha256") is None for m in meta),
+           "run_meta", "an init adapter was used")
+    # ---- the split file
+    sp_path = splits_path or args.get("splits")
+    try:
+        f = {int(x["fold"]): x for x in json.load(open(sp_path, encoding="utf-8"))["folds"]}[int(args["fold"])]
+        rep.ok("rl.v17_splits", sha256_file(sp_path) == meta[0].get("splits_sha256"), "splits",
+               "split file %r is not the one the run used (sha differs)" % sp_path)
+    except Exception as e:                       # never skipped silently
+        rep.ok("rl.v17_splits", False, "splits", "cannot read the split file %r: %r" % (sp_path, e))
+        return
+    train_all, forb = set(f.get("train_all", f["train"])), set(f.get("forbidden_for_training", []))
+    val, val_all = set(f["validation"]), set(f.get("validation_all", f["validation"]))
+    rep.ok("rl.v17_splits", val <= val_all <= forb and not val_all & (train_all | set(f["train"])), "splits",
+           "validation_all must contain validation, lie in forbidden and be disjoint from train / train_all")
+    # ---- Ditto architecture (S12): the env description of a real run
+    env = cfg0.get("env")
+    rep._c("rl.v17_ditto")
+    if env is None:
+        rep.note("rl.v17_ditto", "no env description (dry run)")
+        rep.ok("rl.v17_ditto", dry, "run_meta", "a real run without config.env")
+    else:
+        ae, v2 = env.get("arm_env") or {}, env.get("v2fix") or {}
+        rep.ok("rl.v17_ditto", env.get("arm") == "pend", "env", "arm %r" % env.get("arm"))
+        rep.ok("rl.v17_ditto", "Ditto-8B" in str(env.get("speaker_path")), "env", "speaker %r" % env.get("speaker_path"))
+        rep.ok("rl.v17_ditto", env.get("speaker_endconv_is_none") is True, "env", "the Speaker has an end token")
+        rep.ok("rl.v17_ditto", any(c.endswith("DittoSpeaker") for c in env.get("speaker_class") or []), "env",
+               "speaker class %r" % env.get("speaker_class"))
+        for k in ("SEPSIM_ENDMASK_RETRY", "SEPSIM_ENDGATE", "SEPSIM_KEEPEND", "SEPSIM_ENDSCORE"):
+            rep.ok("rl.v17_ditto", ae.get(k) == "0", "env", "%s = %r (a UserLM end-token mechanism)" % (k, ae.get(k)))
+        rep.ok("rl.v17_ditto", v2.get("SEPSIM_END_PROBE") == "0", "env", "SEPSIM_END_PROBE %r" % v2.get("SEPSIM_END_PROBE"))
+        rep.ok("rl.v17_ditto", "e1r_cf19400" in str(env.get("tree")), "env", "tree %r" % env.get("tree"))
+    # ---- SFT data (§1.1)
+    ex = _jl(os.path.join(rl_dir, "sft_examples.jsonl"))
+    mp = os.path.join(rl_dir, "sft_examples_meta.json")
+    em = json.load(open(mp, encoding="utf-8")) if os.path.exists(mp) else None
+    spp = int(args.get("sft_samples_per_point", 2))
+    if rep.ok("rl.sft_data", em is not None and bool(ex), rl_dir, "sft_examples.jsonl / sft_examples_meta.json missing"):
+        rep.ok("rl.sft_data", sha256_file(os.path.join(rl_dir, "sft_examples.jsonl")) == em["examples_sha256"], mp,
+               "sft_examples.jsonl changed after its meta was written")
+        rep.ok("rl.sft_data", sorted(em.get("conversations") or []) == sorted(train_all), mp,
+               "the SFT conversations are not exactly train_all")
+        n_of, pts = {}, {}
+        for cid, t, n, status, n_ex in em["points"]:
+            w = "sft %s t%s" % (str(cid)[:10], t)
+            rep.ok("rl.sft_data", cid in train_all and cid not in forb, w, "SFT point outside train_all / in forbidden")
+            rep.ok("rl.sft_data", n_of.setdefault(cid, n) == n, w, "two lengths for one conversation")
+            pts[(cid, t)] = (status, n_ex)
+        for cid, n in n_of.items():
+            rep.ok("rl.sft_data", {t for (c, t) in pts if c == cid} == set(range(2, n + 1)), "sft %s" % str(cid)[:10],
+                   "decision points are not t = 2..%d" % n)
+        per = {}
+        for e in ex:
+            w = "sft %s t%s k%s" % (str(e.get("conversation_id"))[:10], e.get("t"), e.get("k"))
+            key = (e["conversation_id"], e["t"])
+            per[key] = per.get(key, 0) + 1
+            st_ = pts.get(key, ("missing", 0))[0]
+            rep.ok("rl.sft_data", e["conversation_id"] in train_all and e["conversation_id"] not in forb and st_ == "ok"
+                   and 2 <= e["t"] <= e["n"] == n_of.get(e["conversation_id"]) and e["real_final"] == (e["t"] == e["n"]),
+                   w, "example outside train_all, off a decision point or with a wrong label")
+            rep.ok("rl.sft_data", (e["kind"] == "greedy") == (e["k"] == 0) and 0 <= e["k"] <= spp
+                   and e["target_ids"] == (e["target_true"] if e["real_final"] else e["target_false"]), w,
+                   "kind / plan index / target inconsistent with the human's decision")
+        for key, (st_, n_ex) in pts.items():
+            rep.ok("rl.sft_data", per.get(key, 0) == n_ex and n_ex <= 1 + spp, "sft %s t%s" % (str(key[0])[:10], key[1]),
+                   "%d examples logged, the point record says %d" % (per.get(key, 0), n_ex))
+        c = em.get("counts") or {}
+        rep.ok("rl.sft_data", c.get("n_examples") == len(ex) and c.get("n_points") == sum(1 for v in pts.values() if v[0] == "ok"),
+               mp, "counts %r disagree with the rows" % {k: c.get(k) for k in ("n_examples", "n_points")})
+        base = _jl(os.path.join(rl_dir, "base_pend_train.jsonl"))
+        rep.ok("rl.sft_data", sha256_file(os.path.join(rl_dir, "base_pend_train.jsonl")) == em.get("base_pend_sha256")
+               if os.path.exists(os.path.join(rl_dir, "base_pend_train.jsonl")) else False, rl_dir,
+               "base_pend_train.jsonl missing or changed")
+        rep.ok("rl.sft_data", sorted((b["conversation_id"], b["t"]) for b in base)
+               == sorted(k for k, v in pts.items() if v[0] == "ok") and all(_unscored_ok(b) for b in base), rl_dir,
+               "base_pend_train.jsonl: not one scored point per SFT decision point, or a p_end breaks the rules")
+        if real_vllm:
+            want = adapter_name(rl_dir, "sft_e0")
+            rep.ok("rl.sft_data", all(e.get("gen_adapter") == want for e in ex) and all(b.get("gen_adapter") == want for b in base),
+                   rl_dir, "SFT plans not generated by the start policy's adapter %r" % want)
+    # ---- SFT choice (§1.3): recomputed from sft.jsonl
+    srows = _jl(os.path.join(rl_dir, "sft.jsonl"))
+    sel = [r for r in srows if r.get("kind") == "selection"]
+    st0p = os.path.join(rl_dir, "ckpt", "u00000", "state.json")
+    st0 = json.load(open(st0p, encoding="utf-8")) if os.path.exists(st0p) else None
+    if rep.ok("rl.sft_choice", bool(sel) and st0 is not None, rl_dir, "no SFT selection row / no ckpt u00000"):
+        sel = sel[-1]
+        eps_ = sorted((r for r in srows if r.get("kind") == "epoch" and r.get("attempt") == sel["attempt"]),
+                      key=lambda r: r["epoch"])
+        rep.ok("rl.sft_choice", [r["epoch"] for r in eps_] == list(range(0, int(args.get("sft_epochs_max", 3)) + 1)),
+               "sft.jsonl", "candidate epochs %r" % [r["epoch"] for r in eps_])
+        for r in eps_:
+            w = "sft epoch %d" % r["epoch"]
+            pts_ = [p for c in sorted(r.get("val_end_probs") or {}) for p in r["val_end_probs"][c]]
+            rep.ok("rl.sft_choice", sorted(r.get("val_ids") or []) == sorted(val_all)
+                   and sorted(r.get("val_end_probs") or {}) == sorted(val_all), w, "the probes are not on validation_all")
+            n_exp = sum(n - 1 for n in (r.get("val_n_turns") or {}).values())
+            rep.ok("rl.sft_choice", len(pts_) == n_exp and all(_unscored_ok(p) for p in pts_), w,
+                   "%d probe points, expected sum(n - 1) = %d, or a p_end breaks the rules" % (len(pts_), n_exp))
+            if pts_:
+                nll = _v17_nll(pts_)
+                ninv = sum(1 for p in pts_ if not p.get("valid", True))
+                rep.ok("rl.sft_choice", (nll is None and r["val"]["nll"] is None) or (nll is not None and r["val"]["nll"] is not None
+                       and abs(nll - r["val"]["nll"]) < 1e-9) and ninv == r["val"]["n_invalid"], w,
+                       "logged nll %r / n_invalid %r, recomputed %r / %d" % (r["val"]["nll"], r["val"]["n_invalid"], nll, ninv))
+            cp = os.path.join(rl_dir, "ckpt", "sft_e%d" % r["epoch"], "state.json")
+            rep.ok("rl.sft_choice", os.path.exists(cp) and json.load(open(cp, encoding="utf-8"))["policy_sha"] == r["policy_sha"],
+                   w, "candidate checkpoint missing or of another policy")
+            if real_vllm:
+                want = adapter_name(rl_dir, "sft_e%d" % r["epoch"])
+                rep.ok("rl.sft_choice", all(p.get("gen_adapter") == want for p in pts_), w,
+                       "probes not generated by the candidate's adapter %r" % want)
+        if eps_:
+            key = lambda r: (float("inf") if r["val"]["nll"] is None else r["val"]["nll"], r["val"]["n_invalid"], r["epoch"])
+            k = min(eps_, key=key)["epoch"]
+            chosen = next(r for r in eps_ if r["epoch"] == k)
+            rep.ok("rl.sft_choice", sel["chosen_epoch"] == k, "sft.jsonl",
+                   "chosen epoch %r, recomputed %r (lowest nll, then n_invalid, then earlier)" % (sel["chosen_epoch"], k))
+            rep.ok("rl.sft_choice", st0["policy_sha"] == chosen["policy_sha"] == sel["policy_sha"]
+                   and (st0.get("sft") or {}).get("chosen_epoch") == k, st0p, "u0 is not the chosen SFT candidate")
+            a0 = os.path.join(rl_dir, "ckpt", "u00000", "adapter", "adapter_model.safetensors")
+            ak = os.path.join(rl_dir, "ckpt", "sft_e%d" % k, "adapter", "adapter_model.safetensors")
+            if os.path.exists(a0) or os.path.exists(ak):
+                rep.ok("rl.sft_choice", os.path.exists(a0) and os.path.exists(ak) and sha256_file(a0) == sha256_file(ak),
+                       st0p, "u0's adapter file differs from the chosen candidate's")
+    # ---- the ref adapter (§2, B4)
+    for d in sorted(glob.glob(os.path.join(rl_dir, "ckpt", "*", "adapter"))):
+        rep.ok("rl.ref_adapter", not os.path.exists(os.path.join(d, "ref")), d, "a checkpoint holds the ref adapter")
+    rep._c("rl.ref_adapter")
+    if st0 is not None:
+        sft_rows = [m for m in meta if m.get("kind") == "sft"]
+        rep.ok("rl.ref_adapter", len(sft_rows) >= 1 and all(m.get("ref_policy_sha") == st0["policy_sha"] for m in sft_rows),
+               "run_meta", "no sft row naming the ref = u0 sha")
+        for m in meta:
+            if m.get("ref_policy_sha") is not None:
+                rep.ok("rl.ref_adapter", m["ref_policy_sha"] == st0["policy_sha"], "run_meta %s" % m.get("kind"),
+                       "ref %s is not u0" % str(m["ref_policy_sha"])[:12])
+    # ---- per update: Task 1 groups, advantages, aux, steps, settings, drift (§3)
+    upd = {u["update"]: u for u in _jl(os.path.join(rl_dir, "updates.jsonl"))}
+    latest = {}
+    for r in _jl(os.path.join(rl_dir, "rollouts_task1.jsonl")):
+        latest[(r["update"], r["conversation_id"], r["t"])] = r
+    t2 = {}
+    for r in _jl(os.path.join(rl_dir, "rollouts.jsonl")):
+        t2[(r["update"], r["slot"], r["replicate"])] = r
+    G1, n_convs = int(args.get("task1_G", 4)), int(args.get("task1_convs", 8))
+    mstd, epochs, mbs = float(acfg.get("min_group_std", 1e-8)), int(acfg.get("epochs", 2)), int(acfg.get("minibatches", 4))
+    t_max = int((cfg0.get("selection_cfg") or {}).get("t_max", 10))
+    drift = {}
+    for u, row in sorted(upd.items()):
+        w = "update %s" % u
+        ts, st, ag, cfg = row.get("task1_stats"), row.get("learner_stats") or {}, row.get("train_aggregate") or {}, row.get("cfg_used") or {}
+        rep.ok("rl.v17_update", abs(float(cfg.get("kl_coef", -1)) - float(args.get("kl", 0.01))) < 1e-15
+               and abs(float(cfg.get("lr", -1)) - float(args.get("lr", 1e-5))) < 1e-15, w,
+               "kl_coef %r / lr %r differ from the run's" % (cfg.get("kl_coef"), cfg.get("lr")))
+        if args.get("controller") == "fixed":
+            rep.ok("rl.v17_update", row.get("controller") == "fixed" and cfg == cfg0.get("cfg0"), w,
+                   "the fixed controller's weights moved")
+        rep.ok("rl.v17_update", float(ag.get("aux_weight", -1)) == float(args.get("aux_weight", 0.5)), w,
+               "aux weight %r, the run's --aux-weight %r" % (ag.get("aux_weight"), args.get("aux_weight")))
+        # optimizer steps (§3.4, S3)
+        n_s = int(row.get("n_samples") or 0)
+        want = epochs * min(mbs, n_s) if n_s else (1 if st.get("aux_n") else 0)
+        rep.ok("rl.v17_steps", st.get("optimizer_steps") == want, w,
+               "%r optimizer steps, expected %d (epochs %d x min(%d, %d samples))" % (st.get("optimizer_steps"), want, epochs, mbs, n_s))
+        if n_s == 0 and st.get("aux_n"):
+            rep.ok("rl.v17_steps", st.get("aux_only") is True, w, "a supervision-only update is not flagged")
+        if n_s:
+            rep.ok("rl.adv_norm", st.get("adv_abs_mean") is not None and isinstance(st.get("adv_abs_mean_by_source"), dict),
+                   w, "adv_abs_mean (by source) missing")
+        # drift (§3.5): recomputed from the Task 2 rollouts (clean episodes of groups with >= 2 clean)
+        slots = {}
+        for (uu, slot, g), r in t2.items():
+            if uu == u and r["episode"].get("clean"):
+                slots.setdefault(slot, []).append(r["episode"])
+        eps_u = [e for es in slots.values() if len(es) >= 2 for e in es]
+        if rep.ok("rl.v17_drift", bool(eps_u), w, "no clean group episode to recompute the drift"):
+            dv = sum(int(e["emitted_user_turns"]) - min(int(e["human_turns"]), t_max) for e in eps_u) / len(eps_u)
+            drift[u] = dv
+            rep.ok("rl.v17_drift", ag.get("drift_stat") is not None and abs(ag["drift_stat"] - dv) < 1e-9, w,
+                   "logged drift %r, recomputed %r" % (ag.get("drift_stat"), dv))
+        if n_convs <= 0:
+            continue
+        if not rep.ok("rl.v17_task1", isinstance(ts, dict) and all(k in ts for k in ("convs", "groups", "skipped_capped",
+                                                                                      "advantages", "aux_points")),
+                      w, "task1_stats record missing"):
+            continue
+        convs = set(ts["convs"])
+        rep.ok("rl.v17_task1", convs <= train_all and not convs & forb and len(convs) == min(n_convs, len(train_all)), w,
+               "Task 1 conversations %d, outside train_all or not min(task1_convs, |train_all|)" % len(convs))
+        rows = {}
+        for cid, t in ts["groups"]:
+            r = latest.get((u, cid, t))
+            if rep.ok("rl.v17_task1", r is not None and cid in convs, w, "group %s t%s has no row" % (str(cid)[:10], t)):
+                rows[(cid, t)] = r
+        skipped = {(c, t) for c, t in ts["skipped_capped"]}
+        for cid in convs:
+            ns = {r["n_real"] for (c, _), r in rows.items() if c == cid}
+            if len(ns) > 1:
+                rep.ok("rl.v17_task1", False, w, "two lengths for %s" % cid)
+                continue
+            if ns:
+                n = ns.pop()
+                have = {t for (c, t) in rows if c == cid} | {t for (c, t) in skipped if c == cid}
+                rep.ok("rl.v17_task1", have == set(range(2, n + 1)) and not ({t for (c, t) in rows if c == cid}
+                                                                             & {t for (c, t) in skipped if c == cid}),
+                       w, "%s: decision points %s are not t = 2..%d" % (str(cid)[:10], sorted(have), n))
+        adv_log = {(c, t): (kind, used) for c, t, kind, used in ts["advantages"]}
+        cnt = {"lt2": 0, "all_invalid": 0, "zero_std": 0}
+        want_aux = []
+        for (cid, t), r in sorted(rows.items()):
+            wg = "%s %s t%s" % (w, str(cid)[:10], t)
+            smp = r.get("samples") or []
+            rep.ok("rl.v17_task1", len(smp) == G1 and r["real_final"] == (t == r["n_real"]) and t >= 2, wg,
+                   "%d samples (task1_G %d) or a wrong label" % (len(smp), G1))
+            y = 1.0 if r["real_final"] else 0.0
+            for x in smp:
+                s_ = x.get("status")
+                g = x.get("planner_gen") or {}
+                if s_ == "valid":
+                    ok = (x.get("decision_valid") and x.get("mask_ok") and not x.get("dropped")
+                          and x.get("p_end") is not None and 0.0 <= x["p_end"] <= 1.0
+                          and abs(x["reward"] - (1.0 - (x["p_end"] - y) ** 2)) < 1e-12
+                          and g.get("stop_mask") is not None and 1 in g["stop_mask"] and g["stop_mask"].index(1) > 0)
+                elif s_ == "invalid":
+                    ok = not x.get("decision_valid") and x.get("reward") == 0.0 and x.get("p_end") is None and not x.get("dropped")
+                elif s_ == "dropped":
+                    ok = x.get("decision_valid") and not x.get("mask_ok") and x.get("dropped") and x.get("reward") is None
+                else:
+                    ok = False
+                rep.ok("rl.v17_task1_reward", ok, wg, "sample r%s status %r: reward / P_end / flags break the Brier rule"
+                       % (x.get("replicate"), s_))
+            kept = [x for x in smp if not x.get("dropped")]
+            if any(x.get("status") == "valid" for x in smp):
+                want_aux.append([cid, t])
+            if len(kept) < 2:
+                kind, advs = "lt2", None
+            elif all(x.get("status") == "invalid" for x in kept):
+                kind, advs = "all_invalid", None
+            else:
+                rs = [x["reward"] for x in kept]
+                m_ = sum(rs) / len(rs)
+                kind, advs = ("zero_std", None) if _pstd(rs) <= mstd else ("used", [x_ - m_ for x_ in rs])
+            if kind != "used":
+                cnt[kind] += 1
+            lk, used = adv_log.get((cid, t), (None, None))
+            if rep.ok("rl.v17_advantage", lk == kind, wg, "logged group %r, recomputed %r" % (lk, kind)) and kind == "used":
+                want_u = [[x["replicate"], x["status"], a_, "prefix" if x["status"] == "valid" else "all"]
+                          for x, a_ in zip(kept, advs)]
+                rep.ok("rl.v17_advantage", len(used) == len(want_u) and all(
+                    a[0] == b[0] and a[1] == b[1] and abs(a[2] - b[2]) < 1e-12 and a[3] == b[3] for a, b in zip(used, want_u)),
+                    wg, "advantages / where they act differ from R - mean(R) over the kept samples (prefix for a "
+                        "valid sample, every token for an invalid one; dropped samples never)")
+        rep.ok("rl.v17_advantage", set(adv_log) == set(rows), w, "advantage records != groups")
+        rep.ok("rl.v17_task1", ts.get("n_groups_lt2") == cnt["lt2"] and ts.get("n_groups_all_invalid") == cnt["all_invalid"]
+               and ts.get("groups_skipped_zero_std") == cnt["zero_std"], w,
+               "skip counts %r != recomputed %r" % ({k: ts.get(k) for k in ("n_groups_lt2", "n_groups_all_invalid",
+                                                                           "groups_skipped_zero_std")}, cnt))
+        # the stop supervision (§3.3): one example per decision point with a valid sample, weight --aux-weight
+        if float(args.get("aux_weight", 0.5)) > 0:
+            rep.ok("rl.v17_aux", sorted(ts["aux_points"]) == sorted(want_aux) and st.get("aux_n", 0) == len(want_aux)
+                   and len({tuple(p) for p in ts["aux_points"]}) == len(ts["aux_points"]), w,
+                   "aux examples %r at %d points, expected one per point with a valid sample (%d)"
+                   % (st.get("aux_n"), len(ts["aux_points"]), len(want_aux)))
+    # ---- the stop rule (§3.5, S5, S13), recomputed from the drift values
+    margin, n_up = float(args.get("length_drift_margin", 1.0)), int(args.get("updates", 5))
+    fu, reason = None, None
+    for u in sorted(drift):
+        if u >= 2 and drift.get(u - 1) is not None and drift[u] < -margin and drift[u - 1] < -margin:
+            fu, reason = u, "length_drift"
+            break
+        if u >= n_up:
+            fu, reason = u, "max_updates"
+            break
+    fp = os.path.join(rl_dir, "final.json")
+    fin = json.load(open(fp, encoding="utf-8")) if os.path.exists(fp) else None
+    if fin is not None or fu is not None:
+        rep.ok("rl.v17_stop", fin is not None and fin.get("final_update") == fu and fin.get("stop_reason") == reason, fp,
+               "final.json %r, recomputed final u%s (%s)" % ({k: (fin or {}).get(k) for k in ("final_update", "stop_reason")},
+                                                            fu, reason))
+        rep.ok("rl.v17_stop", fu is None or max(upd) == fu, fp, "updates after the stop (u%s)" % max(upd or [0]))
+        stops = [m for m in meta if m.get("kind") == "stop"]
+        rep.ok("rl.v17_stop", len(stops) == 1 and stops[0].get("final_update") == fu and stops[0].get("stop_reason") == reason,
+               "run_meta", "run_meta stop rows %r" % [(m.get("final_update"), m.get("stop_reason")) for m in stops])
+        if fin is not None and fu is not None:
+            sp_ = os.path.join(rl_dir, "ckpt", "u%05d" % fu, "state.json")
+            rep.ok("rl.v17_stop", os.path.exists(sp_) and json.load(open(sp_, encoding="utf-8"))["policy_sha"] == fin.get("policy_sha"),
+                   fp, "final.json policy sha is not the checkpoint's")
+    rep._c("rl.v17_stop")
+    # ---- validation schedule (§4, S6)
+    vrows = _jl(os.path.join(rl_dir, "validation.jsonl"))
+    summ = [v for v in vrows if v.get("kind") == "summary"]
+    seeds_want = sorted(args.get("val_seeds") or V17_VAL_SEEDS)
+    final_u = (fin or {}).get("final_update")
+    for v in summ:
+        u, w = v["update"], "validation u%s%s" % (v["update"], " task2" if v.get("task2") else "")
+        rep.ok("rl.v17_validation", sorted(v.get("task1_ids") or []) == sorted(val_all), w, "Task 1 ids != validation_all")
+        rows_ = {}
+        for r in vrows:
+            if r.get("kind") == "task1" and r.get("update") == u and r.get("policy_sha") == v.get("policy_sha"):
+                rows_[r["conversation_id"]] = r
+        rep.ok("rl.v17_validation", sorted(rows_) == sorted(val_all), w, "Task 1 rows %r != validation_all" % sorted(rows_))
+        pts = [p for r in rows_.values() for p in (r.get("end_probs") or [])]
+        n_exp = sum(len(r["task1"]["turns"]) - 1 for r in rows_.values())
+        if rep.ok("rl.v17_validation", pts and len(pts) == n_exp and all(_unscored_ok(p) for p in pts), w,
+                  "%d probe points (expected %d) or a p_end breaking the rules" % (len(pts), n_exp)):
+            m = T1.task1_prob_metrics(pts)
+            for k in ("bal_p", "nll"):
+                a_, b_ = (v.get("task1") or {}).get(k), m[k]
+                rep.ok("rl.v17_validation", (a_ is None and b_ is None) or (a_ is not None and b_ is not None and abs(a_ - b_) < 1e-9),
+                       w, "summary %s %r != recomputed %r" % (k, a_, b_))
+        if real_vllm:
+            want_ad = adapter_name(rl_dir, u)
+            rep.ok("rl.v17_validation", all(p.get("gen_adapter") == want_ad for p in pts), w,
+                   "probes not generated by the policy of update %s" % u)
+        if v.get("task2"):
+            rep.ok("rl.v17_validation", u == 0 or u == final_u, w, "Task 2 validation at an update that is neither u0 nor final")
+            rep.ok("rl.v17_validation", sorted(v.get("val_seeds") or []) == seeds_want and v.get("val_temperature") == 0.7, w,
+                   "Task 2 seeds %r / temperature %r" % (v.get("val_seeds"), v.get("val_temperature")))
+            ep = {}
+            for r in vrows:
+                if r.get("kind") == "episode" and r.get("update") == u and r.get("policy_sha") == v.get("policy_sha"):
+                    ep[(r["conversation_id"], r["seed"])] = r
+            rep.ok("rl.v17_validation", sorted(ep) == sorted((c, s) for c in val for s in seeds_want), w,
+                   "Task 2 episodes %d != validation x seeds" % len(ep))
+            rep.ok("rl.v17_validation", v.get("n_episodes", 0) + v.get("n_unclean_episodes", 0) == len(val) * len(seeds_want), w,
+                   "episode counts")
+        else:
+            rep.ok("rl.v17_validation", not v.get("val_seeds") and not v.get("turn_stats"), w, "a Task-1-only summary with Task 2")
+    t2u = {r.get("update") for r in vrows if r.get("kind") == "episode"}
+    rep.ok("rl.v17_validation", t2u <= {0, final_u}, "validation.jsonl",
+           "Task 2 episodes at updates %s (only u0 and the final update)" % sorted(x for x in t2u if x not in (0, final_u)))
+    have = {(v["update"], bool(v.get("task2"))) for v in summ}
+    if st0 is not None:
+        rep.ok("rl.v17_validation", (0, True) in have, "validation.jsonl", "u0 (SFT) has no Task 2 validation")
+    if fin is not None and fin.get("validated"):
+        rep.ok("rl.v17_validation", (final_u, True) in have, "validation.jsonl",
+               "the final update u%s has no Task 2 validation (a Task-1-only summary does not count)" % final_u)
+    ve = int(args.get("val_every", 1))
+    for u in upd:
+        if final_u is not None and u == final_u:
+            continue
+        if ve > 0 and u % ve == 0 and (final_u is None or u < final_u):
+            rep.ok("rl.v17_validation", (u, False) in have, "validation.jsonl", "u%d has no Task 1 validation" % u)
+    # ---- test (§5): the tested updates are exactly {0, final}
+    tm = _jl(os.path.join(rl_dir, "test_meta.jsonl"))
+    if tm:
+        rep.ok("rl.v17_test", fin is not None and sorted(tm[-1].get("updates") or []) == sorted({0, final_u}), "test_meta",
+               "tested updates %r, final.json names u%s" % (tm[-1].get("updates"), final_u))
+
+
 def _check_t1prob_file(rl_dir, fname, rep, real_vllm):
     import task1_stop as T1
     vrows = _jl(os.path.join(rl_dir, fname))
@@ -963,7 +1386,10 @@ def _check_t1prob_file(rl_dir, fname, rep, real_vllm):
 
 def check_rl(rl_dir, rollouts, ckpt_pattern, rep, splits_path=None):
     check_intervention(rl_dir, rep)
-    check_v16(rl_dir, rep, splits_path)
+    if spec_version(rl_dir) == "v17":
+        check_v17(rl_dir, rep, splits_path)
+    else:
+        check_v16(rl_dir, rep, splits_path)
     for r in rollouts:
         for s in r.get("trace") or []:
             w = "%s s%s t%s" % (str(r.get("conversation_id"))[:12], r.get("seed"), s.get("t"))
@@ -1037,6 +1463,7 @@ def verify(episodes, meta_path, splits_path, fold, split, arm=None, training=Fal
         files = sorted(p for p in glob.glob(os.path.join(rl_dir, "rollouts*.jsonl")) + glob.glob(os.path.join(rl_dir, "rollouts", "*.jsonl"))
                        if not os.path.basename(p).startswith("rollouts_task1"))
         t1p = os.path.join(rl_dir, "rollouts_task1.jsonl")
+        v17 = spec_version(rl_dir) == "v17"
         if os.path.exists(t1p):
             folds = {int(f["fold"]): f for f in splits["folds"]}
             f = folds.get(fold, {})
@@ -1052,10 +1479,14 @@ def verify(episodes, meta_path, splits_path, fold, split, arm=None, training=Fal
                 for x in r.get("samples") or []:
                     g = x.get("planner_gen") or {}
                     valid = x.get("decision_valid", True)
-                    exp = float(valid and bool(x.get("ended_planner")) == bool(r.get("real_final")))
-                    rep.ok("rl.task1_groups", bool(g.get("prompt_ids")) and bool(g.get("gen_ids")) and
-                           x.get("reward") == exp, w,
-                           "sample without generation ids or with a reward that disagrees with the label")
+                    if v17:
+                        # v17: the Brier reward is recomputed in check_v17 (rl.v17_task1_reward); here only the logged
+                        # 0/1 agreement ("correct") must match the label
+                        exp, got = float(valid and bool(x.get("ended_planner")) == bool(r.get("real_final"))), x.get("correct")
+                    else:
+                        exp, got = float(valid and bool(x.get("ended_planner")) == bool(r.get("real_final"))), x.get("reward")
+                    rep.ok("rl.task1_groups", bool(g.get("prompt_ids")) and bool(g.get("gen_ids")) and got == exp, w,
+                           "sample without generation ids or with a 0/1 agreement that disagrees with the label")
                     if not valid:
                         rep.ok("rl.stop_mask_gated", g.get("stop_mask") is None, w, "stop mask on a non-decision sample")
             rep.note("rl.task1_groups", "%d Task 1 groups" % len(t1rows))
@@ -1140,7 +1571,10 @@ def check_endpoints(meta, rep):
 
 
 def check_selection(vp, rl_dir, rep):
-    """validation summaries: D5 settings, the selection score recomputed from its logged parts, best = argmax."""
+    """validation summaries: D5 settings, the selection score recomputed from its logged parts, best = argmax.
+    v16 branch only (v17 B8: a v17 run selects nothing; its validation schedule is checked in check_v17)."""
+    if spec_version(rl_dir) == "v17":
+        return
     summ = [json.loads(l) for l in open(vp, encoding="utf-8") if l.strip() and json.loads(l).get("kind") == "summary"]
     meta0 = _jl(os.path.join(rl_dir, "run_meta.jsonl"))[:1]
     v16_run = bool(meta0) and "task1_G" in ((meta0[0].get("config") or {}).get("args") or {})
@@ -1233,10 +1667,13 @@ def check_reselect_ids(rl_dir, val, train_all, rep):
 
 
 def check_rl_selection(rl_dir, splits, fold, rep):
-    """validation.jsonl only on validation ids (never train, never test); best.json and manifests present."""
+    """validation.jsonl only on validation ids (never train, never test); best.json (v16 branch) and manifests present.
+    v17 (B8): Task 2 episodes on validation, Task 1 rows on validation_all; no best.json / re-selection."""
     folds = {int(f["fold"]): f for f in splits["folds"]}
     f = folds.get(fold, {})
+    v17 = spec_version(rl_dir) == "v17"
     val, train_all = set(f.get("validation", [])), set(f.get("train_all", f.get("train", [])))
+    val_all = set(f.get("validation_all", f.get("validation", []))) if v17 else val
     vp = os.path.join(rl_dir, "validation.jsonl")
     if rep.ok("rl.validation_present", os.path.exists(vp), vp, "missing"):
         n = 0
@@ -1247,11 +1684,17 @@ def check_rl_selection(rl_dir, splits, fold, rep):
             if r.get("kind") in ("episode", "task1"):
                 n += 1
                 cid = r.get("conversation_id")
-                rep.ok("leak.validation_ids", cid in val and cid not in train_all, "validation %s" % str(cid)[:12],
+                ids = val_all if r.get("kind") == "task1" else val
+                rep.ok("leak.validation_ids", cid in ids and cid not in train_all, "validation %s" % str(cid)[:12],
                        "validation row on a non-validation id")
         rep.note("rl.validation_present", "%d validation rows" % n)
-    rep.ok("rl.best", os.path.exists(os.path.join(rl_dir, "best.json")), rl_dir, "best.json missing")
-    check_reselect_ids(rl_dir, val, train_all, rep)
+    if v17:
+        rep.ok("rl.best", not os.path.exists(os.path.join(rl_dir, "best.json"))
+               and not os.path.exists(os.path.join(rl_dir, "reselect.jsonl")), rl_dir,
+               "a v17 run has best.json / reselect.jsonl (no checkpoint selection in v17)")
+    else:
+        rep.ok("rl.best", os.path.exists(os.path.join(rl_dir, "best.json")), rl_dir, "best.json missing")
+        check_reselect_ids(rl_dir, val, train_all, rep)
     for d in sorted(glob.glob(os.path.join(rl_dir, "ckpt", "u*"))):
         if d.endswith(".tmp"):
             continue
@@ -1260,7 +1703,8 @@ def check_rl_selection(rl_dir, splits, fold, rep):
             m = json.load(open(mp, encoding="utf-8"))
             forb = set(f.get("forbidden_for_training", []))
             rep.ok("leak.manifest", not (set(m.get("train_scenarios", [])) | set(m.get("train_conversations", []))
-                                         | set(m.get("fewshot_pool", []))) & forb, d, "manifest lists a forbidden id")
+                                         | set(m.get("fewshot_pool", [])) | set(m.get("sft_conversations", []))) & forb,
+                   d, "manifest lists a forbidden id")
 
 
 def main(argv=None):

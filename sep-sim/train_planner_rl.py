@@ -1,32 +1,44 @@
 #!/usr/bin/env python3
-"""Planner RL for the pend arm (GRPO; v4 LLM factor controller). Design: ops/AUDIT_SPEC_pend_grpo.md.
+"""Planner RL for the pend arm, SPEC v17 (user 2026-09-30): SFT warm-up -> short GRPO. Design: ops/SPEC_v17_sft_pend.md
+(where it is silent, ops/SPEC_v16_grpo_opt.md and ops/AUDIT_SPEC_pend_grpo.md). The architecture is fixed: Planner =
+Qwen3-4B-Instruct-2507 + LoRA (the only trained part), Speaker = Ditto-8B (frozen; NO end token: a session ends by the
+Planner's end_session or a blank selected message) + Borda selector, Implicit Profile, few-shot. This trainer implements
+v17 only; verify_pipeline.py keeps the v16 checks for archived runs.
 
-Loop (update u = 1, 2, ...; the policy that generates update u's rollouts has policy_version u-1):
-  1. sample --scenarios-per-update scenarios (seeded by (seed, u)) from splits[fold]["train"] ONLY;
-     every id is asserted to be in train and not in forbidden_for_training;
-  2. G rollouts each: Task2Env(arm="pend").run_episode(..., planner_temperature>0, record_generation=True);
-     each row is appended to rollouts.jsonl with update, policy_version and policy_sha; episodes that are
-     not clean (cut R0 reply, lost ledger verdict, emitted capped message, compacted prompt) are dropped;
-  3. rewards = rl_reward.reward(episode, cfg, ctx) -- v4: coverage + log p_h(T) - log q(T) - penalties, p_h
-     from splits[fold]["train_all"], q from this update's clean rollouts;
-  4. group advantages R - mean(R) (v16 Dr. GRPO; no division by the group std), split into the stop part
-     (end_session tokens) and the rest; Task 1 stop groups on train_all conversations (--task1-convs x 2 positions,
-     --task1-G samples each, topped up with further conversations while groups carry no gradient) + the stop
-     supervision (never below --stop-sup-floor; annealed towards it after the D2 trigger);
-     assert every sample was produced by the current policy_version (on-policy);
-  5. checkpoint EVERY update (adapter, optimizer, controller state, RNG states, update index, policy_version,
-     history, rl_manifest.json) atomically; then updates.jsonl;
-  6. controller.propose(train aggregates only) -> cfg for the next update;
-  7. every --val-every updates: SAMPLED-Planner episodes (D5) and greedy Task 1 on splits[fold]["validation"]
-     -> validation.jsonl only; best.json = best checkpoint by w_sel_cov*coverage - w_sel_w1*W1(turn counts)
-     + w_sel_task1*Task 1 bal_p (v16: teacher-forced end probabilities at every decision point; term_f1 (M2) is
-     reported); unclean validation episodes are re-run, else the score is withheld.
+Stage 0, SFT warm-up (sft_stage, before u0; §1):
+  the start policy (seeded LoRA init, B1) is saved as ckpt/sft_e0 and served by vLLM; on every train_all conversation
+  (never a forbidden id) at every real decision point t = 2..n (a point after a capped emitted message is skipped and
+  counted) the start policy's greedy teacher-forced prompt gets 1 greedy + --sft-samples-per-point sampled plans (T 1,
+  top-p 1, seeds seed_of(seed, "sft", cid, t, k)); every valid plan with a located value gives one example: the plan's
+  own prefix, the value re-encoded with the human's decision (true iff t == n). Cached in sft_examples.jsonl +
+  sft_examples_meta.json (reused on resume only when start policy / splits / code match); base_pend_train.jsonl = the
+  start policy's teacher-forced P_end at every point (threshold_control.py). Loss = value_nll_loss (no class weights),
+  own AdamW (--sft-lr), minibatches of 8, --sft-epochs-max epochs; candidates ckpt/sft_e<k> (k = 0 is the start
+  policy), each probed greedily on validation_all (teacher-forced P_end) -> sft.jsonl; the candidate with the lowest
+  validation NLL (then fewer invalid points, then the earlier epoch) becomes u0 = "SFT (u0)"; u0 is then loaded as the
+  frozen adapter "ref", the KL reference of every update (§2).
+Loop (update u = 1 .. --updates (SPEC 5, fixed); the policy that generates update u's rollouts has policy_version u-1):
+  1. Task 2: --scenarios-per-update scenarios (seeded by (seed, u)) from splits[fold]["train"] ONLY, G rollouts each
+     (Task2Env(arm="pend").run_episode, T 1); unclean episodes never enter a group; reward v4 (coverage + log p_h(T) -
+     log q(T) - penalties, p_h from train_all), Dr. GRPO, stop credit (the length term's advantage on the end_session
+     value tokens), fixed controller;
+  2. Task 1 (§3.2): --task1-convs train_all conversations (seeded by (seed, u)), EVERY decision point t = 2..n, --task1-G
+     sampled plans each from the current policy's greedy teacher-forced prompt; reward = Brier 1 - (P_end - y)^2 with
+     P_end the rollout policy's teacher-forced P(end) on the sample's OWN prefix; a valid plan whose value cannot be
+     located is dropped (no gradient), an invalid plan has R = 0; advantage R - mean(R) on the prefix tokens (valid) or
+     on every token (invalid), never on the value tokens; plus the stop supervision (--aux-weight, one example per
+     decision point, split across the minibatches);
+  3. learner: epochs 2 x minibatches 4 = 8 optimizer steps, lr 1e-5, KL 0.01 (k3) to the ref adapter u0, TIS, clip 0.2;
+  4. checkpoint EVERY update; updates.jsonl; length-drift monitor: two consecutive updates with mean(T - min(human
+     turns, t_max)) over the clean group episodes < -(--length-drift-margin) stop the run (stop_reason length_drift);
+  5. validation: u0 and the final update: Task 2 on validation x --val-seeds (0..7) + Task 1 on validation_all;
+     u1 .. u(final-1): Task 1 only. No checkpoint selection: the final policy is the last completed update (final.json).
 Validation never enters history, reward statistics or the controller; the test ids are never read.
 
---resume continues from ckpt/LATEST; rollouts of an interrupted update that were produced by the same
-policy (policy_version and policy_sha match) are reused, the rest regenerated. Code SHA256s must match
-the first launch unless --allow-code-change. --dry-run runs the whole loop with a fake env and a
-pure-python learner (no torch, no GPU) to test the loop, checkpointing and resume.
+--resume continues from ckpt/LATEST (or re-runs an unfinished SFT from its cached examples); rollouts of an interrupted
+update that were produced by the same policy (policy_version and policy_sha match) are reused, the rest regenerated.
+Code SHA256s must match the first launch unless --allow-code-change. --dry-run runs the whole loop with a fake env and
+a pure-python learner (no torch, no GPU) to test the loop, checkpointing and resume.
 """
 from __future__ import annotations
 
@@ -53,15 +65,24 @@ import rl_controllers as RC  # noqa: E402
 import rl_reward as RR  # noqa: E402
 import task1_stop as T1  # noqa: E402
 
+SPEC_VERSION = "v17"
 CODE_FILES = ("train_planner_rl.py", "rl_reward.py", "rl_controllers.py", "rl_algos.py", "task2_env.py",
               "task2_episode.py", "goal_judge.py", "planner_prompt_v3.py", "fit_prompts.py", "ditto_e16.py",
-              "task1_stop.py", "batching.py", "implicit_profile.py", "style_select.py")
+              "task1_stop.py", "batching.py", "implicit_profile.py", "style_select.py", "vllm_planner.py")
 TIME_KEYS = ("time", "wall_s", "rollout_s", "update_s", "timing", "validation_s",
-             "planner_s", "speaker_s", "r0_s", "ledger_s")
+             "planner_s", "speaker_s", "r0_s", "ledger_s", "sft_s", "validated_time")
 VAL_RETRIES = 2          # an unclean validation episode (infrastructure incident) is re-run up to this many times
-RESUME_MAY_CHANGE = ("resume", "allow_code_change", "updates", "rollout_workers", "gpu", "max_batch",
-                     "keep_optimizer_last", "dry_run_crash_after_episodes", "vllm_url", "intervention",
-                     "reselect_seeds", "reselect_updates")
+# v17 B2: "updates" is NOT here (the run is 5 updates, fixed); the v16 re-selection flags are gone
+RESUME_MAY_CHANGE = ("resume", "allow_code_change", "rollout_workers", "gpu", "max_batch",
+                     "keep_optimizer_last", "dry_run_crash_after_episodes", "vllm_url", "intervention")
+# SPEC v17 values (user 2026-09-30; S10: kept here, rl_controllers.TRAIN_DEFAULTS is unchanged)
+SPEC_V17 = {"lr": 1e-5, "kl": 0.01, "sft_lr": 5e-5, "sft_epochs_max": 3, "sft_samples_per_point": 2, "task1_G": 4,
+            "task1_convs": 8, "task1_reward": "brier", "task1_positions": "all", "aux_weight": 0.5, "updates": 5,
+            "val_every": 1, "val_seeds": [0, 1, 2, 3, 4, 5, 6, 7], "length_drift_margin": 1.0, "controller": "fixed",
+            "stop_credit": 1, "epochs": 2, "minibatches": 4}
+SFT_BATCH = 8            # §1.2: SFT minibatch of 8 examples
+SFT_TEMPERATURE = 1.0    # §1.1: the sampled SFT plans (T 1, top-p 1)
+SFT_TOP_P = 1.0
 
 
 # ------------------------------------------------------------------ small utilities
@@ -131,8 +152,38 @@ def write_json_atomic(path, obj):
     os.replace(tmp, path)
 
 
+def write_jsonl_atomic(path, rows):
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        for r in rows:
+            f.write(json.dumps(r, sort_keys=True) + "\n")
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+
+
 def seed_of(*parts):
     return int(hashlib.sha256("|".join(map(str, parts)).encode()).hexdigest()[:8], 16)
+
+
+def sft_choice(rows):
+    """v17 §1.3 / B5: the SFT candidate with the lowest validation nll, then the fewer invalid points, then the earlier
+    epoch (an nll of None -- no valid point -- ranks last). rows: sft.jsonl epoch rows of one attempt. -> epoch."""
+    key = lambda r: (float("inf") if r["val"]["nll"] is None else r["val"]["nll"], r["val"]["n_invalid"], r["epoch"])
+    return min(rows, key=key)["epoch"]
+
+
+def drift_decision(drift_by_update, margin, max_updates):
+    """v17 §3.5 / S5: (final update, stop reason) from the per-update drift statistics {u: mean(T - min(human, t_max))}:
+    the first u >= 2 with drift < -margin at u-1 and u -> (u, "length_drift"); else (max_updates, "max_updates") once
+    that update exists; else (None, None) (still running)."""
+    for u in sorted(drift_by_update):
+        d, p = drift_by_update.get(u), drift_by_update.get(u - 1)
+        if u >= 2 and d is not None and p is not None and d < -margin and p < -margin:
+            return u, "length_drift"
+        if u >= max_updates:
+            return u, "max_updates"
+    return None, None
 
 
 # ------------------------------------------------------------------ leakage control
@@ -141,17 +192,23 @@ def load_split(path, fold):
     folds = {int(f["fold"]): f for f in d["folds"]}
     f = folds[int(fold)]
     train, val = list(f["train"]), list(f["validation"])
+    train_all = list(f.get("train_all", train))
+    val_all = list(f.get("validation_all", val))
     forbidden = set(f["forbidden_for_training"])
     assert train, "empty train split"
     assert not set(train) & forbidden, "train intersects forbidden_for_training"
     assert set(val) <= forbidden, "validation must be listed as forbidden for training"
     assert not set(train) & set(val), "train/validation overlap"
-    assert not set(f.get("train_all", train)) & forbidden, "train_all intersects forbidden_for_training"
+    assert not set(train_all) & forbidden, "train_all intersects forbidden_for_training"
+    # v17 §4: Task 1 validation on validation_all (the 4 sessions of every fold)
+    assert set(val_all) <= forbidden, "validation_all must be listed as forbidden for training"
+    assert not set(val_all) & (set(train) | set(train_all)), "validation_all intersects train / train_all"
+    assert set(val) <= set(val_all), "validation_all must contain validation"
     for k, n in (f.get("sizes") or {}).items():          # the declared sizes of the split file
         assert len(f[k]) == n, "splits fold %d: %s has %d ids, declared %d" % (fold, k, len(f[k]), n)
     # the test ids are not kept in memory at all (only through 'forbidden')
-    return {"fold": int(fold), "train": train, "train_all": list(f.get("train_all", train)),
-            "validation": val, "forbidden": forbidden, "sha256": sha_file(path)}
+    return {"fold": int(fold), "train": train, "train_all": train_all, "validation": val, "validation_all": val_all,
+            "forbidden": forbidden, "sha256": sha_file(path)}
 
 
 def check_judge_manifest(adapter, split, strict=True):
@@ -171,8 +228,13 @@ def assert_train_id(cid, split):
     assert cid in split["train"] and cid not in split["forbidden"], "non-train scenario %r in a training rollout" % cid
 
 
+def assert_train_all_id(cid, split):
+    assert cid in split["train_all"] and cid not in split["forbidden"], "non-train conversation %r in Task 1 / SFT" % cid
+
+
 # ------------------------------------------------------------------ dry-run fakes (pure python)
 STATUS_IDX = {"NOT ASSESSED": 0, "NOT": 1, "PARTIAL": 2, "SATISFIED": 3, "UNKNOWN": 4}
+FAKE_ACT = 1          # every fake generation is [8, action, 7]: the end_session value is token 1 (stop_mask [0, 1, 0])
 
 
 def _sig(x):
@@ -180,14 +242,19 @@ def _sig(x):
 
 
 class FakeLearner:
-    """Tabular stop policy: p(stop | status) = sigmoid(theta[status]); samples carry the status in
-    prompt_ids[0] and the action (1 = stop) in gen_ids[0]. Same interface as rl_algos.TorchLearner."""
+    """Tabular stop policy: p(stop | status) = sigmoid(theta[status]); samples carry the status in prompt_ids[0] and the
+    action (1 = stop) in gen_ids[1] (token 0 = the fake prefix, token 2 = the rest). Same interface as
+    rl_algos.TorchLearner: multi-step updates with the aux split (v17 S3/S4), the S2 per-token advantage (recorded in
+    self.token_log for the tests), a ref stub, p_end_batch, and the SFT steps."""
 
     def __init__(self, algo, acfg, lr, seed=0, lr_scale=1e4):
         self.algo, self.acfg, self.lr_scale = algo, RA.algo_cfg(**acfg), lr_scale
         self.theta = [-1.0, -1.5, -0.5, 0.0, -1.0]
         self.value = [0.0] * 5
         self.m = [0.0] * 5            # momentum = "optimizer state"
+        self.has_ref, self.ref_theta, self.ref_path = False, None, None
+        self.sft_lr = None
+        self.token_log = []           # [(source, conversation_id, t, token advantages)] of the last update's first epoch
 
     def policy_sha(self):
         return sha_bytes(json.dumps([round(x, 12) for x in self.theta]).encode())
@@ -197,9 +264,18 @@ class FakeLearner:
 
     def logp(self, s):
         p = _sig(self.theta[s["prompt_ids"][0]])
-        return math.log(p if s["gen_ids"][0] == 1 else 1 - p)
+        return math.log(p if s["gen_ids"][FAKE_ACT] == 1 else 1 - p)
+
+    def load_ref(self, path):
+        """Stub of the frozen ref adapter: the theta of ckpt/u00000 (path = ckpt/u00000/adapter, as the torch learner)."""
+        if self.has_ref:
+            raise AssertionError("the ref adapter is already loaded")
+        self.ref_theta = list(json.load(open(os.path.join(os.path.dirname(path), "fake_learner.json")))["theta"])
+        self.has_ref, self.ref_path = True, path
 
     def prepare(self, samples):
+        if samples and not self.has_ref:
+            raise AssertionError("no KL reference loaded (v17: the SFT policy u0)")
         for s in samples:
             s["old_logp"] = self.logp(s)
         if self.algo == "ppo":
@@ -209,69 +285,111 @@ class FakeLearner:
             for s, a in zip(samples, adv):
                 s["adv"] = a
 
-    def update(self, samples, cfg, seed, aux=None):
-        if not samples and not aux:
-            return {"n_samples": 0, "n_tokens": 0, "skipped_update": True}
-        if not samples:
-            out = {"n_samples": 0, "n_tokens": 0, "loss": 0.0, "kl": 0.0, "ratio_mean": 1.0, "clip_frac": 0.0,
-                   "grad_norm": 0.0, "ratio_init_maxdev": 0.0, "optimizer_steps": 0}
-            self._aux_step(aux, cfg, out, own_step=True)
-            return out
-        st = self._update(samples, cfg, seed)
-        if aux:
-            self._aux_step(aux, cfg, st)
-        return st
-
-    def _aux_step(self, aux, cfg, st, own_step=False):
-        lr = cfg["lr"] * self.lr_scale
-        n_t = sum(int(x["gen_len"]) for x in aux)            # normalised per generated token, like the real learner
+    def _aux_grad(self, ex, g):
+        """Adds the (ascent) gradient of the value NLL of these examples, normalised by their gen_len, to g. -> p list."""
+        n_t = sum(int(x["gen_len"]) for x in ex)
         ps = []
-        for x in aux:
+        for x in ex:
             k = x["prompt_ids"][0]
             p = _sig(self.theta[k])
             ps.append(p if x["target_ids"][0] == 1 else 1 - p)
-            grad = (1 - p) if x["target_ids"][0] == 1 else -p
-            self.theta[k] += lr * float(x["weight"]) * grad / n_t
-        st["aux_n"], st["aux_p_correct_before"] = len(aux), sum(ps) / len(ps)
-        if own_step:                                           # aux-only update: its own step
-            st["optimizer_steps"] = st.get("optimizer_steps", 0) + 1
+            g[k] += float(x["weight"]) * ((1 - p) if x["target_ids"][0] == 1 else -p) / n_t
+        return ps
 
-    def _update(self, samples, cfg, seed):
+    def update(self, samples, cfg, seed, aux=None, aux_orders=None):
+        samples, aux = list(samples or []), list(aux or [])
+        if not samples and not aux:
+            return {"n_samples": 0, "n_tokens": 0, "skipped_update": True, "optimizer_steps": 0}
+        n_ep = int(self.acfg["epochs"])
+        k = min(int(self.acfg["minibatches"]), len(samples)) if samples else 1
+        if aux and samples and (aux_orders is None or len(aux_orders) != n_ep):
+            raise ValueError("the stop supervision needs one example order per epoch")
         self.prepare(samples)
         lr, eps = cfg["lr"] * self.lr_scale, self.acfg["clip_eps"]
-        maxdev, steps, ratios = 0.0, 0, []
-        for ep in range(int(self.acfg["epochs"])):
-            for mb in RA.minibatches(len(samples), int(self.acfg["minibatches"]), seed * 1000 + ep):
+        st = {"n_samples": len(samples), "n_tokens": 3 * len(samples) * n_ep, "loss": 0.0, "kl": 0.0,
+              "clip_frac": 0.0, "grad_norm": 0.0, "ratio_init_maxdev": 0.0, "optimizer_steps": 0,
+              "n_minibatches": k if samples else 0, "aux_only": bool(aux and not samples)}
+        if aux:
+            ps = [(_sig(self.theta[x["prompt_ids"][0]]) if x["target_ids"][0] == 1 else 1 - _sig(self.theta[x["prompt_ids"][0]]))
+                  for x in aux]
+            st["aux_n"], st["aux_p_correct_before"] = len(aux), sum(ps) / len(ps)
+        self.token_log, ratios, steps = [], [], []
+        clipped = self.algo in ("grpo", "ppo") or self.acfg["rloo_clipped"]
+
+        def step(g, rl_gn, aux_gn, n_aux):
+            for i in range(5):
+                self.m[i] = 0.9 * self.m[i] + g[i]
+                self.theta[i] += lr * self.m[i]
+            st["optimizer_steps"] += 1
+            steps.append({"rl_grad_norm": rl_gn, "aux_grad_norm": aux_gn, "n_aux": n_aux, "kl": 0.0, "clip_frac": 0.0,
+                          "grad_norm": math.sqrt(sum(x * x for x in g))})
+
+        for ep in (range(n_ep) if samples else ()):
+            parts = RA.aux_split(len(aux), aux_orders[ep], k) if aux else None
+            for j, mb in enumerate(RA.minibatches(len(samples), k, seed * 1000 + ep)):
                 g = [0.0] * 5
                 for i in mb:
                     s = samples[i]
                     r = math.exp(self.logp(s) - s["old_logp"])
-                    if ep == 0 and steps == 0:
-                        maxdev = max(maxdev, abs(r - 1))
+                    if st["optimizer_steps"] == 0:
+                        st["ratio_init_maxdev"] = max(st["ratio_init_maxdev"], abs(r - 1))
                     ratios.append(r)
-                    k = s["prompt_ids"][0]
-                    p = _sig(self.theta[k])
-                    dlogp = (1 - p) if s["gen_ids"][0] == 1 else -p
-                    clipped = self.algo in ("grpo", "ppo") or self.acfg["rloo_clipped"]
-                    adv = s["adv"] + (s.get("adv_stop") or 0.0) * ((s.get("stop_mask") or [0])[0])
+                    tok = RA.token_advantages(s, len(s["gen_ids"]))
+                    if ep == 0:
+                        self.token_log.append((s.get("source"), s.get("conversation_id"), s.get("t"), tok))
+                    adv = tok[FAKE_ACT]          # the tabular policy only has the action token
+                    kk = s["prompt_ids"][0]
+                    p = _sig(self.theta[kk])
+                    dlogp = (1 - p) if s["gen_ids"][FAKE_ACT] == 1 else -p
                     active = (not clipped) or RA.clipped_surrogate(r, adv, eps) == r * adv
                     if active:
-                        g[k] += adv * r * dlogp / len(mb)
+                        g[kk] += adv * r * dlogp / len(mb)
                     if self.algo == "ppo":
-                        self.value[k] += 0.1 * (s["ret"] - self.value[k]) / len(mb)
-                for k in range(5):
-                    self.m[k] = 0.9 * self.m[k] + g[k]
-                    self.theta[k] += lr * self.m[k]
-                steps += 1
-        if maxdev > self.acfg["ratio_init_tol"]:
+                        self.value[kk] += 0.1 * (s["ret"] - self.value[kk]) / len(mb)
+                rl_gn = math.sqrt(sum(x * x for x in g))
+                aux_gn = None
+                if parts and parts[j]:
+                    g0 = list(g)
+                    self._aux_grad([aux[i] for i in parts[j]], g)
+                    aux_gn = math.sqrt(sum((a - b) ** 2 for a, b in zip(g, g0)))
+                step(g, rl_gn, aux_gn, len(parts[j]) if parts else 0)
+        if aux and not samples:                  # v17 S3: supervision only -> one step
+            g = [0.0] * 5
+            self._aux_grad(aux, g)
+            step(g, 0.0, math.sqrt(sum(x * x for x in g)), len(aux))
+        if st["ratio_init_maxdev"] > self.acfg["ratio_init_tol"]:
             raise AssertionError("off-policy start")
-        return {"n_samples": len(samples), "n_tokens": len(samples), "loss": 0.0, "kl": 0.0,
-                "ratio_mean": sum(ratios) / len(ratios), "clip_frac": 0.0, "grad_norm": 0.0,
-                "ratio_init_maxdev": maxdev, "optimizer_steps": steps}
+        st.update(RA.step_stats(steps))
+        st["ratio_mean"] = (sum(ratios) / len(ratios)) if ratios else 1.0
+        st["grad_norm"] = max(s_["grad_norm"] for s_ in steps) if steps else 0.0
+        return st
+
+    # ---- SFT (v17 §1.2)
+    def sft_begin(self, lr):
+        self.sft_lr = float(lr)
+
+    def sft_step(self, batch):
+        g = [0.0] * 5
+        n_t = sum(int(x["gen_len"]) for x in batch)
+        loss = 0.0
+        for x in batch:
+            p = _sig(self.theta[x["prompt_ids"][0]])
+            q = p if x["target_ids"][0] == 1 else 1 - p
+            loss += -float(x["weight"]) * math.log(max(q, 1e-12)) / n_t
+        self._aux_grad(batch, g)
+        for i in range(5):
+            self.theta[i] += self.sft_lr * self.lr_scale * g[i]
+        return {"loss": loss, "grad_norm": math.sqrt(sum(v * v for v in g)), "n": len(batch)}
+
+    def sft_end(self):
+        self.sft_lr = None
 
     def save(self, d):
         write_json_atomic(os.path.join(d, "fake_learner.json"),
                           {"theta": self.theta, "value": self.value, "m": self.m})
+
+    def save_adapter(self, d):
+        write_json_atomic(os.path.join(d, "fake_learner.json"), {"theta": self.theta})
 
     def load(self, d):
         s = json.load(open(os.path.join(d, "fake_learner.json")))
@@ -282,6 +400,9 @@ class FakeLearner:
 
     def end_prob(self, x):
         return _sig(self.theta[x["prompt_ids"][0]])
+
+    def p_end_batch(self, items):
+        return [self.end_prob(x) for x in items]
 
 
 class FakeEnv:
@@ -317,7 +438,7 @@ class FakeEnv:
                     "planner_hit_max_new": False, "no_survivor": False, "planner_diag": {},
                     "stop_rule": "satiation" if stop and level else ("disgust" if stop and rng.random() < 0.3 else "none")}
             if record_generation:
-                step["planner_gen"] = {"prompt_ids": [k, t], "gen_ids": [int(stop), 7], "stop_mask": [1, 0],
+                step["planner_gen"] = {"prompt_ids": [k, t], "gen_ids": [8, int(stop), 7], "stop_mask": [0, 1, 0],
                                        "temperature": planner_temperature, "top_p": planner_top_p, "seed": t}
             if stop:
                 step.update(decision="planner_stop", emitted=False, user="", agent=None)
@@ -346,30 +467,44 @@ class FakeEnv:
 
 
 def _fake_task1_prompts(self, conversation_id):
-    n = 2 + seed_of("human", conversation_id) % 6
-    return [{"t": t, "n_real": n, "real_final": t == n, "user_prompt": "fake"} for t in range(1, n + 1)]
+    n = self.human_turns(conversation_id)
+    return [{"t": t, "n_real": n, "real_final": t == n, "user_prompt": "fake", "emitted_capped": False}
+            for t in range(1, n + 1)]
 
 
 def _fake_task1_sample(self, conversation_id, t, user_prompt, real_final, G, temperature, top_p, seed):
+    """Fake Task2Env.task1_sample: ~8% of the plans are not decisions (invalid), ~6% are valid decisions whose value
+    could not be located (mask_ok False, dropped from the Brier groups); the rest carry prefix [8] and the value
+    re-encoded as true [1] / false [0] (v17 S1). Greedy (temperature 0) plans are always valid."""
     out = []
+    k = 3 if real_final else 1
     for g in range(G):
-        rng = random.Random(seed_of("fake-t1", conversation_id, t, g, seed))
-        k = 3 if real_final else 1
-        stop = rng.random() < _sig(self.learner.theta[k])
-        out.append({"t": t, "replicate": g, "real_final": bool(real_final), "ended_planner": stop,
-                    "planner_unparsed": False, "planner_hit_max_new": False,
-                    "reward": float(stop == bool(real_final)),
-                    "planner_gen": {"prompt_ids": [k, t], "gen_ids": [int(stop), 7], "stop_mask": [1, 0],
+        rng = random.Random(seed_of("fake-t1", conversation_id, t, g, seed, temperature))
+        p = _sig(self.learner.theta[k])
+        stop = (rng.random() < p) if temperature > 0 else p > 0.5
+        r = rng.random() if temperature > 0 else 1.0
+        valid, mask_ok = r >= 0.08, r >= 0.14
+        act = int(stop) if valid else 9
+        out.append({"t": t, "replicate": g, "real_final": bool(real_final), "ended_planner": bool(stop and valid),
+                    "planner_unparsed": not valid, "planner_hit_max_new": False, "decision_valid": valid,
+                    "correct": float(valid and stop == bool(real_final)), "mask_ok": mask_ok,
+                    "prefix_ids": [8] if mask_ok else None, "target_true": [1] if mask_ok else None,
+                    "target_false": [0] if mask_ok else None,
+                    "planner_gen": {"prompt_ids": [k, t], "gen_ids": [8, act, 7],
+                                    "stop_mask": [0, 1, 0] if mask_ok else None, "note_mask": None,
                                     "temperature": temperature, "top_p": top_p, "seed": g}})
-    out[0]["aux"] = {"prompt_ids": [k, t], "prefix_ids": [], "target_ids": [int(bool(real_final))],
-                     "want_end": bool(real_final), "gen_len": 2}
+    for x in out:
+        if x["mask_ok"]:
+            out[0]["aux"] = {"prompt_ids": [k, t], "prefix_ids": [8], "target_ids": [int(bool(real_final))],
+                             "want_end": bool(real_final), "gen_len": 3}
+            break
     return out
 
 
 def _fake_task1_end_probe(self, conversation_id, t, user_prompt, real_final):
     k = 3 if real_final else 1
     return {"valid": True, "decision_valid": True, "greedy_end": _sig(self.learner.theta[k]) > 0.5,
-            "prompt_ids": [k, t], "prefix_ids": [], "target_true": [1], "target_false": [0]}
+            "prompt_ids": [k, t], "prefix_ids": [8], "target_true": [1], "target_false": [0]}
 
 
 def _fake_run_task1_prompts(self, conversation_id, seed=0, keep_prompts=False):
@@ -398,6 +533,11 @@ def stub_llm_transport(request):
     return {"choices": [{"message": {"content": json.dumps(prop)}}]}
 
 
+def kl_div(q, p):
+    """KL(q || p) of two distributions over 0..t_max (both smoothed, so p > 0)."""
+    return sum(a * math.log(a / b) for a, b in zip(q, p) if a > 0)
+
+
 # ------------------------------------------------------------------ trainer
 class Trainer:
     def __init__(self, a):
@@ -409,7 +549,12 @@ class Trainer:
         self.p_roll_t1 = os.path.join(a.out, "rollouts_task1.jsonl")
         self.p_upd = os.path.join(a.out, "updates.jsonl")
         self.p_val = os.path.join(a.out, "validation.jsonl")
-        self.p_best = os.path.join(a.out, "best.json")
+        self.p_final = os.path.join(a.out, "final.json")
+        self.p_meta = os.path.join(a.out, "run_meta.jsonl")
+        self.p_sft_ex = os.path.join(a.out, "sft_examples.jsonl")
+        self.p_sft_meta = os.path.join(a.out, "sft_examples_meta.json")
+        self.p_sft = os.path.join(a.out, "sft.jsonl")
+        self.p_base_pend = os.path.join(a.out, "base_pend_train.jsonl")
         self.split = load_split(a.splits, a.fold)
         self.judge_info = check_judge_manifest(a.judge_adapter, self.split, strict=not a.judge_manifest_train_all)
         self.io_lock = threading.Lock()
@@ -417,27 +562,34 @@ class Trainer:
         # pend: reward v4 (D1(b): human length DISTRIBUTION matching) with format constraints on
         # (declared defaults; a --config file may override)
         base_reward = {"version": "v4", "lambda_unparsed": 1.0, "lambda_hit_max_new": 1.0} if a.arm == "pend" else {}
+        # v17 (S9/S10): lr 1e-5, kl 0.01 from the trainer's SPEC table (the args), w_aux = --aux-weight (a constant)
         cfg0 = RC.initial_cfg(**{**base_reward, **user_cfg.get("reward", {}), "lr": a.lr, "kl_coef": a.kl,
-                                 "w_aux": a.stop_sup_weight})
-        self.selection_cfg = copy.deepcopy(cfg0)          # fixed forever: comparable validation scores
+                                 "w_aux": a.aux_weight})
+        # fixed-weight cfg (the shadow reward and the validation reward; the name is kept from v16 for the eval tools,
+        # v17 selects nothing on it)
+        self.selection_cfg = copy.deepcopy(cfg0)
         self.acfg = RA.algo_cfg(**user_cfg.get("algo", {}))
         ctl_opts = dict(user_cfg.get(a.controller, {}))
-        if a.controller == "llm" and cfg0.get("version") == "v4":
-            ctl_opts["aux_floor"] = float(a.stop_sup_floor)       # v16: the controller prompt names the aux floor
         self.controller = RC.make_controller(
             a.controller, cfg0, log_path=os.path.join(a.out, "llm_controller.jsonl"),
             transport=stub_llm_transport if (a.dry_run and a.controller == "llm") else None, **ctl_opts)
         self.cfg = copy.deepcopy(cfg0)
-        self.history, self.best, self.update_done = [], None, 0
-        self.task1_base = None       # Task 1 stop metrics of the starting policy (update 0 validation)
-        self.aux_anneal_start = None # D2 (v16): validation update at which bal_p beat task1_base by the margin twice in a row
-        self.intervention = None     # a human intervention on the controller, once applied (see apply_intervention)
+        self.history, self.update_done = [], 0
+        self.task1_base = None       # Task 1 metrics of SFT (u0) at its validation (the comparison base)
+        self.stop_reason = None      # v17: "max_updates" | "length_drift" once final.json is written
+        self.sft_info = None         # v17: the SFT warm-up's record (chosen epoch, shas), kept in ckpt u0
         self.p_h = None              # v4: smoothed human length distribution of the TRAIN conversations
         self.env = self.learner = None
         self.n_new_episodes = 0
+        self.gen_name = None
         self.config_record = {"args": vars(a), "cfg0": cfg0, "selection_cfg": self.selection_cfg,
                               "algo_cfg": self.acfg, "algo_bounds": RA.ALGO_BOUNDS, "lora": RA.LORA,
-                              "controller": self.controller.describe(), "user_config": user_cfg}
+                              "controller": self.controller.describe(), "user_config": user_cfg,
+                              "spec_version": SPEC_VERSION, "spec_values": SPEC_V17}
+
+    def gpu(self):
+        """The env's GPU lock (learner forwards share the GPU with the Speaker / Planner calls of Task2Env)."""
+        return getattr(self.env, "gpu_lock", None) or contextlib.nullcontext()
 
     # -------------------------------------------------------- setup
     def build(self):
@@ -446,18 +598,18 @@ class Trainer:
             self.learner = FakeLearner(a.algo, self.acfg, self.cfg["lr"], seed=a.seed)
             self.env = FakeEnv(self.learner)
             self.set_p_h()
+            self.load_ref_if_u0()
             return
         from task2_env import PlannerLM, Task2Env
         from goal_judge import GoalJudge
         planner = PlannerLM(a.planner_path, gpu=a.gpu, nf4=a.planner_nf4, dtype=a.planner_dtype,
                             adapter=None, trainable=False)
-        model = RA.setup_policy(planner, init_adapter=a.init_adapter)
+        # v17 B1: the LoRA init is seeded -> the same start policy (and sha) at every launch
+        model = RA.setup_policy(planner, seed_of(a.seed, "lora_init"))
         planner.adapter = "rl:%s" % a.out
         if a.planner_backend == "vllm":
             # Planner generation by the vLLM server; the HF model stays the learner (it re-scores every token)
             import vllm_planner
-            if a.init_adapter:
-                raise SystemExit("--init-adapter is merged into the HF base; the vLLM server serves the plain base")
             vllm_planner.VLLMPlanner(a.vllm_url).attach(planner)
         judge = GoalJudge(a.judge_base, adapter=a.judge_adapter, gpu=a.gpu) if a.arm != "pend" else None
         self.env = Task2Env(arm=a.arm, gpu=a.gpu, planner=planner, judge=judge, batch=bool(a.batch), max_batch=a.max_batch,
@@ -473,6 +625,13 @@ class Trainer:
         self.learner = RA.TorchLearner(model, a.algo, self.acfg, lr=self.cfg["lr"], seed=a.seed)
         self.config_record["env"] = self.env.describe()
         self.config_record["trainable_params"] = self.learner.trainable_names()[:8] + ["..."]
+        self.load_ref_if_u0()
+
+    def load_ref_if_u0(self):
+        """v17 B4: once u0 (the SFT policy) exists, it is the frozen "ref" adapter of the learner (resume and the test
+        evaluation build; a fresh run loads it at the end of sft_stage). After the optimizer exists."""
+        if os.path.exists(os.path.join(self.ckpt_dir(0), "state.json")):
+            self.learner.load_ref(os.path.join(self.ckpt_dir(0), "adapter"))
 
     def set_p_h(self):
         """v4: p_h from the real people's number of messages in splits[fold].train_all ONLY (Task 2 length
@@ -492,77 +651,45 @@ class Trainer:
         q = RR.turn_distribution([e["emitted_user_turns"] for e in episodes], cfg["t_max"], cfg["alpha_smooth"])
         return {"p_h": self.p_h, "q": q}
 
-    def aux_weight(self, u, cfg):
-        """Effective stop-supervision weight = max(--stop-sup-floor, cfg["w_aux"] x the D2 anneal); cfg["w_aux"] is the
-        initial --stop-sup-weight, then tuned by the LLM controller from TRAIN statistics; the anneal is 1 until the
-        D2 trigger (validation Task 1 bal_p above the untrained policy's by --t1-trigger-margin at two consecutive
-        validations, v16), then goes linearly to 0 over --stop-sup-anneal updates; the result never goes below
-        the floor (v16, user 2026-09-28)."""
-        return max(float(self.a.stop_sup_floor), self.aux_annealed(u, cfg))
+    def aux_weight(self):
+        """v17 §3.3 / S9 (user 2026-09-30): the stop-supervision weight is the constant --aux-weight (SPEC 0.5); no D2
+        trigger, no anneal, no floor, not tuned by the controller."""
+        return float(self.a.aux_weight)
 
-    def aux_annealed(self, u, cfg):
-        """cfg["w_aux"] x the D2 anneal factor, before the floor. The factor goes linearly from 1 towards
-        floor / --stop-sup-weight (not to 0): once the anneal is over the controller's w_aux still scales the
-        supervision (user 2026-09-28: the floor bounds it from below, the controller may still raise it)."""
-        w = float(cfg["w_aux"])
-        if self.aux_anneal_start is not None and self.a.stop_sup_anneal > 0:
-            fmin = (float(self.a.stop_sup_floor) / float(self.a.stop_sup_weight)) if self.a.stop_sup_weight > 0 else 0.0
-            f = max(0.0, 1.0 - (u - self.aux_anneal_start) / float(self.a.stop_sup_anneal))
-            w = w * max(fmin, f)
-        return w
-
-    def apply_intervention(self):
-        """Human intervention approved by the user (--intervention FILE, JSON {"set_cfg": {key: value},
-        "controller_bounds": {key: [lo, hi]}, "reason": str, "approved": str}). The bounds are set at EVERY
-        launch (the controller options are rebuilt from the config each time); the values are set ONCE, before
-        the next update, and the record (update, file sha) is kept in every later checkpoint. Once applied, every
-        later launch must pass the same file: the tightened bounds must not silently revert."""
-        a = self.a
-        if not a.intervention:
-            if self.intervention:
-                raise SystemExit("an intervention was applied at update %s; pass the same --intervention"
-                                 % self.intervention["at_update"])
-            return None
-        if not hasattr(self.controller, "intervene"):
-            raise SystemExit("--intervention needs the llm (v4 factor) controller")
-        iv = json.load(open(a.intervention, encoding="utf-8"))
-        extra = set(iv) - {"set_cfg", "controller_bounds", "reason", "approved"}
-        if extra or not iv.get("set_cfg") or not iv.get("reason") or not iv.get("approved"):
-            raise SystemExit("intervention file needs set_cfg, reason, approved (unknown keys %r)" % sorted(extra))
-        sha = sha_file(a.intervention)
-        for k, (lo, hi) in (iv.get("controller_bounds") or {}).items():
-            self.controller.set_bounds(k, lo, hi)
-        if self.intervention is None:
-            u = self.update_done + 1
-            self.cfg = self.controller.intervene(iv["set_cfg"], u, iv["reason"])
-            self.intervention = {"at_update": u, "file_sha256": sha, **iv}
-            print("INTERVENTION applied before update %d: %s bounds %s" % (u, iv["set_cfg"], iv.get("controller_bounds")),
-                  flush=True)
-        elif self.intervention["file_sha256"] != sha:
-            raise SystemExit("intervention file changed after it was applied (sha %s -> %s)"
-                             % (self.intervention["file_sha256"], sha))
-        for k in self.controller.opt["keys"]:
-            lo, hi = self.controller.opt["bounds"][k]
-            if self.cfg[k] != 0 and not (lo <= self.cfg[k] <= hi):
-                raise SystemExit("%s=%g outside the controller bounds [%g, %g] after the intervention" % (k, self.cfg[k], lo, hi))
-        return self.intervention
+    def u0_state(self):
+        p = os.path.join(self.ckpt_dir(0), "state.json")
+        return json.load(open(p)) if os.path.exists(p) else None
 
     def meta(self, kind):
         a = self.a
+        assert getattr(a, "init_adapter", None) is None, "v17: no init adapter"
+        st0 = self.u0_state()
+        sft = (st0 or {}).get("sft") or {}
         row = {"kind": kind, "time": time.time(), "code_sha256": code_shas(),
                "config_sha256": sha_bytes(json.dumps(self.config_record, sort_keys=True, default=str).encode()),
                "config": self.config_record, "splits_sha256": self.split["sha256"], "fold": a.fold,
                "judge_manifest": self.judge_info,
                "judge_adapter_sha256": None if a.dry_run else sha_path(a.judge_adapter),
-               "init_adapter_sha256": sha_path(a.init_adapter) if a.init_adapter else None,
-               "config_file_sha256": sha_file(a.config) if a.config else None}
+               "init_adapter_sha256": None,
+               "config_file_sha256": sha_file(a.config) if a.config else None,
+               # v17 §8 provenance: the SFT arguments, the cached examples, u0, the chosen epoch, the KL reference
+               "spec_version": SPEC_VERSION,
+               "sft_args": {"sft_lr": a.sft_lr, "sft_epochs_max": a.sft_epochs_max,
+                            "sft_samples_per_point": a.sft_samples_per_point},
+               "sft_examples_sha256": sha_file(self.p_sft_ex) if os.path.exists(self.p_sft_ex) else None,
+               "u0_policy_sha": (st0 or {}).get("policy_sha"),
+               "sft_chosen_epoch": sft.get("chosen_epoch"),
+               "ref_policy_sha": (st0 or {}).get("policy_sha") if getattr(self.learner, "has_ref", False) else None}
         return row
 
     def check_provenance(self, row):
-        prev = read_jsonl(os.path.join(self.a.out, "run_meta.jsonl"))
+        prev = read_jsonl(self.p_meta)
         if not prev:
             return
         first = prev[0]
+        if first.get("spec_version") != SPEC_VERSION:
+            raise SystemExit("run %s was written by spec %r; this trainer implements %s only"
+                             % (self.a.out, first.get("spec_version"), SPEC_VERSION))
         for k in ("code_sha256", "splits_sha256", "judge_adapter_sha256", "init_adapter_sha256", "config_file_sha256"):
             if first.get(k) != row.get(k) and not self.a.allow_code_change:
                 raise SystemExit("provenance mismatch on resume (%s); rerun in a new --out or pass --allow-code-change" % k)
@@ -577,6 +704,9 @@ class Trainer:
     def ckpt_dir(self, u):
         return os.path.join(self.ckpt_root, "u%05d" % u)
 
+    def sft_dir(self, k):
+        return os.path.join(self.ckpt_root, "sft_e%d" % k)
+
     def save_checkpoint(self, u, update_row):
         d, tmp = self.ckpt_dir(u), self.ckpt_dir(u) + ".tmp"
         if os.path.exists(tmp):
@@ -589,8 +719,8 @@ class Trainer:
             torch.save(RA.rng_state(), os.path.join(tmp, "rng.pt"))
         state = {"update": u, "policy_version": u, "policy_sha": self.learner.policy_sha(),
                  "cfg": self.cfg, "controller": self.controller.state_dict(), "history": self.history,
-                 "best": self.best, "update_row": update_row, "task1_base": self.task1_base,
-                 "aux_anneal_start": self.aux_anneal_start, "intervention": self.intervention,
+                 "update_row": update_row, "task1_base": self.task1_base, "stop_reason": self.stop_reason,
+                 "sft": self.sft_info if u == 0 else None, "spec_version": SPEC_VERSION,
                  "python_rng": [rng["python"][0], list(rng["python"][1]), rng["python"][2]]}
         write_json_atomic(os.path.join(tmp, "state.json"), state)
         write_json_atomic(os.path.join(tmp, "rl_manifest.json"), self.manifest())
@@ -604,15 +734,28 @@ class Trainer:
                 if u - self.a.keep_optimizer_last >= 1 and os.path.exists(os.path.join(old, fn)):
                     os.remove(os.path.join(old, fn))   # adapters are kept for every update
 
+    def update_state(self, u, **kv):
+        """Persist fields into ckpt u's state.json now (a crash must not lose them)."""
+        sp = os.path.join(self.ckpt_dir(u), "state.json")
+        st = json.load(open(sp))
+        st.update(kv)
+        write_json_atomic(sp, st)
+
     def manifest(self):
         """What this policy was trained on (checked by the evaluation CLIs before any validation/test run)."""
         a = self.a
-        return {"kind": "planner_rl", "fold": self.split["fold"], "splits_sha256": self.split["sha256"],
+        return {"kind": "planner_rl", "spec_version": SPEC_VERSION, "fold": self.split["fold"],
+                "splits_sha256": self.split["sha256"],
                 "train_scenarios": sorted(self.split["train"]), "train_conversations": sorted(self.split["train_all"]),
+                "sft_conversations": sorted(self.split["train_all"]),
                 "fewshot_pool": sorted(self.split["train_all"]) if a.fewshot == "fold" else [],
-                "p_h_source": "train_all", "validation_used_for": "checkpoint selection only",
-                "planner_path": a.planner_path, "init_adapter": a.init_adapter,
-                "init_adapter_sha256": sha_path(a.init_adapter) if a.init_adapter else None,
+                "p_h_source": "train_all",
+                "validation_used_for": "the SFT epoch choice (Task 1 NLL on validation_all) and reporting; "
+                                       "no checkpoint selection",
+                "planner_path": a.planner_path, "init_adapter": None, "init_adapter_sha256": None,
+                "sft_examples_sha256": sha_file(self.p_sft_ex) if os.path.exists(self.p_sft_ex) else None,
+                "sft_chosen_epoch": (self.sft_info or {}).get("chosen_epoch"),
+                "ref_policy_sha": (self.sft_info or {}).get("policy_sha"),
                 "arm": a.arm, "implicit_profile": a.implicit_profile, "fewshot": a.fewshot, "selector": a.selector,
                 "planner_backend": a.planner_backend, "tis_cap": self.acfg["tis_cap"]}
 
@@ -627,10 +770,10 @@ class Trainer:
         if self.learner.policy_sha() != st["policy_sha"]:
             raise AssertionError("restored policy sha differs from the checkpoint record")
         self.controller.load_state_dict(st["controller"])
-        self.cfg, self.history, self.best, self.update_done = st["cfg"], st["history"], st["best"], u
+        self.cfg, self.history, self.update_done = st["cfg"], st["history"], u
         self.task1_base = st.get("task1_base")
-        self.aux_anneal_start = st.get("aux_anneal_start")
-        self.intervention = st.get("intervention")
+        self.stop_reason = st.get("stop_reason")
+        self.sft_info = (self.u0_state() or {}).get("sft")
         py = st["python_rng"]
         random.setstate((py[0], tuple(py[1]), py[2]))
         if not self.a.dry_run:
@@ -642,6 +785,219 @@ class Trainer:
             append_jsonl(self.p_upd, st["update_row"])
         return True
 
+    # -------------------------------------------------------- generation policy
+    def sync_generation_policy(self, pv=None, path=None, tag=None):
+        """v17 B3: the vLLM server generates with the adapter at `path` (default: checkpoint pv's) under the name
+        "<tag>-<sha12 of the adapter directory>" (tag default "p<pv>"; the SFT candidates use "sft_e<k>"); every
+        generation records that name. The learner must hold the same policy (the caller's responsibility)."""
+        if path is None:
+            path, tag = os.path.join(self.ckpt_dir(pv), "adapter"), "p%d" % pv
+        remote = getattr(getattr(self.env, "planner", None), "remote", None)
+        if remote is None:
+            self.gen_name = None
+            return None
+        self.gen_name = remote.use_adapter(path, tag)
+        return self.gen_name
+
+    # -------------------------------------------------------- SFT warm-up (v17 §1)
+    def save_sft_candidate(self, k):
+        """ckpt/sft_e<k>: the learner's current policy adapter (k = 0: the start policy) + its policy sha."""
+        d, tmp = self.sft_dir(k), self.sft_dir(k) + ".tmp"
+        if os.path.exists(tmp):
+            shutil.rmtree(tmp)
+        os.makedirs(tmp)
+        self.learner.save_adapter(tmp)          # the torch learner writes tmp/adapter (the "default" adapter only)
+        write_json_atomic(os.path.join(tmp, "state.json"), {"epoch": k, "policy_sha": self.learner.policy_sha(),
+                                                            "time": time.time()})
+        if os.path.exists(d):
+            shutil.rmtree(d)
+        os.replace(tmp, d)
+        return d
+
+    def sft_examples(self, start_sha):
+        """v17 §1.1 (user 2026-09-30): the SFT examples of every train_all decision point, generated by the START
+        policy (served as ckpt/sft_e0), plus the start policy's teacher-forced P_end at every point
+        (base_pend_train.jsonl). Cached: reused only when the cache key (start policy sha, splits, code, seed, plan
+        settings) matches; a mismatching cache is never reused and never overwritten. -> (examples, meta)."""
+        a = self.a
+        key = {"start_policy_sha": start_sha, "splits_sha256": self.split["sha256"], "code_sha256": code_shas(),
+               "seed": a.seed, "sft_samples_per_point": a.sft_samples_per_point,
+               "sample_temperature": SFT_TEMPERATURE, "sample_top_p": SFT_TOP_P}
+        if os.path.exists(self.p_sft_meta):
+            m = json.load(open(self.p_sft_meta, encoding="utf-8"))
+            bad = [k for k in key if m.get("key", {}).get(k) != key[k]]
+            if not bad and os.path.exists(self.p_sft_ex) and sha_file(self.p_sft_ex) == m["examples_sha256"] \
+                    and os.path.exists(self.p_base_pend) and sha_file(self.p_base_pend) == m["base_pend_sha256"]:
+                return read_jsonl(self.p_sft_ex), m
+            raise SystemExit("the SFT example cache in %s does not match this run (%s): not reused, not overwritten"
+                             % (a.out, bad or "file sha"))
+        t0 = time.time()
+        self.sync_generation_policy(path=os.path.join(self.sft_dir(0), "adapter"), tag="sft_e0")
+        cids = sorted(self.split["train_all"])
+        for cid in cids:
+            assert_train_all_id(cid, self.split)
+
+        def one_conv(cid):
+            n = self.env.human_turns(cid)
+            ex, base, pts, cnt = [], [], [], {"unparsed": 0, "hit_max_new": 0, "invalid_value": 0, "mask_not_found": 0}
+            if n < 2:
+                return ex, base, pts, cnt           # turn 1 never ends: no decision point
+            prompts = self.env.task1_prompts(cid)
+            assert len(prompts) == n
+            for t in range(2, n + 1):
+                if any(p.get("emitted_capped") for p in prompts[: t - 1]):
+                    pts.append([cid, t, n, "skipped_capped_history", 0])
+                    continue
+                pr = prompts[t - 1]
+                assert pr["t"] == t and pr["real_final"] == (t == n)
+                plans = []
+                for k in range(1 + a.sft_samples_per_point):          # N1: k = 0 greedy, then the samples
+                    temp = 0.0 if k == 0 else SFT_TEMPERATURE
+                    x = self.env.task1_sample(cid, t, pr["user_prompt"], pr["real_final"], 1, temp, SFT_TOP_P,
+                                              seed_of(a.seed, "sft", cid, t, k))[0]
+                    plans.append(x)
+                n_ex = 0
+                for k, x in enumerate(plans):
+                    g = x["planner_gen"]
+                    if not x["decision_valid"]:
+                        cnt["unparsed" if x.get("planner_unparsed") else
+                            "hit_max_new" if x.get("planner_hit_max_new") else "invalid_value"] += 1
+                        continue
+                    if not x.get("mask_ok"):
+                        cnt["mask_not_found"] += 1
+                        continue
+                    ex.append({"conversation_id": cid, "t": t, "n": n, "real_final": t == n,
+                               "kind": "greedy" if k == 0 else "sample", "k": k,
+                               "seed": seed_of(a.seed, "sft", cid, t, k),
+                               "prompt_ids": list(g["prompt_ids"]), "prefix_ids": list(x["prefix_ids"]),
+                               "target_ids": list(x["target_true"] if t == n else x["target_false"]),
+                               "target_true": list(x["target_true"]), "target_false": list(x["target_false"]),
+                               "gen_len": len(g["gen_ids"]), "gen_adapter": g.get("gen_adapter")})
+                    n_ex += 1
+                pts.append([cid, t, n, "ok", n_ex])
+                # base P_end (§1.1 item 6): the greedy plan = task1_end_probe's, scored by the start policy
+                g0, x0 = plans[0]["planner_gen"], plans[0]
+                if x0["decision_valid"] and x0.get("mask_ok"):
+                    with self.gpu():
+                        pe = float(self.learner.p_end_batch([{"prompt_ids": g0["prompt_ids"], "prefix_ids": x0["prefix_ids"],
+                                                              "target_true": x0["target_true"],
+                                                              "target_false": x0["target_false"]}])[0])
+                    valid = True
+                else:
+                    pe = 1.0 if (x0["decision_valid"] and x0["ended_planner"]) else 0.0     # the unscored-point rule
+                    valid = False
+                base.append({"conversation_id": cid, "t": t, "n": n, "real_final": t == n, "p_end": pe, "valid": valid,
+                             "decision_valid": bool(x0["decision_valid"]), "greedy_end": bool(x0["ended_planner"]),
+                             "gen_adapter": g0.get("gen_adapter"), "policy_sha": start_sha})
+            return ex, base, pts, cnt
+
+        if a.rollout_workers <= 1:
+            res = [one_conv(c) for c in cids]
+        else:
+            with ThreadPoolExecutor(max_workers=a.rollout_workers) as ex_:
+                res = list(ex_.map(one_conv, cids))
+        examples = sorted((e for r in res for e in r[0]), key=lambda e: (e["conversation_id"], e["t"], e["k"]))
+        base = sorted((b for r in res for b in r[1]), key=lambda b: (b["conversation_id"], b["t"]))
+        points = sorted((p for r in res for p in r[2]), key=lambda p: (p[0], p[1]))
+        counts = {k: sum(r[3][k] for r in res) for k in ("unparsed", "hit_max_new", "invalid_value", "mask_not_found")}
+        counts.update(n_conversations=len(cids), n_points=sum(1 for p in points if p[3] == "ok"),
+                      n_points_skipped_capped=sum(1 for p in points if p[3] != "ok"),
+                      n_plans=sum(1 for p in points if p[3] == "ok") * (1 + a.sft_samples_per_point),
+                      n_examples=len(examples), n_examples_greedy=sum(1 for e in examples if e["kind"] == "greedy"),
+                      n_examples_sample=sum(1 for e in examples if e["kind"] == "sample"))
+        if not examples:
+            raise SystemExit("SFT: no valid plan with a located value on train_all (counts %r)" % counts)
+        write_jsonl_atomic(self.p_sft_ex, examples)
+        write_jsonl_atomic(self.p_base_pend, base)
+        m = {"key": key, "counts": counts, "points": points, "examples_sha256": sha_file(self.p_sft_ex),
+             "base_pend_sha256": sha_file(self.p_base_pend), "gen_adapter": self.gen_name,
+             "conversations": cids, "sft_s": round(time.time() - t0, 1), "time": time.time()}
+        write_json_atomic(self.p_sft_meta, m)          # written last: its presence marks a complete cache
+        return examples, m
+
+    def sft_probe(self, attempt, k, examples, steps):
+        """One SFT candidate (the learner holds it; vLLM serves ckpt/sft_e<k>, S8): the train P_end on the examples and
+        the greedy Task 1 run + teacher-forced P_end on validation_all -> an sft.jsonl epoch row."""
+        a = self.a
+        psha = self.learner.policy_sha()
+        cst = json.load(open(os.path.join(self.sft_dir(k), "state.json")))
+        assert cst["policy_sha"] == psha, "SFT candidate %d: the learner does not hold the saved adapter" % k
+        name = self.sync_generation_policy(path=os.path.join(self.sft_dir(k), "adapter"), tag="sft_e%d" % k)
+        with self.gpu():
+            pe = self.learner.p_end_batch([{"prompt_ids": e["prompt_ids"], "prefix_ids": e["prefix_ids"],
+                                            "target_true": e["target_true"], "target_false": e["target_false"]}
+                                           for e in examples])
+        fin = [p for p, e in zip(pe, examples) if e["real_final"]]
+        mid = [p for p, e in zip(pe, examples) if not e["real_final"]]
+        ids = sorted(self.split["validation_all"])
+        for cid in ids:
+            assert cid in self.split["forbidden"] and cid not in self.split["train_all"], "validation_all id %r" % cid
+        with ThreadPoolExecutor(max_workers=max(1, a.rollout_workers)) as ex:
+            rows = list(ex.map(lambda c: self.task1_eval_row(None, psha, c), ids))
+        pts = [p for r in rows for p in r["end_probs"]]
+        m = T1.task1_prob_metrics(pts)
+        row = {"kind": "epoch", "attempt": attempt, "epoch": k, "policy_sha": psha, "gen_adapter": name,
+               "train_steps": len(steps), "train_loss": (sum(s["loss"] for s in steps) / len(steps)) if steps else None,
+               "train_grad_norm_max": max(s["grad_norm"] for s in steps) if steps else None,
+               "train_p_end_final_mean": (sum(fin) / len(fin)) if fin else None,
+               "train_p_end_nonfinal_mean": (sum(mid) / len(mid)) if mid else None,
+               "val": {k_: m[k_] for k_ in ("nll", "bal_p", "auc", "n_points", "n_invalid", "n_final")},
+               "val_ids": ids, "val_end_probs": {r["conversation_id"]: r["end_probs"] for r in rows},
+               "val_n_turns": {r["conversation_id"]: len(r["task1"]["turns"]) for r in rows}, "time": time.time()}
+        append_jsonl(self.p_sft, row)
+        return row
+
+    def sft_stage(self):
+        """v17 §1 (user 2026-09-30): the SFT warm-up before u0 (see the module docstring). Ends with u0 = the chosen
+        candidate saved as ckpt/u00000 (LATEST) and loaded as the frozen KL reference "ref". An interrupted SFT is re-run
+        from its cached examples (a new attempt in sft.jsonl); u0 / LATEST are written only when it is complete."""
+        a = self.a
+        assert not os.path.exists(os.path.join(self.ckpt_root, "LATEST.json")), "u0 exists: SFT never runs again"
+        t0 = time.time()
+        start_sha = self.learner.policy_sha()
+        self.save_sft_candidate(0)                 # B3: the start policy as an adapter vLLM can serve
+        examples, emeta = self.sft_examples(start_sha)
+        attempt = 1 + sum(1 for r in read_jsonl(self.p_sft) if r.get("kind") == "attempt_start")
+        append_jsonl(self.p_sft, {"kind": "attempt_start", "attempt": attempt, "start_policy_sha": start_sha,
+                                  "sft_examples_sha256": emeta["examples_sha256"], "n_examples": len(examples),
+                                  "sft_lr": a.sft_lr, "sft_epochs_max": a.sft_epochs_max, "batch": SFT_BATCH,
+                                  "time": time.time()})
+        rows = [self.sft_probe(attempt, 0, examples, [])]
+        self.learner.sft_begin(a.sft_lr)
+        for ep in range(1, a.sft_epochs_max + 1):
+            order = list(range(len(examples)))
+            random.Random(seed_of(a.seed, "sft_shuffle", ep)).shuffle(order)
+            steps = []
+            for i in range(0, len(order), SFT_BATCH):
+                batch = [dict(examples[j], weight=1.0) for j in order[i:i + SFT_BATCH]]
+                with self.gpu():
+                    steps.append(self.learner.sft_step(batch))
+            self.save_sft_candidate(ep)
+            rows.append(self.sft_probe(attempt, ep, examples, steps))
+        self.learner.sft_end()
+        k = sft_choice(rows)
+        chosen = next(r for r in rows if r["epoch"] == k)
+        self.learner.load_policy(self.sft_dir(k))
+        if self.learner.policy_sha() != chosen["policy_sha"]:
+            raise AssertionError("SFT: the loaded candidate %d does not have its recorded sha" % k)
+        append_jsonl(self.p_sft, {"kind": "selection", "attempt": attempt, "chosen_epoch": k,
+                                  "policy_sha": chosen["policy_sha"],
+                                  "rule": "lowest validation_all nll, then fewer n_invalid, then the earlier epoch",
+                                  "candidates": {str(r["epoch"]): [r["val"]["nll"], r["val"]["n_invalid"]] for r in rows},
+                                  "u0_is_start_policy": k == 0, "time": time.time()})
+        self.sft_info = {"attempt": attempt, "chosen_epoch": k, "policy_sha": chosen["policy_sha"],
+                         "start_policy_sha": start_sha, "sft_examples_sha256": emeta["examples_sha256"],
+                         "n_examples": len(examples), "u0_is_start_policy": k == 0,
+                         "sft_s": round(time.time() - t0, 1)}
+        self.save_checkpoint(0, None)              # policy_version 0 = SFT (u0); LATEST
+        self.learner.load_ref(os.path.join(self.ckpt_dir(0), "adapter"))
+        if self.learner.policy_sha() != chosen["policy_sha"]:
+            raise AssertionError("loading the ref adapter changed the policy")
+        append_jsonl(self.p_meta, {**self.meta("sft"), "sft_info": self.sft_info})
+        print(json.dumps({"sft": {k_: self.sft_info[k_] for k_ in ("chosen_epoch", "n_examples", "u0_is_start_policy")},
+                          "candidates": {r["epoch"]: r["val"]["nll"] for r in rows}}), flush=True)
+        return self.sft_info
+
     # -------------------------------------------------------- rollouts
     def scenarios_for(self, u):
         rng = random.Random(seed_of(self.a.seed, "scenarios", u))
@@ -650,16 +1006,6 @@ class Trainer:
         if k <= len(pool):
             return rng.sample(pool, k)
         return [rng.choice(pool) for _ in range(k)]
-
-    def sync_generation_policy(self, pv):
-        """The vLLM server must generate with the policy the learner holds: the adapter of checkpoint pv (saved
-        from this learner) is loaded under a name carrying pv and its sha; every generation records that name."""
-        remote = getattr(getattr(self.env, "planner", None), "remote", None)
-        if remote is None:
-            self.gen_name = None
-            return None
-        self.gen_name = remote.use_adapter(os.path.join(self.ckpt_dir(pv), "adapter"), "p%d" % pv)
-        return self.gen_name
 
     def rollouts(self, u):
         a, pv, psha = self.a, u - 1, self.learner.policy_sha()
@@ -709,16 +1055,41 @@ class Trainer:
                     rows[k] = r
         return [[rows[(slot, g)] for g in range(a.G)] for slot in range(len(cids))]
 
+    def score_task1(self, samples, real_final):
+        """v17 §3.2 / S1 (user 2026-09-30): the Brier reward of each Task 1 sample, computed by the learner holding the
+        ROLLOUT policy (pi_old) under the env's GPU lock, eval mode, before the row is logged:
+          valid, value located (mask_ok)  P_end = p(true) / (p(true) + p(false)) on the sample's OWN prefix,
+                                          R = 1 - (P_end - y)^2, y = 1[t == n]         status "valid"
+          valid, value not located        dropped from the group (our parsing failure): no reward, no gradient
+                                                                                     status "dropped", stop_mask_mismatch
+          not a decision                  R = 0 (the worst Brier score): format penalty  status "invalid"."""
+        y = 1.0 if real_final else 0.0
+        items, idx = [], []
+        for i, x in enumerate(samples):
+            if not x.get("decision_valid"):
+                x.update(status="invalid", p_end=None, reward=0.0, dropped=False, drop_reason=None)
+            elif not x.get("mask_ok"):
+                x.update(status="dropped", p_end=None, reward=None, dropped=True, drop_reason="stop_mask_mismatch")
+            else:
+                items.append({"prompt_ids": x["planner_gen"]["prompt_ids"], "prefix_ids": x["prefix_ids"],
+                              "target_true": x["target_true"], "target_false": x["target_false"]})
+                idx.append(i)
+        if items:
+            with self.gpu():
+                pe = self.learner.p_end_batch(items)
+            for i, p in zip(idx, pe):
+                p = float(p)
+                assert 0.0 <= p <= 1.0, "P_end %r outside [0, 1]" % p
+                samples[i].update(status="valid", p_end=p, reward=1.0 - (p - y) ** 2, dropped=False, drop_reason=None)
+        return samples
+
     def task1_rollouts(self, u):
-        """Task 1 stop groups on REAL train conversations: for --task1-convs conversations (seeded by u,
-        train split only), at the person's last message and at one earlier message (t >= 2), --task1-G sampled
-        Planner decisions from the state the current policy reaches greedily; reward 1 when
-        end_session agrees with the real person (the real last message is the only positive).
-        v16 item 1 (dynamic sampling): a group whose rewards all agree has no gradient; while the informative groups
-        are fewer than the base groups, further unused train_all conversations are drawn from the same rng (rounds of
-        ceil(deficit / 2) conversations, at most --task1-convs extra conversations in total), rows marked refill."""
+        """v17 §3.2 (user 2026-09-30): Task 1 groups on REAL train_all conversations: --task1-convs conversations (rng
+        seeded by (seed, "task1", u)), EVERY decision point t = 2..n (a point after a capped emitted message is skipped
+        and counted), --task1-G sampled plans each from the state the current policy reaches greedily (T 1, top-p 1);
+        each sample scored by score_task1 before its row is logged. No refill (v16's dynamic sampling is gone)."""
         a, pv, psha = self.a, u - 1, self.learner.policy_sha()
-        self.t1_skipped_capped = 0
+        self.t1_rec = {"convs": [], "groups": [], "skipped_capped": []}
         if a.task1_convs <= 0:
             return []
         reuse = {}
@@ -729,122 +1100,115 @@ class Trainer:
         rng = random.Random(seed_of(a.seed, "task1", u))
         pool = sorted(self.split["train_all"])     # Task 1 needs no requirement shards: every train session
         cids = rng.sample(pool, min(a.task1_convs, len(pool)))
-        jobs = []
         for cid in cids:
-            assert cid in self.split["train_all"] and cid not in self.split["forbidden"], "non-train conversation %r in a Task 1 group" % cid
-            jobs.append((cid, rng.random()))
+            assert_train_all_id(cid, self.split)
+        skipped = []
 
-        def run_conv(job, refill=False):
-            cid, x = job
+        def run_conv(cid):
             n = self.env.human_turns(cid)
             if n < 2:
                 return []                    # turn 1 never ends: a one-message conversation has no stop decision
-            pos = [n] + ([2 + int(x * (n - 2))] if n >= 3 else [])
+            pos = list(range(2, n + 1))
             rows = [reuse[(cid, t)] for t in pos if (cid, t) in reuse]
-            for r_ in rows:
-                assert bool(r_.get("refill", False)) == refill, "reused Task 1 row %s t%d changed its refill role" % (cid, r_["t"])
             missing = [t for t in pos if (cid, t) not in reuse]
             if not missing:
                 return rows
             prompts = self.env.task1_prompts(cid)
             assert len(prompts) == n
-            capped_before = [t for t in missing if any(p.get("emitted_capped") for p in prompts[: t - 1])]
-            if capped_before:
-                with self.io_lock:
-                    self.t1_skipped_capped += len(capped_before)
-            for t in [t for t in missing if t not in capped_before]:
+            capped = [t for t in missing if any(p.get("emitted_capped") for p in prompts[: t - 1])]
+            with self.io_lock:
+                skipped.extend([cid, t] for t in capped)
+            for t in [t for t in missing if t not in capped]:
                 pr = prompts[t - 1]
                 assert pr["t"] == t and pr["real_final"] == (t == n)
                 smp = self.env.task1_sample(cid, t, pr["user_prompt"], pr["real_final"], a.task1_G,
                                             a.temperature, a.top_p, seed_of(a.seed, "t1s", u))
+                self.score_task1(smp, t == n)
                 row = {"update": u, "conversation_id": cid, "t": t, "n_real": n, "real_final": t == n,
-                       "split": "train", "policy_version": pv, "policy_sha": psha, "samples": smp, "refill": refill,
+                       "split": "train", "policy_version": pv, "policy_sha": psha, "samples": smp,
                        "time": time.time()}
                 with self.io_lock:
                     append_jsonl(self.p_roll_t1, row)
                 rows.append(row)
             return rows
 
-        def run_many(js, refill):
-            res = []
-            if a.rollout_workers <= 1:
-                for job in js:
-                    res += run_conv(job, refill)
-            else:
-                with ThreadPoolExecutor(max_workers=a.rollout_workers) as ex:
-                    for rows in ex.map(lambda j: run_conv(j, refill), js):
-                        res += rows
-            return res
-
-        def informative(r):
-            rs = [x["reward"] for x in r["samples"]]
-            return len(rs) >= 2 and RA.pstd(rs) > self.acfg["min_group_std"]
-
-        out = run_many(jobs, False)
-        n_base = len(out)
-        rest = [c for c in pool if c not in set(cids)]
-        rng.shuffle(rest)                             # the refill order: after the base draws, same rng
-        n_refill_convs, stop = 0, "none_needed"
-        while True:
-            deficit = n_base - sum(1 for r in out if informative(r))
-            if deficit <= 0:
-                stop = "filled" if n_refill_convs else "none_needed"
-                break
-            if not rest:
-                stop = "pool_empty"
-                break
-            if n_refill_convs >= a.task1_convs:
-                stop = "cap"
-                break
-            k = max(1, min(len(rest), a.task1_convs - n_refill_convs, -(-deficit // 2)))
-            take, rest = rest[:k], rest[k:]
-            js = []
-            for cid in take:
-                assert cid in self.split["train_all"] and cid not in self.split["forbidden"], "non-train conversation %r in a Task 1 refill" % cid
-                js.append((cid, rng.random()))
-            out += run_many(js, True)
-            n_refill_convs += k
-        self.t1_refill = {"n_base_groups": n_base, "n_refill_groups": len(out) - n_base, "n_refill_convs": n_refill_convs,
-                          "n_informative_groups": sum(1 for r in out if informative(r)), "refill_stop": stop,
-                          "base_convs": sorted(cids),
-                          "refill_convs": sorted({r["conversation_id"] for r in out if r.get("refill")}),
-                          "groups": sorted([r["conversation_id"], r["t"], bool(r.get("refill"))] for r in out)}
-        return sorted(out, key=lambda r: (bool(r.get("refill", False)), r["conversation_id"], r["t"]))
+        out = []
+        if a.rollout_workers <= 1:
+            for cid in cids:
+                out += run_conv(cid)
+        else:
+            with ThreadPoolExecutor(max_workers=a.rollout_workers) as ex:
+                for rows in ex.map(run_conv, cids):
+                    out += rows
+        self.t1_rec = {"convs": sorted(cids), "groups": sorted([r["conversation_id"], r["t"]] for r in out),
+                       "skipped_capped": sorted(skipped)}
+        return sorted(out, key=lambda r: (r["conversation_id"], r["t"]))
 
     def task1_samples(self, t1rows, pv, psha):
-        """GRPO samples of the Task 1 stop groups (one Planner step per sample; a group without spread is skipped).
-        With stop credit the group advantage acts only on the end_session value tokens. -> (samples, n_skipped)"""
-        samples = []
-        t1_rewards = [[x["reward"] for x in r["samples"]] for r in t1rows]
-        t1_advs, t1_skipped = RA.advantages_for_groups(t1_rewards, self.a.algo, self.acfg) if t1rows else ([], 0)
-        for r, rs, ad in zip(t1rows, t1_rewards, t1_advs):
+        """v17 §3.2 / B7 / S2: the GRPO samples of the Task 1 groups (one Planner step per sample). The dropped samples
+        (value not located) leave the group first; a group left with < 2 samples is skipped (n_groups_lt2), a group of
+        invalid samples only is skipped without a format penalty (n_groups_all_invalid), a group whose rewards have no
+        spread is skipped (groups_skipped_zero_std). A = R - mean(R) (Dr. GRPO) within the kept samples: a valid sample
+        carries it as adv_prefix on the tokens before its value (prefix_mask), an invalid one as adv on every token;
+        both x (1 - note); never on the value tokens; stop credit does not apply.
+        -> (samples, counts, per-group advantage records)."""
+        samples, recs = [], []
+        cnt = {"groups_skipped_zero_std": 0, "n_groups_lt2": 0, "n_groups_all_invalid": 0, "n_groups_used": 0}
+        for r in t1rows:
             assert r["policy_version"] == pv and r["policy_sha"] == psha, "off-policy task1 rollout"
             assert r["t"] >= 2, "Task 1 stop group at turn 1"
-            if ad is None:
+            kept = [x for x in r["samples"] if not x["dropped"]]
+            if len(kept) < 2:
+                cnt["n_groups_lt2"] += 1
+                recs.append([r["conversation_id"], r["t"], "lt2", []])
                 continue
-            for x, R, A in zip(r["samples"], rs, ad):
+            if all(x["status"] == "invalid" for x in kept):
+                cnt["n_groups_all_invalid"] += 1
+                recs.append([r["conversation_id"], r["t"], "all_invalid", []])
+                continue
+            adv = RA.group_advantages([x["reward"] for x in kept], self.acfg["adv_eps"], self.acfg["min_group_std"],
+                                      self.acfg["grpo_std_norm"])
+            if adv is None:
+                cnt["groups_skipped_zero_std"] += 1
+                recs.append([r["conversation_id"], r["t"], "zero_std", []])
+                continue
+            cnt["n_groups_used"] += 1
+            used = []
+            for x, A in zip(kept, adv):
+                g = dict(x["planner_gen"])
+                where = "all"
+                if x["status"] == "valid":
+                    g["prefix_mask"] = RA.prefix_mask_of(g.get("stop_mask"))
+                    assert g["prefix_mask"] is not None, "a valid Task 1 sample without a located value"
+                    where = "prefix"
                 pseudo = {"conversation_id": r["conversation_id"], "replicate": x["replicate"],
-                          "trace": [{"t": x["t"], "planner_gen": x["planner_gen"]}]}
+                          "trace": [{"t": x["t"], "planner_gen": g}]}
                 for s_ in RA.episode_samples(pseudo, policy_version=pv):
-                    if self.a.stop_credit:
-                        s_["ret"], s_["adv"], s_["adv_stop"], s_["source"] = R, 0.0, A, "task1"
+                    s_["ret"], s_["source"], s_["adv_stop"] = x["reward"], "task1", 0.0
+                    if where == "prefix":
+                        s_["adv"], s_["adv_prefix"] = 0.0, A
                     else:
-                        s_["ret"], s_["adv"], s_["source"] = R, A, "task1"
+                        s_["adv"], s_["adv_prefix"] = A, 0.0
                     samples.append(s_)
-        return samples, t1_skipped
+                used.append([x["replicate"], x["status"], A, where])
+            recs.append([r["conversation_id"], r["t"], "used", used])
+        return samples, cnt, recs
 
-    def aux_examples(self, t1rows, w_aux):
-        """Stop-supervision examples: one per BASE Task 1 group that carries one (v16: never from refill groups, so the
-        supervision amount stays fixed), weighted by the effective aux weight."""
+    def aux_examples(self, t1rows):
+        """v17 §3.3 (user 2026-09-30): one stop-supervision example per decision point -- the first valid sample with a
+        located value, its own prefix, the value re-encoded with the human's decision (y) -- weight --aux-weight."""
+        w = self.aux_weight()
         aux = []
-        if w_aux > 0:
-            for r in t1rows:
-                if r.get("refill"):
-                    continue
-                x = (r["samples"] or [{}])[0].get("aux")
-                if x is not None:
-                    assert x["want_end"] == r["real_final"], "stop-supervision label disagrees with the human"
-                    aux.append(dict(x, weight=w_aux))
+        if w <= 0:
+            return aux
+        for r in t1rows:
+            x = next((x for x in r["samples"] if x.get("status") == "valid"), None)
+            if x is None:
+                continue
+            aux.append({"prompt_ids": list(x["planner_gen"]["prompt_ids"]), "prefix_ids": list(x["prefix_ids"]),
+                        "target_ids": list(x["target_true"] if r["real_final"] else x["target_false"]),
+                        "want_end": bool(r["real_final"]), "gen_len": len(x["planner_gen"]["gen_ids"]), "weight": w,
+                        "conversation_id": r["conversation_id"], "t": r["t"], "replicate": x["replicate"]})
         return aux
 
     def task1_eval_row(self, u, psha, cid):
@@ -858,7 +1222,7 @@ class Trainer:
             pr = self.env.task1_end_probe(cid, x["t"], x["user_prompt"], x["real_final"])
             if pr["valid"]:
                 # the learner's forward shares the GPU with the Speaker / Planner calls of Task2Env
-                with (getattr(self.env, "gpu_lock", None) or contextlib.nullcontext()):
+                with self.gpu():
                     pe = float(self.learner.end_prob(pr))
             else:
                 # no value to score: an invalid plan reads as "not ending" (the benchmark's reading); a valid
@@ -876,6 +1240,7 @@ class Trainer:
     def one_update(self, u):
         t0 = time.time()
         cfg = copy.deepcopy(self.cfg)
+        a = self.a
         _t = time.time()
         groups_all = self.rollouts(u)
         timing = {"task2_rollouts_s": round(time.time() - _t, 1)}
@@ -909,13 +1274,13 @@ class Trainer:
                 shadow.append(RR.reward(row["episode"], self.selection_cfg, shadow_ctx)["total"])
             rew_groups.append(rs)
             stop_groups.append(sp)
-        stop_credit = self.a.stop_credit and cfg["version"] in ("v3", "v4")
+        stop_credit = a.stop_credit and cfg["version"] in ("v3", "v4")
         if stop_credit:
-            # stop credit assignment: the length term (v3 |T - target|, v4 log p_h(T) - log q(T)) is caused
+            # stop credit assignment (Task 2 only, v17 S11): the length term (v4 log p_h(T) - log q(T)) is caused
             # only by the end_session decisions, so its group advantage goes to the end_session value tokens
             # of every decision step; coverage and the format constraints keep the sequence-level advantage;
-            # both parts are centred on the TOTAL reward's group mean (v16: not divided by its std), so they add
-            # up to the plain advantage and w_cov / w_dist and the controller's factors keep their effect
+            # both parts are centred on the TOTAL reward's group mean (Dr. GRPO: not divided by its std), so they add
+            # up to the plain advantage and w_cov / w_dist keep their effect
             advs, advs_stop = [], []
             for rs, sp in zip(rew_groups, stop_groups):
                 a1, a2 = RA.split_group_advantages(rs, sp, self.acfg["adv_eps"], self.acfg["min_group_std"],
@@ -924,7 +1289,7 @@ class Trainer:
                 advs_stop.append(a2)
             skipped = sum(1 for a1 in advs if a1 is None)
         else:
-            advs, skipped = RA.advantages_for_groups(rew_groups, self.a.algo, self.acfg)
+            advs, skipped = RA.advantages_for_groups(rew_groups, a.algo, self.acfg)
             advs_stop = [None] * len(groups)
         for grp, rs, ad, ads in zip(groups, rew_groups, advs, advs_stop):
             if ad is None and ads is None:
@@ -933,31 +1298,54 @@ class Trainer:
                 for s_ in RA.episode_samples(row["episode"], policy_version=row["policy_version"]):
                     s_["ret"], s_["adv"] = R, (ad[j] if ad is not None else 0.0)
                     s_["adv_stop"] = ads[j] if ads is not None else 0.0
+                    s_["source"] = "task2"
                     samples.append(s_)
-        # Task 1 stop groups (same policy version; one Planner step per sample). A sample that is not a
-        # decision (unparsed / capped / no valid end_session) has reward 0 and no stop mask.
+        # Task 1 groups (same policy version; one Planner step per sample; Brier reward, v17 §3.2)
         _t = time.time()
         t1rows = self.task1_rollouts(u)
         timing["task1_groups_s"] = round(time.time() - _t, 1)
-        t1_samples, t1_skipped = self.task1_samples(t1rows, pv, psha)
+        t1_samples, t1_cnt, t1_advs = self.task1_samples(t1rows, pv, psha)
         samples += t1_samples
         t1_all = [x for r in t1rows for x in r["samples"]]
-        t1_base = [x for r in t1rows if not r.get("refill") for x in r["samples"]]     # comparable across updates
-        t1_hist = None
-        if t1_all or self.a.task1_convs > 0:
-            fin = [x for x in t1_base if x["real_final"]]
-            mid = [x for x in t1_base if not x["real_final"]]
-            t1_hist = {"n": len(t1_base), "acc": (sum(x["reward"] for x in t1_base) / len(t1_base)) if t1_base else None,
-                       "acc_all": (sum(x["reward"] for x in t1_all) / len(t1_all)) if t1_all else None,
-                       "n_all": len(t1_all),
+        t1_stats, t1_hist = None, None
+        if t1_all or a.task1_convs > 0:
+            scored = [x for x in t1_all if not x["dropped"]]
+            fin = [x for x in t1_all if x["real_final"]]
+            mid = [x for x in t1_all if not x["real_final"]]
+            pf = [x["p_end"] for x in fin if x["p_end"] is not None]
+            pm = [x["p_end"] for x in mid if x["p_end"] is not None]
+            kept_std = [RA.pstd([x["reward"] for x in r["samples"] if not x["dropped"]]) for r in t1rows
+                        if sum(1 for x in r["samples"] if not x["dropped"]) >= 2]
+            t1_hist = {"n": len(t1_all), "n_points": len(t1rows),
+                       "brier_mean": (sum(x["reward"] for x in scored) / len(scored)) if scored else None,
                        "end_at_final": (sum(x["ended_planner"] for x in fin) / len(fin)) if fin else None,
                        "end_at_nonfinal": (sum(x["ended_planner"] for x in mid) / len(mid)) if mid else None,
-                       "n_not_decisions": sum(1 for x in t1_all if not x.get("decision_valid", True)),
-                       "n_skipped_capped_history": self.t1_skipped_capped,
-                       "groups_skipped_zero_std": t1_skipped, **getattr(self, "t1_refill", {})}
+                       "p_end_final_mean": (sum(pf) / len(pf)) if pf else None,
+                       "p_end_nonfinal_mean": (sum(pm) / len(pm)) if pm else None,
+                       "n_dropped_mask": sum(1 for x in t1_all if x["dropped"]),
+                       "n_not_decisions": sum(1 for x in t1_all if x["status"] == "invalid"),
+                       "n_skipped_capped_history": len(self.t1_rec["skipped_capped"]),
+                       "reward_std_mean": (sum(kept_std) / len(kept_std)) if kept_std else None,
+                       "groups_skipped_zero_std": t1_cnt["groups_skipped_zero_std"],
+                       "n_groups_lt2": t1_cnt["n_groups_lt2"], "n_groups_used": t1_cnt["n_groups_used"],
+                       "n_groups_no_decision": t1_cnt["n_groups_all_invalid"]}
+            # the full record under the spec's names (S15 n_invalid, B7 n_groups_all_invalid) lives in the update row's
+            # task1_stats: the controller history may not carry a key that contains "valid" (rl_controllers
+            # FORBIDDEN_KEY_PARTS), so the history copy above says n_not_decisions / n_groups_no_decision
+            t1_stats = dict(t1_hist, n_invalid=t1_hist["n_not_decisions"],
+                            n_groups_all_invalid=t1_cnt["n_groups_all_invalid"], convs=self.t1_rec["convs"],
+                            groups=self.t1_rec["groups"], skipped_capped=self.t1_rec["skipped_capped"],
+                            advantages=t1_advs)
         assert all(s_["policy_version"] == pv for s_ in samples), "sample from another policy version"
-        w_aux = self.aux_weight(u, cfg)
-        aux = self.aux_examples(t1rows, w_aux)
+        w_aux = self.aux_weight()
+        aux = self.aux_examples(t1rows)
+        if t1_stats is not None:
+            t1_stats["aux_points"] = sorted([x["conversation_id"], x["t"]] for x in aux)
+        aux_orders = []
+        for ep in range(int(self.acfg["epochs"])):
+            o = list(range(len(aux)))
+            random.Random(seed_of(a.seed, "aux_mb", u, ep)).shuffle(o)
+            aux_orders.append(o)
         _t = time.time()
         if getattr(self, "gen_name", None):
             bad = sorted({s_.get("gen_adapter") for s_ in samples if s_.get("gen_adapter") != self.gen_name})
@@ -965,44 +1353,67 @@ class Trainer:
                 raise AssertionError("samples generated by adapter(s) %r, the policy is %r: off-policy generation"
                                      % (bad[:3], self.gen_name))
         try:
-            stats = self.learner.update(samples, cfg, seed=seed_of(self.a.seed, "update", u), aux=aux or None,
-                                        **({"mismatch_abort": self.a.behav_mismatch_abort} if not self.a.dry_run else {}))
+            stats = self.learner.update(samples, cfg, seed=seed_of(a.seed, "update", u), aux=aux or None,
+                                        aux_orders=aux_orders if aux else None,
+                                        **({"mismatch_abort": a.behav_mismatch_abort} if not a.dry_run else {}))
         except RA.MismatchAbort as e:
             # before any optimizer step and before the checkpoint; the marker makes a resume regenerate update u's
             # rollouts instead of reusing the same mismatched ones
-            write_json_atomic(os.path.join(self.a.out, "ABORTED_u%05d.json" % u),
-                              {"update": u, "mismatch": e.value, "threshold": self.a.behav_mismatch_abort,
+            write_json_atomic(os.path.join(a.out, "ABORTED_u%05d.json" % u),
+                              {"update": u, "mismatch": e.value, "threshold": a.behav_mismatch_abort,
                                "adapter": getattr(self, "gen_name", None), "time": time.time()})
             raise SystemExit("update %d: %s > %.4f (phase-0 measured 0.017): the served adapter does not match the "
-                             "learner?" % (u, e, self.a.behav_mismatch_abort))
+                             "learner?" % (u, e, a.behav_mismatch_abort))
         timing["learner_s"] = round(time.time() - _t, 1)
-        stats["adv_abs_mean"] = (sum(abs(float(s_.get("adv") or 0.0)) + abs(float(s_.get("adv_stop") or 0.0)) for s_ in samples)
+        n_mb = min(int(self.acfg["minibatches"]), len(samples)) if samples else 0
+        want_steps = int(self.acfg["epochs"]) * n_mb if samples else (1 if aux else 0)
+        if stats.get("optimizer_steps", 0) != want_steps:
+            raise AssertionError("update %d: %s optimizer steps, expected %d" % (u, stats.get("optimizer_steps"), want_steps))
+
+        def adv_abs(src):
+            xs = [abs(float(s_.get("adv") or 0.0)) + abs(float(s_.get("adv_prefix") or 0.0))
+                  + abs(float(s_.get("adv_stop") or 0.0)) for s_ in samples if s_.get("source") == src]
+            return (sum(xs) / len(xs)) if xs else None
+        stats["adv_abs_mean"] = (sum(abs(float(s_.get("adv") or 0.0)) + abs(float(s_.get("adv_prefix") or 0.0))
+                                     + abs(float(s_.get("adv_stop") or 0.0)) for s_ in samples)
                                  / len(samples)) if samples else None
+        stats["adv_abs_mean_by_source"] = {"task1": adv_abs("task1"), "task2": adv_abs("task2")}
+        stats["n_samples_by_source"] = {"task1": sum(1 for s_ in samples if s_.get("source") == "task1"),
+                                        "task2": sum(1 for s_ in samples if s_.get("source") == "task2")}
+        stats["expected_optimizer_steps"] = want_steps
         agg = RR.aggregate(rewarded)
         tm = int(cfg["t_max"])
         turn_hist = [0] * (tm + 1)
         for e in all_clean:
             turn_hist[min(max(int(e["emitted_user_turns"]), 0), tm)] += 1
+        # v17 §3.5 / S5: the length drift of this update = mean(T - min(human turns, t_max)) over the clean episodes
+        # that entered a group
+        drift = sum(int(e["emitted_user_turns"]) - min(int(e["human_turns"]), tm) for e in clean_eps) / len(clean_eps)
+        t2_std = [RA.pstd(rs) for rs in rew_groups]
         hist = {"update": u, "split": "train", "reward_version": cfg["version"], "task1_train": t1_hist, **agg,
                 "n_groups": len(groups), "n_groups_skipped_zero_std": skipped, "n_unclean_episodes": n_unclean,
                 "n_dropped_singleton_episodes": n_singletons,
                 "shadow_reward_mean": sum(shadow) / len(shadow), "turn_hist": turn_hist, "p_h": self.p_h,
-                "aux_weight": w_aux, "aux_floor": float(self.a.stop_sup_floor),
-                "aux_annealed": self.aux_annealed(u, cfg),
-                "aux_floor_active": bool(float(self.a.stop_sup_floor) > self.aux_annealed(u, cfg)),
-                "lr": cfg["lr"], "kl_coef": cfg["kl_coef"],
-                "aux_stats": {k: stats.get(k) for k in ("aux_n", "aux_loss", "aux_grad_norm", "aux_p_correct_before",
-                                                         "aux_p_correct_end")},
+                "task2_turns_mean": sum(int(e["emitted_user_turns"]) for e in all_clean) / len(all_clean),
+                "kl_q_ph": kl_div(ctx["q"], ctx["p_h"]) if ctx else None,
+                "drift_stat": drift, "n_drift_episodes": len(clean_eps),
+                "reward_std_mean": {"task2": (sum(t2_std) / len(t2_std)) if t2_std else None,
+                                    "task1": (t1_hist or {}).get("reward_std_mean")},
+                "aux_weight": w_aux, "lr": cfg["lr"], "kl_coef": cfg["kl_coef"],
+                "aux_stats": {k: stats.get(k) for k in ("aux_n", "aux_loss", "aux_grad_norm", "aux_grad_norm_max",
+                                                         "aux_p_correct_before", "aux_p_correct_end")},
                 **{k: stats.get(k) for k in ("loss", "kl", "ratio_mean", "clip_frac", "grad_norm", "n_tokens",
-                                              "value_mse", "ratio_init_maxdev", "rl_grad_norm", "tis_w_mean",
-                                              "tis_capped_frac", "behav_mismatch_mean")}}
+                                              "value_mse", "ratio_init_maxdev", "rl_grad_norm", "rl_grad_norm_max",
+                                              "kl_step_mean", "kl_step_max", "clip_frac_step_mean",
+                                              "clip_frac_step_max", "tis_w_mean", "tis_capped_frac",
+                                              "behav_mismatch_mean", "optimizer_steps")}}
         self.history.append(hist)
         self.cfg = self.controller.propose(self.history)
         self.update_done = u
-        row = {"update": u, "policy_version_rollouts": pv, "policy_version_after": u, "algo": self.a.algo,
-               "controller": self.a.controller, "cfg_used": cfg, "cfg_used_sha256": RR.cfg_sha(cfg),
+        row = {"update": u, "policy_version_rollouts": pv, "policy_version_after": u, "algo": a.algo,
+               "controller": a.controller, "cfg_used": cfg, "cfg_used_sha256": RR.cfg_sha(cfg),
                "reward_ctx": ctx, "next_cfg": self.cfg, "scenarios": [g[0]["conversation_id"] for g in groups_all],
-               "train_aggregate": hist, "learner_stats": stats, "n_samples": len(samples),
+               "train_aggregate": hist, "task1_stats": t1_stats, "learner_stats": stats, "n_samples": len(samples),
                "timing": timing,
                "controller_failures": getattr(self.controller, "n_failures", None),
                "controller_rollbacks": getattr(self.controller, "n_rollbacks", None),
@@ -1012,20 +1423,19 @@ class Trainer:
         return row
 
     # -------------------------------------------------------- validation
-    def validate(self, u, seeds=None, p_val=None, reselect=False):
-        """Task 2 episodes on the validation ids with the SAMPLED Planner (D5: --val-temperature, one
-        replicate per --val-seeds entry) + Task 1 (greedy, as the benchmark); logged only to validation.jsonl;
-        drives best.json and the D2 annealing trigger. Never enters history or the controller.
-        reselect=True (checkpoint re-selection, user 2026-09-27): the same procedure with other seeds into another
-        file (p_val), without any side effect (best.json, task1_base, D2 trigger and the checkpoints untouched)."""
+    def validate(self, u, task2):
+        """v17 §4 (user 2026-09-30): Task 1 (greedy + teacher-forced end probabilities) on validation_all at every
+        validated update; with task2=True (u0 = SFT and the final update) also Task 2 episodes on validation with the
+        SAMPLED Planner (--val-temperature, one replicate per --val-seeds entry, 0..7). Logged only to validation.jsonl;
+        no checkpoint selection. The summary is keyed by (update, task2): a Task-1-only summary never stands in for the
+        final validation (S6). Never enters history or the controller."""
         _tv = time.time()
         self.sync_generation_policy(u)          # validation generates with the policy after update u
         a = self.a
-        seeds = list(a.val_seeds if seeds is None else seeds)
-        p_val = p_val or self.p_val
-        prev = read_jsonl(p_val)
+        seeds = list(a.val_seeds) if task2 else []
+        prev = read_jsonl(self.p_val)
         for r in prev:
-            if r.get("kind") == "summary" and r["update"] == u:
+            if r.get("kind") == "summary" and r["update"] == u and r.get("task2") == bool(task2):
                 return r
         done = {(r["conversation_id"], r["seed"]): r for r in prev if r.get("kind") == "episode" and r["update"] == u}
         done_t1 = {r["conversation_id"]: r for r in prev if r.get("kind") == "task1" and r["update"] == u}
@@ -1036,6 +1446,10 @@ class Trainer:
                 and cid not in self.split["train_all"], "validation id %r is also a training id" % cid
             for s in seeds:
                 jobs.append((cid, s))
+        t1_ids = sorted(self.split["validation_all"])
+        for cid in t1_ids:
+            assert cid in self.split["forbidden"] and cid not in self.split["train"] \
+                and cid not in self.split["train_all"], "validation_all id %r is also a training id" % cid
 
         def run_val(job):
             cid, s = job
@@ -1049,7 +1463,7 @@ class Trainer:
                 r = {"kind": "episode", "update": u, "policy_sha": psha, "conversation_id": cid, "seed": s,
                      "attempt": attempt, "split": "validation", "episode": ep, "time": time.time()}
                 with self.io_lock:
-                    append_jsonl(p_val, r)
+                    append_jsonl(self.p_val, r)
                 if ep["clean"] or attempt >= VAL_RETRIES:
                     return r
                 attempt += 1                    # an infrastructure incident, not the policy: run it again
@@ -1059,169 +1473,124 @@ class Trainer:
             if r is None or r["policy_sha"] != psha or "end_probs" not in r:
                 r = self.task1_eval_row(u, psha, cid)
                 with self.io_lock:
-                    append_jsonl(p_val, r)
+                    append_jsonl(self.p_val, r)
             return r
 
         if not hasattr(self.env, "run_task1"):
-            raise RuntimeError("validation needs Task 1 (run_task1): D2, task1_base and the selection score use it")
+            raise RuntimeError("validation needs Task 1 (run_task1)")
         workers = max(1, a.rollout_workers)
         with ThreadPoolExecutor(max_workers=workers) as ex:
             vrows = list(ex.map(run_val, jobs))
-            t1rows = list(ex.map(run_t1, sorted(self.split["validation"])))
+            t1rows = list(ex.map(run_t1, t1_ids))
         eps = [r["episode"] for r in vrows if r["episode"]["clean"]]
         n_unclean = len(vrows) - len(eps)
-        withheld = n_unclean > 0                # every checkpoint is scored on the SAME validation set, or not at all
         vctx = self.reward_ctx(eps, self.selection_cfg) if eps else None
         totals = [RR.reward(e, self.selection_cfg, vctx)["total"] for e in eps]
-        score = sum(totals) / len(totals) if totals else float("nan")
+        score = sum(totals) / len(totals) if totals else None
         turn_stats = None
         if eps and all("human_turns" in e for e in eps):
             d = [e["emitted_user_turns"] - e["human_turns"] for e in eps]
-            turn_stats = {"sim_turns_mean": sum(e["emitted_user_turns"] for e in eps) / len(eps),
+            turn_stats = {"n_episodes": len(eps),
+                          "sim_turns_mean": sum(e["emitted_user_turns"] for e in eps) / len(eps),
                           "human_turns_mean": sum(e["human_turns"] for e in eps) / len(eps),
                           "abs_diff_mean": sum(abs(x) for x in d) / len(d),
                           "coverage_mean": sum(float(e["coverage"]) for e in eps) / len(eps),
                           "turn_w1": turn_w1([e["emitted_user_turns"] for e in eps],
                                              [min(int(e["human_turns"]), int(self.selection_cfg["t_max"])) for e in eps]),
                           "end_kinds": {k: sum(e["end_kind"] == k for e in eps) for k in sorted({e["end_kind"] for e in eps})}}
-        t1 = T1.task1_stop_metrics([r["task1"] for r in t1rows]) if t1rows else None
-        if t1 is not None:
-            t1.update(T1.task1_prob_metrics([p_ for r in t1rows for p_ in r["end_probs"]]))
-        if not reselect and t1 is not None and self.task1_base is None:
+        t1 = T1.task1_stop_metrics([r["task1"] for r in t1rows])
+        t1.update(T1.task1_prob_metrics([p_ for r in t1rows for p_ in r["end_probs"]]))
+        if u == 0 and self.task1_base is None:
+            # the comparison base: SFT (u0)'s validation Task 1 (persisted now: a crash in update 1 must not lose it)
             self.task1_base = {"update": u, **t1}
-            sp = os.path.join(self.ckpt_dir(self.update_done), "state.json")
-            st = json.load(open(sp))
-            st["task1_base"] = self.task1_base         # persisted now: a crash in update 1 must not lose it
-            write_json_atomic(sp, st)
-        # D2 (v16): the continuous Task 1 metric bal_p at least --t1-trigger-margin above the untrained policy's at
-        # TWO consecutive validations (after the base); one noisy validation (4 conversations) cannot trigger it
-        d2 = None
-        if t1 is not None and self.task1_base is not None and self.task1_base.get("bal_p") is not None \
-                and u > self.task1_base["update"]:
-            met = t1["bal_p"] >= self.task1_base["bal_p"] + a.t1_trigger_margin
-            streak = 0
-            for v_ in sorted((r for r in prev if r.get("kind") == "summary" and r["update"] < u
-                              and r["update"] > self.task1_base["update"]), key=lambda r: r["update"]):
-                streak = streak + 1 if (v_.get("d2") or {}).get("met") else 0
-            streak = streak + 1 if met else 0
-            d2 = {"met": met, "streak": streak, "margin": a.t1_trigger_margin, "base_bal_p": self.task1_base["bal_p"],
-                  "bal_p": t1["bal_p"], "triggered_at": self.aux_anneal_start}
-        if not reselect and d2 is not None and self.aux_anneal_start is None and d2["streak"] >= 2:
-            d2["triggered_at"] = u
-            self.aux_anneal_start = u            # D2: from here the stop supervision goes linearly to its floor
-            sp = os.path.join(self.ckpt_dir(self.update_done), "state.json")
-            st = json.load(open(sp))
-            st["aux_anneal_start"] = u
-            write_json_atomic(sp, st)
-        t1_ok = True if t1 is None else T1.within_tolerance(t1, self.task1_base, a.task1_tol)
-        # checkpoint selection (user 2026-09-26): with ~8 validation episodes the v4 dist term is dominated by
-        # the smoothing, so Task 2 is scored by the turn-count distribution W1 against the validation people
-        # plus coverage. The v4 validation reward is still logged (not selected on).
-        # v16 (user 2026-09-28): Task 1 enters the selection through the continuous bal_p (20 decision points rather
-        # than 4 end events); term_f1 stays the reported metric
-        sel = None
-        if not withheld and turn_stats is not None and turn_stats.get("turn_w1") is not None:
-            sel = (a.w_sel_cov * turn_stats["coverage_mean"] - a.w_sel_w1 * turn_stats["turn_w1"]
-                   + (a.w_sel_task1 * t1["bal_p"] if t1 is not None else 0.0))
-        summary = {"kind": "summary", "update": u, "policy_sha": psha, "split": "validation",
-                                  "selection_withheld": "unclean validation episode(s) after %d re-runs" % VAL_RETRIES
-                                  if withheld else None,
-                                  "validation_s": round(time.time() - _tv, 1),
-                                  "n_episodes": len(totals), "n_unclean_episodes": n_unclean,
-                                  "val_temperature": a.val_temperature, "val_seeds": seeds, "reselect": reselect,
-                                  "mean_reward_selection": score, "aux_anneal_start": self.aux_anneal_start,
-                                  "turn_stats": turn_stats, "task1": t1, "task1_base": self.task1_base,
-                                  "task1_within_tol": t1_ok, "task1_tol": a.task1_tol,
-                                  "selection_score": sel, "w_sel_task1": a.w_sel_task1,
-                                  "w_sel_w1": a.w_sel_w1, "w_sel_cov": a.w_sel_cov, "selection_task1_metric": "bal_p",
-                                  "selection_formula": "w_sel_cov*coverage_mean - w_sel_w1*turn_w1 + w_sel_task1*task1.bal_p",
-                                  "d2": d2, "aux_floor": float(a.stop_sup_floor),
-                                  "selection_cfg_sha256": RR.cfg_sha(self.selection_cfg), "time": time.time()}
-        if not reselect and sel is not None and (self.best is None or sel > self.best["selection_score"]):
-            self.best = {"update": u, "checkpoint": os.path.relpath(self.ckpt_dir(u), a.out).replace("\\", "/"),
-                         "policy_sha": psha, "mean_reward_selection": score, "selection_score": sel,
-                         "selection_cfg_sha256": RR.cfg_sha(self.selection_cfg)}
-            write_json_atomic(self.p_best, self.best)
-            # keep the checkpoint's own record of best in sync
-            sp = os.path.join(self.ckpt_dir(self.update_done), "state.json")
-            st = json.load(open(sp))
-            st["best"] = self.best
-            write_json_atomic(sp, st)
-        append_jsonl(p_val, summary)
+            self.update_state(0, task1_base=self.task1_base)
+        t1_ok = True if self.task1_base is None else T1.within_tolerance(t1, self.task1_base, a.task1_tol)
+        summary = {"kind": "summary", "update": u, "task2": bool(task2), "policy_sha": psha, "split": "validation",
+                   "validation_s": round(time.time() - _tv, 1),
+                   "n_episodes": len(totals), "n_unclean_episodes": n_unclean,
+                   "unclean_after_retries": n_unclean > 0, "val_temperature": a.val_temperature, "val_seeds": seeds,
+                   "task2_ids": sorted(self.split["validation"]) if task2 else [], "task1_ids": t1_ids,
+                   "mean_reward_fixed_cfg": score, "turn_stats": turn_stats, "task1": t1,
+                   "task1_base": self.task1_base, "task1_within_tol": t1_ok, "task1_tol": a.task1_tol,
+                   "fixed_cfg_sha256": RR.cfg_sha(self.selection_cfg), "time": time.time()}
+        append_jsonl(self.p_val, summary)
         return summary
 
-    # -------------------------------------------------------- checkpoint re-selection
-    def reselect(self):
-        """Checkpoint re-selection (user 2026-09-27): every checkpoint that was validated during training is
-        validated again with --reselect-seeds (same validation ids, temperature, env, clean re-run rule and
-        selection formula as validate()); results go to reselect.jsonl, the choice to reselect_best.json.
-        Training files (validation.jsonl, best.json, checkpoints) are never written."""
-        a = self.a
-        self.build()
-        last = json.load(open(os.path.join(self.ckpt_root, "LATEST.json")))["update"]
-        st = json.load(open(os.path.join(self.ckpt_dir(last), "state.json")))
-        self.task1_base, self.update_done = st.get("task1_base"), last
-        cands = sorted({r["update"] for r in read_jsonl(self.p_val) if r.get("kind") == "summary"})
-        if not cands:
-            raise SystemExit("no validated checkpoint in %s" % self.p_val)
-        if a.reselect_updates:
-            miss = sorted(set(a.reselect_updates) - set(cands))
-            if miss:
-                raise SystemExit("--reselect-updates %s were never validated in training" % miss)
-            cands = sorted(set(a.reselect_updates))
-        row = self.meta("reselect")
-        self.check_provenance(row)
-        out = os.path.join(a.out, "reselect.jsonl")
-        append_jsonl(os.path.join(a.out, "reselect_meta.jsonl"),
-                     {**row, "candidates": cands, "seeds": list(a.reselect_seeds)})
-        summaries = []
-        for u in cands:
-            d = self.ckpt_dir(u)
-            cst = json.load(open(os.path.join(d, "state.json")))
-            self.learner.load_policy(d)
-            if self.learner.policy_sha() != cst["policy_sha"]:
-                raise AssertionError("checkpoint u%d: loaded policy sha differs from its record" % u)
-            s = self.validate(u, seeds=a.reselect_seeds, p_val=out, reselect=True)
-            summaries.append(s)
-            print(json.dumps({"reselect_update": u, "selection_score": s["selection_score"],
-                              "withheld": s["selection_withheld"], "n_episodes": s["n_episodes"]}), flush=True)
-        ok = [s for s in summaries if s["selection_score"] is not None]
-        best = max(ok, key=lambda s: (s["selection_score"], -s["update"])) if ok else None
-        rec = {"seeds": list(a.reselect_seeds), "candidates": {str(s["update"]): s["selection_score"] for s in summaries},
-               "withheld": [s["update"] for s in summaries if s["selection_score"] is None],
-               "selection_formula": summaries[0]["selection_formula"],
-               "selection_cfg_sha256": RR.cfg_sha(self.selection_cfg),
-               "best": None if best is None else {
-                   "update": best["update"], "selection_score": best["selection_score"], "policy_sha": best["policy_sha"],
-                   "checkpoint": os.path.relpath(self.ckpt_dir(best["update"]), a.out).replace("\\", "/")},
+    # -------------------------------------------------------- the end of the run (v17 §3.5, S5, S6, S13)
+    def read_final(self):
+        return json.load(open(self.p_final, encoding="utf-8")) if os.path.exists(self.p_final) else None
+
+    def drift_stats(self):
+        return {h["update"]: h.get("drift_stat") for h in self.history}
+
+    def finalize(self, u, reason):
+        """final.json + a run_meta "stop" row; the checkpoint u records its stop reason."""
+        st = json.load(open(os.path.join(self.ckpt_dir(u), "state.json")))
+        self.stop_reason = reason
+        self.update_state(u, stop_reason=reason)
+        fin = {"final_update": u, "stop_reason": reason, "policy_sha": st["policy_sha"], "validated": False,
+               "length_drift_margin": self.a.length_drift_margin, "drift_stats": self.drift_stats(),
                "time": time.time()}
-        write_json_atomic(os.path.join(a.out, "reselect_best.json"), rec)
-        return rec
+        write_json_atomic(self.p_final, fin)
+        append_jsonl(self.p_meta, {**self.meta("stop"), "final_update": u, "stop_reason": reason})
+        print(json.dumps({"final_update": u, "stop_reason": reason}), flush=True)
+        return fin
+
+    def val_due(self, u):
+        return self.a.val_every > 0 and u % self.a.val_every == 0
 
     # -------------------------------------------------------- main loop
     def run(self):
         a = self.a
+        fin = self.read_final()
+        if fin is not None and fin.get("validated"):
+            raise SystemExit("%s is finished (final.json: u%d, %s): no further training; use a new --out"
+                             % (a.out, fin["final_update"], fin["stop_reason"]))
+        if not a.resume:
+            if os.path.exists(os.path.join(self.ckpt_root, "LATEST.json")):
+                raise SystemExit("%s already has checkpoints; pass --resume or use a new --out" % a.out)
+            left = [p for p in (self.p_sft_ex, self.p_sft_meta, self.p_sft, self.p_base_pend)
+                    if os.path.exists(p)] + [d for d in sorted(os.listdir(self.ckpt_root)) if d.startswith("sft_e")]
+            if left:
+                raise SystemExit("%s holds SFT leftovers %s; pass --resume (reuses the cached examples) or use a new "
+                                 "--out" % (a.out, left))
         self.build()
         resumed = self.load_checkpoint() if a.resume else False
-        if not resumed and os.path.exists(os.path.join(self.ckpt_root, "LATEST.json")):
-            raise SystemExit("%s already has checkpoints; pass --resume or use a new --out" % a.out)
-        row = self.meta("resume" if resumed else "start")
-        row["intervention"] = self.apply_intervention()
-        row["intervention_file_sha256"] = sha_file(a.intervention) if a.intervention else None
+        row = self.meta("resume" if a.resume else "start")
         self.check_provenance(row)
-        append_jsonl(os.path.join(a.out, "run_meta.jsonl"), row)
+        append_jsonl(self.p_meta, row)
         if not resumed:
             random.seed(a.seed)
-            self.save_checkpoint(0, None)             # policy_version 0 = the starting policy
-        if a.val_every > 0 and self.update_done % a.val_every == 0:
-            self.validate(self.update_done)           # also completes a validation cut short by a crash
-        for u in range(self.update_done + 1, a.updates + 1):
-            r = self.one_update(u)
-            print(json.dumps({"update": u, "reward_mean": r["train_aggregate"]["reward_mean"],
-                              "skipped": r["train_aggregate"]["n_groups_skipped_zero_std"],
-                              "n_samples": r["n_samples"], "update_s": round(r["update_s"], 1)}), flush=True)
-            if a.val_every > 0 and u % a.val_every == 0:
-                self.validate(u)
+            self.sft_stage()                          # -> u0 = SFT, LATEST, the ref adapter
+        if fin is None:
+            # recomputed from the records (a crash between the last checkpoint and final.json)
+            fu, reason = drift_decision(self.drift_stats(), a.length_drift_margin, a.updates)
+            if fu is not None:
+                assert fu == self.update_done, "stop condition at u%d but the latest checkpoint is u%d" % (fu, self.update_done)
+                fin = self.finalize(fu, reason)
+        if fin is None:
+            if self.update_done == 0:
+                self.validate(0, task2=True)
+            elif self.val_due(self.update_done):
+                self.validate(self.update_done, task2=False)   # completes a validation cut short by a crash
+            for u in range(self.update_done + 1, a.updates + 1):
+                r = self.one_update(u)
+                print(json.dumps({"update": u, "reward_mean": r["train_aggregate"]["reward_mean"],
+                                  "skipped": r["train_aggregate"]["n_groups_skipped_zero_std"],
+                                  "drift": round(r["train_aggregate"]["drift_stat"], 3),
+                                  "n_samples": r["n_samples"], "update_s": round(r["update_s"], 1)}), flush=True)
+                fu, reason = drift_decision(self.drift_stats(), a.length_drift_margin, a.updates)
+                if fu is not None:
+                    fin = self.finalize(fu, reason)
+                    break
+                if self.val_due(u):
+                    self.validate(u, task2=False)             # u1 .. u(final-1): Task 1 only
+        assert fin["final_update"] == self.update_done, "final.json names u%d, the latest checkpoint is u%d" % (
+            fin["final_update"], self.update_done)
+        self.validate(fin["final_update"], task2=True)
+        fin["validated"] = True
+        fin["validated_time"] = time.time()
+        write_json_atomic(self.p_final, fin)
         return self
 
 
@@ -1261,51 +1630,47 @@ def parse_args(argv=None):
     ap.add_argument("--rollout-workers", type=int, default=1,
                     help="episodes run in threads; GPU calls are serialised inside Task2Env, R0/ledger calls overlap")
     ap.add_argument("--task1-tol", type=float, default=0.05,
-                    help="reported: whether Task 1 term_f1 / premature stay within this of update 0")
-    ap.add_argument("--task1-convs", type=int, default=8,
-                    help="Task 1 stop groups per update: real TRAIN conversations (last + one earlier message, --task1-G "
-                         "samples each); 0 = off. v16 spec: 8")
-    ap.add_argument("--task1-G", type=int, default=8, help="samples per Task 1 stop group (v16 spec: 8; Task 2 keeps --G)")
-    ap.add_argument("--t1-trigger-margin", type=float, default=0.10,
-                    help="D2 (v16): validation Task 1 bal_p must exceed the untrained policy's by this at two consecutive "
-                         "validations before the stop supervision anneals (spec 0.10)")
-    ap.add_argument("--stop-sup-floor", type=float, default=None,
-                    help="v16: the stop supervision never goes below this weight (user 2026-09-28: spec 0.5; "
-                         "0 when --stop-sup-weight 0 switches the supervision off)")
-    ap.add_argument("--stop-sup-weight", type=float, default=1.0,  # initial w_aux; the LLM controller tunes it
-                    help="auxiliary stop-token supervision on the Task 1 positions (human end/continue); 0 = off (pure GRPO)")
-    ap.add_argument("--stop-sup-anneal", type=int, default=10,
-                    help="D2: updates over which the stop supervision goes linearly towards --stop-sup-floor once "
-                         "validation Task 1 bal_p beat the untrained policy's by --t1-trigger-margin at two consecutive "
-                         "validations (v16); 0 = never anneal")
+                    help="report only: whether validation Task 1 term_f1 / premature stay within this of SFT (u0)")
+    # ---- v17 (user 2026-09-30)
+    ap.add_argument("--sft-lr", type=float, default=SPEC_V17["sft_lr"], help="SFT warm-up AdamW lr (spec 5e-5)")
+    ap.add_argument("--sft-epochs-max", type=int, default=SPEC_V17["sft_epochs_max"],
+                    help="SFT epochs (spec 3); the epoch (0 = none) with the lowest validation_all NLL becomes u0")
+    ap.add_argument("--sft-samples-per-point", type=int, default=SPEC_V17["sft_samples_per_point"],
+                    help="sampled SFT plans per decision point, besides the greedy one (spec 2)")
+    ap.add_argument("--task1-convs", type=int, default=SPEC_V17["task1_convs"],
+                    help="Task 1 groups per update: train_all conversations, every decision point (spec 8); 0 = off")
+    ap.add_argument("--task1-G", type=int, default=SPEC_V17["task1_G"], help="samples per Task 1 group (spec 4)")
+    ap.add_argument("--task1-reward", choices=("brier",), default=SPEC_V17["task1_reward"],
+                    help="Task 1 reward: brier = 1 - (P_end - y)^2 on the sample's own prefix")
+    ap.add_argument("--task1-positions", choices=("all",), default=SPEC_V17["task1_positions"],
+                    help="Task 1 decision points: all = t = 2..n")
+    ap.add_argument("--aux-weight", type=float, default=SPEC_V17["aux_weight"],
+                    help="stop supervision weight (constant; spec 0.5; 0 = off)")
+    ap.add_argument("--length-drift-margin", type=float, default=SPEC_V17["length_drift_margin"],
+                    help="stop after two consecutive updates with mean(T - human turns) < -margin (spec 1.0)")
     ap.add_argument("--stop-credit", type=int, choices=(0, 1), default=1,
-                    help="1: turn-count and Task 1 advantages act only on the end_session value tokens")
-    ap.add_argument("--w-sel-w1", type=float, default=1.0,
-                    help="checkpoint selection: weight of the validation turn-count W1 (turns; subtracted)")
-    ap.add_argument("--w-sel-cov", type=float, default=1.0, help="checkpoint selection: weight of validation coverage")
-    ap.add_argument("--w-sel-task1", type=float, default=1.0,
-                    help="checkpoint selection: weight of the validation Task 1 bal_p (v16; term_f1 is reported)")
+                    help="1: the Task 2 turn-count advantage acts only on the end_session value tokens (Task 1 never)")
     ap.add_argument("--splits", default="/tmp2/mzjiang_usersim/grpo_planner/splits_v1.json")
     ap.add_argument("--algo", choices=RA.ALGOS, default="grpo")
-    ap.add_argument("--controller", choices=("fixed", "dual", "llm"), default="llm",
-                    help="spec: llm (the v4 factor controller); fixed/dual need --ablation")
+    ap.add_argument("--controller", choices=("fixed", "dual", "llm"), default=SPEC_V17["controller"],
+                    help="spec v17: fixed (weights never move); dual/llm need --ablation")
     ap.add_argument("--planner-path")
     ap.add_argument("--planner-dtype", default="bfloat16")
     ap.add_argument("--planner-nf4", action="store_true")
-    ap.add_argument("--init-adapter", default=None, help="SFT warm-start adapter, merged into the base (KL reference)")
     ap.add_argument("--judge-adapter", default=None)
     ap.add_argument("--judge-base", default=None)
     ap.add_argument("--judge-manifest-train-all", action="store_true",
                     help="accept a judge whose train_scenarios lie in train_all (without shards) rather than train")
     ap.add_argument("--G", type=int, default=4)
     ap.add_argument("--scenarios-per-update", type=int, default=4)
-    ap.add_argument("--updates", type=int, default=5)
-    ap.add_argument("--lr", type=float, default=RC.TRAIN_DEFAULTS["lr"])
-    ap.add_argument("--kl", type=float, default=RC.TRAIN_DEFAULTS["kl_coef"])
+    ap.add_argument("--updates", type=int, default=SPEC_V17["updates"], help="spec v17: 5, fixed (never changed on resume)")
+    ap.add_argument("--lr", type=float, default=SPEC_V17["lr"])
+    ap.add_argument("--kl", type=float, default=SPEC_V17["kl"])
     ap.add_argument("--temperature", type=float, default=1.0)
     ap.add_argument("--top-p", type=float, default=1.0)
-    ap.add_argument("--val-every", type=int, default=5)
-    ap.add_argument("--val-seeds", type=int, nargs="+", default=[0, 1])
+    ap.add_argument("--val-every", type=int, default=SPEC_V17["val_every"])
+    ap.add_argument("--val-seeds", type=int, nargs="+", default=list(SPEC_V17["val_seeds"]),
+                    help="validation Task 2 seeds of u0 and the final update (spec 0..7)")
     ap.add_argument("--val-temperature", type=float, default=0.7, help="D5: validation Task 2 uses the sampled Planner")
     ap.add_argument("--val-top-p", type=float, default=1.0)
     ap.add_argument("--seed", type=int, default=0)
@@ -1313,83 +1678,60 @@ def parse_args(argv=None):
     ap.add_argument("--out", required=True)
     ap.add_argument("--resume", action="store_true")
     ap.add_argument("--allow-code-change", action="store_true")
-    ap.add_argument("--reselect-seeds", type=int, nargs="+", default=None,
-                    help="checkpoint re-selection: re-validate every validated checkpoint with these seeds "
-                         "(writes reselect.jsonl / reselect_best.json only; no training)")
-    ap.add_argument("--reselect-updates", type=int, nargs="+", default=None,
-                    help="with --reselect-seeds: only these validated checkpoints (default: all validated ones)")
-    ap.add_argument("--intervention", default=None,
-                    help="JSON file of a user-approved intervention on the controller weights/bounds (see apply_intervention)")
+    ap.add_argument("--intervention", default=None, help="not available in v17 (refused; SPEC v17 S9)")
     ap.add_argument("--keep-optimizer-last", type=int, default=3,
                     help="delete optimizer.pt of checkpoints older than this many updates (adapters kept); 0 = keep all")
     ap.add_argument("--gpu", type=int, default=0)
     ap.add_argument("--dry-run", action="store_true", help="fake env + pure-python learner (no torch, no GPU)")
     ap.add_argument("--dry-run-crash-after-episodes", type=int, default=0, help=argparse.SUPPRESS)
     a = ap.parse_args(argv)
+    if a.intervention:
+        ap.error("--intervention is not available in v17: the controller is fixed (SPEC v17 S9)")
     if a.G < 2:
         ap.error("--G must be >= 2 (group baselines)")
     if not (a.temperature > 0):
         ap.error("training rollouts need --temperature > 0")
     if a.stop_credit and a.algo != "grpo":
         ap.error("--stop-credit 1 is implemented for grpo")
+    if a.task1_G < 2:
+        ap.error("--task1-G must be >= 2 (group baselines)")
+    if a.sft_epochs_max < 0 or a.sft_samples_per_point < 0 or not (a.sft_lr > 0):
+        ap.error("--sft-epochs-max / --sft-samples-per-point must be >= 0 and --sft-lr > 0")
+    if not (0.0 <= a.aux_weight <= 10.0):
+        ap.error("--aux-weight must lie in [0, 10]")
+    if not (a.length_drift_margin > 0):
+        ap.error("--length-drift-margin must be > 0")
+    if a.updates < 1:
+        ap.error("--updates must be >= 1")
     off = {k: getattr(a, k) for k in SPEC if getattr(a, k) != SPEC[k]}
-    for k, want in (("G", 4), ("behav_mismatch_abort", 0.1), ("w_sel_cov", 1.0), ("w_sel_w1", 1.0),
-                    ("w_sel_task1", 1.0), ("batch", 1), ("task1_tol", 0.05)):
+    for k, want in (("G", 4), ("behav_mismatch_abort", 0.1), ("batch", 1), ("task1_tol", 0.05),
+                    ("val_temperature", 0.7), ("algo", "grpo")):
         if getattr(a, k) != want:
             off[k] = getattr(a, k)
-    if a.stop_sup_weight not in (0.0, 1.0):
-        off["stop_sup_weight"] = a.stop_sup_weight
+    for k in ("lr", "kl", "sft_lr", "sft_epochs_max", "sft_samples_per_point", "task1_G", "task1_convs", "task1_reward",
+              "task1_positions", "aux_weight", "updates", "length_drift_margin", "controller", "stop_credit"):
+        if getattr(a, k) != SPEC_V17[k]:
+            off[k] = getattr(a, k)
+    if sorted(a.val_seeds) != SPEC_V17["val_seeds"]:
+        off["val_seeds"] = a.val_seeds
     if not a.dry_run:
-        for k, want in (("scenarios_per_update", 4), ("val_every", 5)):
+        for k, want in (("scenarios_per_update", 4), ("val_every", SPEC_V17["val_every"])):
             if getattr(a, k) != want:
                 off[k] = getattr(a, k)
-    if a.controller != "llm":
-        off["controller"] = a.controller
     if a.planner_path and "Qwen3-4B-Instruct-2507" not in a.planner_path:
         off["planner_path"] = a.planner_path          # the spec's Planner is Qwen3-4B-Instruct-2507
     if a.config:
         cj = json.load(open(a.config, encoding="utf-8"))
         for sect in ("reward", "algo", "llm", "dual"):
             if cj.get(sect):
-                off["config." + sect] = cj[sect]            # any override of the declared defaults
+                off["config." + sect] = cj[sect]            # any override of the declared defaults (incl. epochs 2 x 4)
     if a.planner_backend != "vllm" and not a.dry_run:
         off["planner_backend"] = a.planner_backend
     if a.planner_backend == "vllm" and (a.temperature != 1.0 or a.top_p != 1.0):
         ap.error("with the vLLM backend the training rollouts must use --temperature 1 --top-p 1: the server's "
                  "behaviour log-probs are the raw distribution, so any other value would bias the TIS weights")
-    for k, want in (("stop_credit", 1), ("kl", RC.TRAIN_DEFAULTS["kl_coef"]), ("val_temperature", 0.7),
-                    ("lr", RC.TRAIN_DEFAULTS["lr"]),
-                    ("stop_sup_anneal", 10), ("algo", "grpo")):
-        if getattr(a, k) != want:
-            off[k] = getattr(a, k)
-    if sorted(a.val_seeds) != [0, 1]:
-        off["val_seeds"] = a.val_seeds
-    if a.task1_convs != 8:
-        off["task1_convs"] = a.task1_convs
-    if a.task1_G != 8:
-        off["task1_G"] = a.task1_G
-    if a.task1_G < 2:
-        ap.error("--task1-G must be >= 2 (group baselines)")
-    if a.t1_trigger_margin != 0.10:
-        off["t1_trigger_margin"] = a.t1_trigger_margin
-    floor_spec = 0.0 if a.stop_sup_weight == 0 else 0.5          # no supervision -> no floor
-    if a.stop_sup_floor is None:
-        a.stop_sup_floor = floor_spec
-    elif a.stop_sup_floor != floor_spec:
-        off["stop_sup_floor"] = a.stop_sup_floor
-    if not (0.0 <= a.stop_sup_floor <= 5.0):
-        ap.error("--stop-sup-floor must lie in [0, 5]")
-    if 0 < a.stop_sup_weight < a.stop_sup_floor:
-        ap.error("--stop-sup-weight %g is below --stop-sup-floor %g: the floor would override it silently"
-                 % (a.stop_sup_weight, a.stop_sup_floor))
-    if a.stop_sup_weight == 0 and a.stop_sup_floor != 0:
-        ap.error("--stop-sup-weight 0 (no stop supervision) needs --stop-sup-floor 0")
-    if a.stop_sup_weight == 0:
-        off["stop_sup_weight"] = 0.0
-    elif not (0.01 <= a.stop_sup_weight <= 5.0):
-        ap.error("--stop-sup-weight must be 0 (off) or within the controller bounds [0.01, 5]")
     if off and not a.ablation:
-        ap.error("settings %r differ from the pend spec %r; name the ablation with --ablation" % (off, SPEC))
+        ap.error("settings %r differ from the pend spec v17; name the ablation with --ablation" % (off,))
     if not (a.val_temperature > 0):
         ap.error("--val-temperature must be > 0 (D5: sampled Planner at validation)")
     if not a.dry_run:
@@ -1401,8 +1743,6 @@ def parse_args(argv=None):
 
 def main(argv=None):
     a = parse_args(argv)
-    if a.reselect_seeds:
-        return Trainer(a).reselect()
     return Trainer(a).run()
 
 

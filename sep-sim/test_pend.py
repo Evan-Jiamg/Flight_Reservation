@@ -93,20 +93,21 @@ def test_stop_target_swaps_the_value_only():
 
 
 def test_stop_supervision_moves_the_stop_policy():
-    """GRPO Task 1 groups are all-or-nothing at the start (zero spread -> skipped); the auxiliary
-    stop supervision still moves p(end | last message) up and p(end | earlier message) down."""
+    """v17 §3.3: the auxiliary stop supervision (constant --aux-weight, one example per decision point, split across the
+    minibatches) moves p(end | last message) up and p(end | earlier message) down, beyond what the Brier GRPO does."""
     d = tempfile.mkdtemp()
     try:
         sp = make_splits(d)
         on, off = os.path.join(d, "on"), os.path.join(d, "off")
-        run_ok(args(sp, on, updates=4, controller="fixed"))
-        run_ok(args(sp, off, "--stop-sup-weight", "0", updates=4, controller="fixed"))
+        run_ok(args(sp, on, "--sft-epochs-max", "0", updates=4))
+        run_ok(args(sp, off, "--sft-epochs-max", "0", "--aux-weight", "0", updates=4))
         th = lambda o: json.load(open(os.path.join(o, "ckpt", "u00004", "fake_learner.json")))["theta"]
         t_on, t_off = th(on), th(off)
         assert t_on[3] > t_off[3], "final-message end logit did not rise with stop supervision"
         assert t_on[1] < t_off[1], "earlier-message end logit did not fall with stop supervision"
         ups = T.read_jsonl(os.path.join(on, "updates.jsonl"))
         assert all(u["learner_stats"].get("aux_n", 0) > 0 for u in ups)
+        assert all(u["train_aggregate"]["aux_weight"] == 0.5 for u in ups)
         assert all("aux_n" not in u["learner_stats"] for u in T.read_jsonl(os.path.join(off, "updates.jsonl")))
     finally:
         shutil.rmtree(d, ignore_errors=True)
@@ -146,15 +147,15 @@ def test_parallel_rollouts_equal_serial():
     try:
         sp = make_splits(d)
         a, b = os.path.join(d, "serial"), os.path.join(d, "par")
-        run_ok(args(sp, a, updates=3, controller="fixed"))
-        run_ok(args(sp, b, "--rollout-workers", "4", updates=3, controller="fixed"))
+        run_ok(args(sp, a, updates=3))
+        run_ok(args(sp, b, "--rollout-workers", "4", updates=3))
         key = lambda r: (r["update"], r["slot"], r["replicate"])
         ra = sorted(strip(T.read_jsonl(os.path.join(a, "rollouts.jsonl"))), key=key)
         rb = sorted(strip(T.read_jsonl(os.path.join(b, "rollouts.jsonl"))), key=key)
         assert ra == rb
         ua, ub = strip(T.read_jsonl(os.path.join(a, "updates.jsonl"))), strip(T.read_jsonl(os.path.join(b, "updates.jsonl")))
         assert ua == ub
-        assert json.load(open(os.path.join(a, "best.json"))) == json.load(open(os.path.join(b, "best.json")))
+        assert json.load(open(os.path.join(a, "final.json")))["final_update"] == 3
         # Task 1 stop groups: same rows serial/parallel, TRAIN conversations only, every update
         ka = lambda r: (r["update"], r["conversation_id"], r["t"])
         ta = sorted(strip(T.read_jsonl(os.path.join(a, "rollouts_task1.jsonl"))), key=ka)
@@ -164,13 +165,21 @@ def test_parallel_rollouts_equal_serial():
         assert all(r["conversation_id"] in sp_["train_all"] and r["conversation_id"] not in sp_["forbidden_for_training"] for r in ta)
         assert sorted({r["update"] for r in ta}) == [1, 2, 3]
         for r in ta:
-            assert r["real_final"] == (r["t"] == r["n_real"]) and len(r["samples"]) == 8      # v16: --task1-G 8
-            assert all(x["reward"] == float(x["ended_planner"] == r["real_final"]) for x in r["samples"])
+            assert r["real_final"] == (r["t"] == r["n_real"]) and len(r["samples"]) == 4      # v17: --task1-G 4
+            y = 1.0 if r["real_final"] else 0.0                                              # v17: Brier reward
+            assert all(x["reward"] == 1.0 - (x["p_end"] - y) ** 2 for x in r["samples"] if x["status"] == "valid")
+            assert all(x["reward"] == 0.0 for x in r["samples"] if x["status"] == "invalid")
+            assert all(x["reward"] is None for x in r["samples"] if x["status"] == "dropped")
+            assert sorted(x["t"] for x in ta if x["update"] == r["update"] and x["conversation_id"] == r["conversation_id"]) \
+                == list(range(2, r["n_real"] + 1))                                           # every decision point
         assert all(u["train_aggregate"]["task1_train"]["n"] > 0 for u in ua)
         # pend default: reward v4 (D1(b)) with the train-only p_h, and validation summaries carry the turn statistics
         assert ua[0]["cfg_used"]["version"] == "v4" and ua[0]["reward_ctx"]["p_h"] and ua[0]["reward_ctx"]["q"]
         assert all(u["train_aggregate"]["shadow_reward_mean"] is not None and u["train_aggregate"]["turn_hist"] for u in ua)
         summ = [v for v in T.read_jsonl(os.path.join(b, "validation.jsonl")) if v["kind"] == "summary"]
-        assert summ and all(s["turn_stats"] and "abs_diff_mean" in s["turn_stats"] and "turn_w1" in s["turn_stats"] for s in summ)
+        # v17: turn statistics on the Task 2 validations (u0 and the final update); the others are Task 1 only
+        assert summ and all(s["turn_stats"] and "abs_diff_mean" in s["turn_stats"] and "turn_w1" in s["turn_stats"]
+                            for s in summ if s["task2"])
+        assert all(s["turn_stats"] is None for s in summ if not s["task2"]) and sum(s["task2"] for s in summ) == 2
     finally:
         shutil.rmtree(d, ignore_errors=True)

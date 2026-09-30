@@ -16,18 +16,40 @@ BASE = ["--dry-run", "--fold", "0", "--out", "o"]
 
 
 @pytest.mark.parametrize("extra", [["--kl", "0.2"], ["--val-seeds", "5"], ["--val-temperature", "1.0"],
-                                   ["--stop-credit", "0"], ["--task1-convs", "0"], ["--stop-sup-weight", "0"],
-                                   ["--stop-sup-anneal", "3"], ["--controller", "fixed"]])
+                                   ["--stop-credit", "0"], ["--task1-convs", "0"], ["--aux-weight", "0"],
+                                   ["--controller", "llm"], ["--lr", "2e-5"], ["--task1-G", "8"], ["--updates", "6"],
+                                   ["--sft-lr", "1e-4"], ["--sft-epochs-max", "2"], ["--sft-samples-per-point", "1"],
+                                   ["--length-drift-margin", "2"], ["--val-seeds", "0", "1"], ["--G", "8"],
+                                   ["--behav-mismatch-abort", "0.5"], ["--batch", "0"], ["--task1-tol", "1"]])
 def test_every_spec_setting_needs_an_ablation(extra, capsys):
+    """SPEC v17 §8 (user 2026-09-30): every approved value is gated; another value needs a named --ablation."""
     with pytest.raises(SystemExit):
         T.parse_args(BASE + extra)
     assert "--ablation" in capsys.readouterr().err
     T.parse_args(BASE + extra + ["--ablation", "test"])           # allowed when named
 
 
+def test_v17_spec_defaults_and_removed_flags(capsys):
+    a = T.parse_args(["--fold", "2", "--out", "o", "--planner-path", "Qwen3-4B-Instruct-2507", "--rollout-workers", "4",
+                      "--gpu", "1", "--resume"])
+    assert a.ablation is None
+    assert (a.lr, a.kl, a.task1_G, a.task1_convs, a.aux_weight, a.updates, a.val_every, a.controller) == \
+        (1e-5, 0.01, 4, 8, 0.5, 5, 1, "fixed")
+    assert (a.sft_lr, a.sft_epochs_max, a.sft_samples_per_point, a.length_drift_margin) == (5e-5, 3, 2, 1.0)
+    assert a.val_seeds == list(range(8)) and a.task1_reward == "brier" and a.task1_positions == "all"
+    for gone in (["--stop-sup-floor", "0.5"], ["--t1-trigger-margin", "0.1"], ["--stop-sup-anneal", "3"],
+                 ["--stop-sup-weight", "1"], ["--reselect-seeds", "0"], ["--w-sel-w1", "1"], ["--init-adapter", "x"]):
+        with pytest.raises(SystemExit):
+            T.parse_args(BASE + gone + ["--ablation", "x"])
+    with pytest.raises(SystemExit):
+        T.parse_args(BASE + ["--intervention", "iv.json", "--ablation", "x"])     # S9: refused in v17
+    assert "not available in v17" in capsys.readouterr().err
+    assert "updates" not in T.RESUME_MAY_CHANGE and not any("reselect" in k for k in T.RESUME_MAY_CHANGE)
+
+
 def test_initial_w_aux_must_lie_in_the_controller_bounds():
     with pytest.raises(SystemExit):
-        T.parse_args(BASE + ["--stop-sup-weight", "8"])
+        T.parse_args(BASE + ["--aux-weight", "12", "--ablation", "x"])
     with pytest.raises(ValueError):
         RC.make_controller("llm", RC.initial_cfg(version="v4", lambda_unparsed=1.0, lambda_hit_max_new=1.0, w_cov=7.0),
                            transport=lambda r: None)

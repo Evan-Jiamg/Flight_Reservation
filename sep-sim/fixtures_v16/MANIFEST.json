@@ -1,0 +1,26 @@
+{
+ "code_sha256": {
+  "batching.py": "f7ca29f24ae62c6c2606ba48207bfff9685e3335349b2009907d988b32d0f555",
+  "ditto_e16.py": "c18fb651c6ad534d939b8c966357f033f9ff688b482134d57cd84f93edf18ceb",
+  "fit_prompts.py": "3f97f0b20dc102cc4b3bb291008b49cc1f2fdf1350ee9783991ee5e0d3a7d365",
+  "goal_judge.py": "c7582f881c84d7b2984957339c0b3904355e47fa0eabd6278e59718e2d5763c7",
+  "implicit_profile.py": "fde22d3be9fbe64c84d9943e734e4152297c923041814f7b0b26737125a9f8f5",
+  "planner_prompt_v3.py": "bee81bbf1b3936a126d9db4344061e747e307817622308b1e91a558198f03fb9",
+  "rl_algos.py": "70d0871f1452150fa67c057e376f0962098008c8e9dfee8db15c7aeff99cbee2",
+  "rl_controllers.py": "7d47d57816b0b5f1119b44b48f7bd5c4d2ad7610eacb321ab2baac78fce0aafa",
+  "rl_reward.py": "67b8f5a719b729b5bac82ee3dbd1334005bbf87d30fa8895827851f3c0a633ee",
+  "style_select.py": "83067f72ddbdeb4306b5058cdad920eb65be61bd91b5f5302a4201fd9241ddfc",
+  "task1_stop.py": "92e2161300b6df0a0297a11b42b28143f5449bf77fe63a709f153a9958c0ffd5",
+  "task2_env.py": "4ecf88b9d87c66bd201d401141f22e92f44489b4e4576482615fa4b7bcbc73f6",
+  "task2_episode.py": "8688ee60a4c29456f080a78efd3405c42623df6155c2721b98d42d0196e10ed8",
+  "train_planner_rl.py": "5a59709b253d3db960880425ec4c409b6a6d1f87e021591bc846a79ceb7071e8",
+  "verify_pipeline.py": "58c8e7a4cd2f2e205b57f481e1c0c306a8958d6c1c985d866235c747b8eca7af"
+ },
+ "runs": {
+  "cap": "big splits, Task 1 samples never end, 2 updates (refill stop 'cap')",
+  "d2": "--t1-trigger-margin -1 --ablation test-d2, 6 updates",
+  "iv": "2 updates, then --resume --intervention (w_dist 1.0, bounds [1, 5]) to 4 updates",
+  "main": "fresh(updates=4) + --reselect-seeds 0..7"
+ },
+ "written_by": "fixtures_v16/make_fixtures_v16.py at commit 9afebdd (v16 trainer, dry run)"
+}
