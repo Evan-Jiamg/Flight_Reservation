@@ -1,0 +1,37 @@
+train_aggregate keys: ['aux_annealed', 'aux_floor', 'aux_floor_active', 'aux_stats', 'aux_weight', 'behav_mismatch_mean', 'clip_frac', 'components_mean', 'end_kind_frac', 'grad_norm', 'kl', 'kl_coef', 'loss', 'lr', 'n_dropped_singleton_episodes', 'n_episodes', 'n_groups', 'n_groups_skipped_zero_std', 'n_tokens', 'n_unclean_episodes', 'p_h', 'ratio_init_maxdev', 'ratio_mean', 'reward_mean', 'reward_std', 'reward_version', 'rl_grad_norm', 'shadow_reward_mean', 'split', 'task1_train', 'tis_capped_frac', 'tis_w_mean', 'turn_hist', 'update', 'value_mse']
+{"u": 1, "n_ep": 16, "groups": 4, "skip0": 0, "R_mean": 0.527, "R_std": 0.584, "cov": 0.887, "dist": -0.34, "turns": 6.375, "end_kind": {"planner_end": 0.8125, "t_max": 0.1875}, "t1": {"n": 128, "acc": 0.5078125, "end_at_final": 0.015625, "end_at_nonfinal": 0.0, "groups_skipped_zero_std": 27, "n_base_groups": 16, "n_informative_groups": 5, "n_refill_groups": 16, "refill_stop": "cap"}, "aux": {"aux_grad_norm": 0.04185574976447082, "aux_loss": 0.00947310554951726, "aux_n": 16, "aux_p_correct_before": 0.5000000243344183, "aux_p_correct_end": 4.906447385710777e-06}, "aux_w": 1.0}
+{"u": 2, "n_ep": 16, "groups": 4, "skip0": 0, "R_mean": 0.627, "R_std": 0.497, "cov": 0.831, "dist": -0.204, "turns": 5.6875, "end_kind": {"planner_end": 1.0}, "t1": {"n": 128, "acc": 0.5390625, "end_at_final": 0.09375, "end_at_nonfinal": 0.015625, "groups_skipped_zero_std": 25, "n_base_groups": 16, "n_informative_groups": 7, "n_refill_groups": 16, "refill_stop": "cap"}, "aux": {"aux_grad_norm": 0.042946538560593515, "aux_loss": 0.008389805948202912, "aux_n": 16, "aux_p_correct_before": 0.5388891984827708, "aux_p_correct_end": 0.07781166380790694}, "aux_w": 1.0}
+{"u": 3, "n_ep": 16, "groups": 4, "skip0": 0, "R_mean": 0.459, "R_std": 0.762, "cov": 0.834, "dist": -0.375, "turns": 6.3125, "end_kind": {"planner_end": 1.0}, "t1": {"n": 128, "acc": 0.578125, "end_at_final": 0.15625, "end_at_nonfinal": 0.0, "groups_skipped_zero_std": 23, "n_base_groups": 16, "n_informative_groups": 9, "n_refill_groups": 16, "refill_stop": "cap"}, "aux": {"aux_grad_norm": 0.04262382251412697, "aux_loss": 0.006762937029108112, "aux_n": 16, "aux_p_correct_before": 0.5486458704817494, "aux_p_correct_end": 0.12512991894249126}, "aux_w": 1.0}
+{"u": 4, "n_ep": 16, "groups": 4, "skip0": 0, "R_mean": 0.722, "R_std": 0.477, "cov": 0.835, "dist": -0.107, "turns": 5.5, "end_kind": {"planner_end": 0.875, "t_max": 0.125}, "t1": {"n": 128, "acc": 0.5234375, "end_at_final": 0.0625, "end_at_nonfinal": 0.015625, "groups_skipped_zero_std": 23, "n_base_groups": 16, "n_informative_groups": 9, "n_refill_groups": 16, "refill_stop": "cap"}, "aux": {"aux_grad_norm": 0.05913533618676073, "aux_loss": 0.008915625318355807, "aux_n": 16, "aux_p_correct_before": 0.43782724298149844, "aux_p_correct_end": 6.969565703229819e-06}, "aux_w": 1.0}
+{"u": 5, "n_ep": 16, "groups": 4, "skip0": 0, "R_mean": 0.694, "R_std": 0.466, "cov": 0.857, "dist": -0.163, "turns": 5.6875, "end_kind": {"planner_end": 1.0}, "t1": {"n": 128, "acc": 0.5078125, "end_at_final": 0.078125, "end_at_nonfinal": 0.0625, "groups_skipped_zero_std": 26, "n_base_groups": 16, "n_informative_groups": 6, "n_refill_groups": 16, "refill_stop": "cap"}, "aux": {"aux_grad_norm": 0.06713760987149744, "aux_loss": 0.007264002253510829, "aux_n": 16, "aux_p_correct_before": 0.5171393217027975, "aux_p_correct_end": 0.034287241375603905}, "aux_w": 1.0}
+{"u": 6, "n_ep": 16, "groups": 4, "skip0": 0, "R_mean": 0.374, "R_std": 0.558, "cov": 0.771, "dist": -0.318, "turns": 5.375, "end_kind": {"planner_end": 1.0}, "t1": {"n": 128, "acc": 0.53125, "end_at_final": 0.109375, "end_at_nonfinal": 0.046875, "groups_skipped_zero_std": 24, "n_base_groups": 16, "n_informative_groups": 8, "n_refill_groups": 16, "refill_stop": "cap"}, "aux": {"aux_grad_norm": 0.0438469557289976, "aux_loss": 0.005145751333207438, "aux_n": 16, "aux_p_correct_before": 0.5667742808688532, "aux_p_correct_end": 0.14337942402141302}, "aux_w": 0.8}
+{"u": 7, "n_ep": 16, "groups": 4, "skip0": 0, "R_mean": 0.2, "R_std": 1.161, "cov": 0.776, "dist": -0.461, "turns": 4.6875, "end_kind": {"planner_end": 1.0}, "t1": {"n": 128, "acc": 0.5390625, "end_at_final": 0.125, "end_at_nonfinal": 0.046875, "groups_skipped_zero_std": 19, "n_base_groups": 16, "n_informative_groups": 13, "n_refill_groups": 16, "refill_stop": "cap"}, "aux": {"aux_grad_norm": 0.03632737723015683, "aux_loss": 0.005089572105913681, "aux_n": 16, "aux_p_correct_before": 0.5625412083890851, "aux_p_correct_end": 0.12510067815121317}, "aux_w": 0.8}
+{"u": 8, "n_ep": 16, "groups": 4, "skip0": 0, "R_mean": 0.364, "R_std": 1.107, "cov": 0.833, "dist": -0.375, "turns": 4.5, "end_kind": {"planner_end": 0.875, "t_max": 0.125}, "t1": {"n": 128, "acc": 0.53125, "end_at_final": 0.140625, "end_at_nonfinal": 0.078125, "groups_skipped_zero_std": 14, "n_base_groups": 16, "n_informative_groups": 16, "n_refill_groups": 14, "refill_stop": "filled"}, "aux": {"aux_grad_norm": 0.03262495811517472, "aux_loss": 0.004860629495172256, "aux_n": 16, "aux_p_correct_before": 0.4972997509275672, "aux_p_correct_end": 0.12557977253703712}, "aux_w": 0.8}
+{"u": 9, "n_ep": 16, "groups": 4, "skip0": 0, "R_mean": 0.321, "R_std": 1.067, "cov": 0.696, "dist": -0.3, "turns": 3.6875, "end_kind": {"planner_end": 1.0}, "t1": {"n": 128, "acc": 0.671875, "end_at_final": 0.421875, "end_at_nonfinal": 0.0625, "groups_skipped_zero_std": 8, "n_base_groups": 16, "n_informative_groups": 16, "n_refill_groups": 8, "refill_stop": "filled"}, "aux": {"aux_grad_norm": 0.056911876894459264, "aux_loss": 0.0027578456035327326, "aux_n": 16, "aux_p_correct_before": 0.5149578773480243, "aux_p_correct_end": 0.14988759487278003}, "aux_w": 0.8}
+{"u": 10, "n_ep": 16, "groups": 4, "skip0": 0, "R_mean": 0.296, "R_std": 1.068, "cov": 0.815, "dist": -0.415, "turns": 3.5, "end_kind": {"planner_end": 1.0}, "t1": {"n": 128, "acc": 0.609375, "end_at_final": 0.328125, "end_at_nonfinal": 0.109375, "groups_skipped_zero_std": 7, "n_base_groups": 16, "n_informative_groups": 17, "n_refill_groups": 8, "refill_stop": "filled"}, "aux": {"aux_grad_norm": 0.03191412711166512, "aux_loss": 0.0016233009441388724, "aux_n": 16, "aux_p_correct_before": 0.6531023427796754, "aux_p_correct_end": 0.4459836145360896}, "aux_w": 0.8}
+##### real turn-count distribution p_h (train_all) and q of u1 / u10
+p_h [0.036, 0.036, 0.036, 0.143, 0.214, 0.214, 0.143, 0.071, 0.036, 0.036, 0.036]
+q u1 [0.037, 0.037, 0.037, 0.037, 0.111, 0.222, 0.148, 0.148, 0.037, 0.037, 0.148]
+q u10 [0.037, 0.037, 0.185, 0.222, 0.185, 0.074, 0.111, 0.037, 0.037, 0.037, 0.037]
+##### Task 1 stop groups: (update, real_final) -> groups, sampled ends / samples
+(1, False) [16, 0, 128]
+(1, True) [16, 0, 128]
+(2, False) [16, 0, 128]
+(2, True) [16, 0, 128]
+(3, False) [16, 0, 128]
+(3, True) [16, 0, 128]
+(4, False) [16, 0, 128]
+(4, True) [16, 0, 128]
+(5, False) [16, 0, 128]
+(5, True) [16, 0, 128]
+(6, False) [16, 0, 128]
+(6, True) [16, 0, 128]
+(7, False) [16, 0, 128]
+(7, True) [16, 0, 128]
+(8, False) [15, 0, 120]
+(8, True) [15, 0, 120]
+(9, False) [12, 0, 96]
+(9, True) [12, 0, 96]
+(10, False) [12, 0, 96]
+(10, True) [12, 0, 96]
+rollouts_task1 row keys: ['conversation_id', 'n_real', 'policy_sha', 'policy_version', 'real_final', 'refill', 'samples', 'split', 't', 'time', 'update']

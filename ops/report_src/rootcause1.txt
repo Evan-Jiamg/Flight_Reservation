@@ -1,0 +1,35 @@
+##### host
+cfda5
+##### GPUs
+0, 69157 MiB, 97887 MiB, 97 %
+1, 74151 MiB, 97887 MiB, 100 %
+##### GPU processes: owner only
+pid 2119312 user xandro
+pid 2334507 user hcwang
+pid 2338759 user hcwang
+pid 2330584 user hcwang
+2119312, GPU-983e4cfd-be6e-a359-74d4-f0c3a1f837a9, 920 MiB
+2334507, GPU-983e4cfd-be6e-a359-74d4-f0c3a1f837a9, 22994 MiB
+2338759, GPU-983e4cfd-be6e-a359-74d4-f0c3a1f837a9, 45224 MiB
+2330584, GPU-3797edfd-621e-a245-771b-087225b620e1, 74142 MiB
+0, GPU-983e4cfd-be6e-a359-74d4-f0c3a1f837a9
+1, GPU-3797edfd-621e-a245-771b-087225b620e1
+##### our processes
+(none above = idle)
+##### v16 fold 2 per-update training statistics
+{"u": 1, "rl_g": 0.00662908788873669, "aux_g": 0.04185574976447082, "kl": 0.0, "adv_abs": 0.5043572206840553, "n_samp": 142, "aux_n": 16, "aux_p_before": 0.5000000243344183, "t1_acc": null, "t1_end_final": null, "t1_end_nonfinal": null, "t1_skip0": null, "t1_base": null, "t1_inform": null, "w": {"w_cov": 1.0, "w_dist": 1.0, "w_aux": 1.0}}
+{"u": 2, "rl_g": 0.003273059416132307, "aux_g": 0.042946538560593515, "kl": 0.0012527997643091411, "adv_abs": 0.3591808122625385, "n_samp": 147, "aux_n": 16, "aux_p_before": 0.5388891984827708, "t1_acc": null, "t1_end_final": null, "t1_end_nonfinal": null, "t1_skip0": null, "t1_base": null, "t1_inform": null, "w": {"w_cov": 1.0, "w_dist": 1.0, "w_aux": 1.0}}
+{"u": 3, "rl_g": 0.008217495981654426, "aux_g": 0.04262382251412697, "kl": 0.001263339098955116, "adv_abs": 0.535402122459263, "n_samp": 173, "aux_n": 16, "aux_p_before": 0.5486458704817494, "t1_acc": null, "t1_end_final": null, "t1_end_nonfinal": null, "t1_skip0": null, "t1_base": null, "t1_inform": null, "w": {"w_cov": 1.0, "w_dist": 1.0, "w_aux": 1.0}}
+{"u": 4, "rl_g": 0.005227870477655652, "aux_g": 0.05913533618676073, "kl": 0.0013397073553976801, "adv_abs": 0.3587633695434259, "n_samp": 160, "aux_n": 16, "aux_p_before": 0.43782724298149844, "t1_acc": null, "t1_end_final": null, "t1_end_nonfinal": null, "t1_skip0": null, "t1_base": null, "t1_inform": null, "w": {"w_cov": 1.0, "w_dist": 1.0, "w_aux": 1.0}}
+{"u": 5, "rl_g": 0.008939819909578822, "aux_g": 0.06713760987149744, "kl": 0.0014010712652021834, "adv_abs": 0.46759664933430517, "n_samp": 139, "aux_n": 16, "aux_p_before": 0.5171393217027975, "t1_acc": null, "t1_end_final": null, "t1_end_nonfinal": null, "t1_skip0": null, "t1_base": null, "t1_inform": null, "w": {"w_cov": 1.0, "w_dist": 1.0, "w_aux": 1.0}}
+{"u": 6, "rl_g": 0.01436168886792683, "aux_g": 0.0438469557289976, "kl": 0.002069544312356738, "adv_abs": 0.4817839551418096, "n_samp": 150, "aux_n": 16, "aux_p_before": 0.5667742808688532, "t1_acc": null, "t1_end_final": null, "t1_end_nonfinal": null, "t1_skip0": null, "t1_base": null, "t1_inform": null, "w": {"w_cov": 1.0, "w_dist": 1.25, "w_aux": 0.8}}
+{"u": 7, "rl_g": 0.006716017355942889, "aux_g": 0.03632737723015683, "kl": 0.002382132680883199, "adv_abs": 0.5268490388167777, "n_samp": 179, "aux_n": 16, "aux_p_before": 0.5625412083890851, "t1_acc": null, "t1_end_final": null, "t1_end_nonfinal": null, "t1_skip0": null, "t1_base": null, "t1_inform": null, "w": {"w_cov": 1.0, "w_dist": 1.25, "w_aux": 0.8}}
+{"u": 8, "rl_g": 0.0061872266025776515, "aux_g": 0.03262495811517472, "kl": 0.0032892109109724735, "adv_abs": 0.4947373430856388, "n_samp": 200, "aux_n": 16, "aux_p_before": 0.4972997509275672, "t1_acc": null, "t1_end_final": null, "t1_end_nonfinal": null, "t1_skip0": null, "t1_base": null, "t1_inform": null, "w": {"w_cov": 1.0, "w_dist": 1.25, "w_aux": 0.8}}
+{"u": 9, "rl_g": 0.01417828765334398, "aux_g": 0.056911876894459264, "kl": 0.0053152088734916975, "adv_abs": 0.5250055436184293, "n_samp": 187, "aux_n": 16, "aux_p_before": 0.5149578773480243, "t1_acc": null, "t1_end_final": null, "t1_end_nonfinal": null, "t1_skip0": null, "t1_base": null, "t1_inform": null, "w": {"w_cov": 1.0, "w_dist": 1.25, "w_aux": 0.8}}
+{"u": 10, "rl_g": 0.009482250162174263, "aux_g": 0.03191412711166512, "kl": 0.0058453546579345355, "adv_abs": 0.5093473030650296, "n_samp": 192, "aux_n": 16, "aux_p_before": 0.6531023427796754, "t1_acc": null, "t1_end_final": null, "t1_end_nonfinal": null, "t1_skip0": null, "t1_base": null, "t1_inform": null, "w": {"w_cov": 1.0, "w_dist": 1.25, "w_aux": 0.8}}
+##### keys available (update 1)
+['algo', 'cfg_used', 'cfg_used_sha256', 'controller', 'controller_failures', 'controller_rollbacks', 'learner_stats', 'n_samples', 'next_cfg', 'policy_sha_after', 'policy_version_after', 'policy_version_rollouts', 'reward_ctx', 'scenarios', 'time', 'timing', 'train_aggregate', 'update', 'update_s']
+learner_stats keys: ['adv_abs_mean', 'aux_grad_norm', 'aux_loss', 'aux_n', 'aux_p_correct_before', 'aux_p_correct_end', 'behav_mismatch_mean', 'clip_frac', 'grad_norm', 'kl', 'loss', 'n_samples', 'n_tokens', 'optimizer_steps', 'ratio_init_maxdev', 'ratio_mean', 'rl_grad_norm', 'tis_capped_frac', 'tis_tokens', 'tis_w_mean', 'value_mse']
+reward_ctx -> ['p_h', 'q']
+timing -> ['learner_s', 'task1_groups_s', 'task2_rollouts_s']
+train_aggregate -> ['aux_annealed', 'aux_floor', 'aux_floor_active', 'aux_stats', 'aux_weight', 'behav_mismatch_mean', 'clip_frac', 'components_mean', 'end_kind_frac', 'grad_norm', 'kl', 'kl_coef', 'loss', 'lr', 'n_dropped_singleton_episodes', 'n_episodes', 'n_groups', 'n_groups_skipped_zero_std', 'n_tokens', 'n_unclean_episodes', 'p_h', 'ratio_init_maxdev', 'ratio_mean', 'reward_mean', 'reward_std']
