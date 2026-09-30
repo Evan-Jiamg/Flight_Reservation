@@ -4,13 +4,16 @@
 # (another job on the GPU; judged on THIS attempt's log lines only) is retried with --resume (the SFT examples / the
 # latest checkpoint are reused), up to 10 times; anything else stops. Then verify_pipeline (v17 branch) must pass.
 # The test evaluation is run_v17_test.sh (it starts / releases the placeholder and every GPU we hold).
-# Needs the placeholder (gpu_holder2.py) to run; start_servers5.sh starts / reuses the servers (gpt-oss-120b on 8029,
+# Needs the placeholder (gpu_holder3.py) to run; start_servers6.sh starts / reuses the servers (gpt-oss-120b on 8029,
 # the Planner vLLM on 8031). The training GPU is taken from the placeholder dynamically and handed back after each
-# attempt (never a GPU somebody else is using). Usage: run_v17_fold.sh F   (F = 0, 1 or 2)
+# attempt (never a GPU somebody else is using). 2026-09-30: gpu_holder3.py / start_servers6.sh (dynamic placement; a
+# server start that loses the memory race is waited out and re-placed inside start_servers6.sh; only a real server
+# error or the same race 3 times on one placement makes it exit 1 -> STOP here).
+# Usage: run_v17_fold.sh F   (F = 0, 1 or 2)
 set -uo pipefail
 F=${1:-}
 case $F in 0|1|2) ;; *) echo "STOP: fold must be 0, 1 or 2"; exit 1;; esac
-G=/tmp2/mzjiang_usersim/grpo_planner; C=$G/code_snapshots/pend_v17; RUN=$G/runs/pend_f${F}_v17; H=$G/hold
+G=/tmp2/mzjiang_usersim/grpo_planner; C=$G/code_snapshots/pend_v17; RUN=$G/runs/pend_f${F}_v17; H=${HOLD_DIR:-$G/hold}   # HOLD_DIR: only for a cut-over next to an old placeholder
 PYDIR=/home/mzjiang/miniconda3/envs/consistent-test/bin; PY=$PYDIR/python
 export PATH=$PYDIR:$PATH PYTHONNOUSERSITE=1 HF_HOME=/tmp2/hf_shared PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export CUDA_DEVICE_ORDER=PCI_BUS_ID   # torch GPU indices = nvidia-smi / placeholder indices (fix round 3)
@@ -20,22 +23,28 @@ export CONTROLLER_BASE_URL=http://127.0.0.1:8029/v1 OPENAI_API_KEY=local-vllm-un
 export Q4=$(ls -d /tmp2/hf_shared/hub/models--Qwen--Qwen3-4B-Instruct-2507/snapshots/*/ | head -1)
 held() { cat $H/status_$1 2>/dev/null || echo 0; }
 settarget() { echo $2 > $H/target_$1.tmp && mv -f $H/target_$1.tmp $H/target_$1; }
+TN=${TRAIN_NEED_GIB:-45}                 # the training share the placeholder keeps for the trainer (gpu_holder3.py TRAIN_NEED)
 TG=""
+holder_ok() { pgrep -u mzjiang -f "python.* .*gpu_holder3\.py" > /dev/null && [ -f $H/plan ] && [ $(( $(date +%s) - $(stat -c %Y $H/plan) )) -lt 60 ]; }
+holder_check() { holder_ok || { echo "STOP: the GPU holder (gpu_holder3.py) is not running or not writing $H/plan (HOLD_DIR?)"; exit 1; }; }
 take_train_gpu() {
-  n=0; until [ -f $H/role_train ]; do [ $((n % 600)) -eq 0 ] && echo "WAITING_GPU: no training GPU with room yet ($(date +%H:%M))"; n=$((n + 1)); sleep 1; done
+  n=0; until [ -f $H/role_train ]; do [ $((n % 300)) -eq 0 ] && { holder_check; echo "WAITING_GPU: no committed placement yet: $(cat $H/plan 2>/dev/null) ($(date +%H:%M))"; }; n=$((n + 1)); sleep 1; done
   TG=$(cat $H/role_train); n=0
-  until [ "$(held $TG)" -ge 45 ]; do [ $((n % 300)) -eq 0 ] && echo "WAITING_GPU: training GPU $TG holds $(held $TG)/45 GiB ($(date +%H:%M))"; n=$((n + 1)); sleep 1; done
-  settarget $TG 0; until [ "$(held $TG)" -le 0 ]; do sleep 1; done
+  settarget $TG $TN                  # never wait for more than the placeholder is asked to hold (audit B1)
+  until [ "$(held $TG)" -ge $TN ]; do [ $((n % 300)) -eq 0 ] && { holder_check; echo "WAITING_GPU: training GPU $TG holds $(held $TG)/$TN GiB ($(date +%H:%M))"; }; n=$((n + 1)); sleep 1; done
+  settarget $TG 0; n=0
+  until [ "$(held $TG)" -le 0 ]; do n=$((n + 1)); [ $((n % 300)) -eq 0 ] && { holder_check; echo "WAITING_GPU: GPU $TG still holds $(held $TG) GiB after the hand-over ($(date +%H:%M))"; }; sleep 1; done
   GPU=$TG
 }
-giveback() { [ -n "$TG" ] && settarget $TG 45; TG=""; }     # the placeholder re-takes the training GPU
+giveback() { [ -n "$TG" ] && settarget $TG $TN; TG=""; }     # the placeholder re-takes the training GPU
 trap giveback EXIT
-servers() { bash $G/start_servers5.sh > $G/servers_check_f${F}_v17.log 2>&1 || { echo "STOP: servers not available"; tail -5 $G/servers_check_f${F}_v17.log; exit 1; }; }
+servers() { bash $G/start_servers6.sh > $G/servers_check_f${F}_v17.log 2>&1 || { echo "STOP: a server failed to start (not a memory race; those are waited out inside start_servers6.sh)"; tail -8 $G/servers_check_f${F}_v17.log; exit 1; }; }
 VERIFY="$PY verify_pipeline.py --rl-dir $RUN --splits $G/splits_v1.json --fold $F --split train --arm pend --sepsim-path $G/trees/e1r_cf19400"
 finished() { [ -f $RUN/final.json ] && $PY -c "import json,sys; sys.exit(0 if json.load(open('$RUN/final.json')).get('validated') else 1)"; }
 cd $C || { echo "STOP: no snapshot $C"; exit 1; }
 sha256sum -c --quiet local_sha_v17.txt || { echo "STOP: pend_v17 snapshot sha mismatch"; exit 1; }
-pgrep -u mzjiang -f gpu_holder2.py > /dev/null || { echo "STOP: the placeholder is not running"; exit 1; }
+pgrep -u mzjiang -f "python.* .*(gpu_holder2|gpu_grab)\.py" > /dev/null && { echo "STOP: an old placeholder (gpu_holder2.py / gpu_grab.py) is running - finish the cut-over first (ops/v11ops/RESUME.md)"; exit 1; }
+holder_check                             # the placeholder runs and writes $H/plan (else STOP)
 mkdir -p $RUN
 echo "=== FOLD $F v17 start $(date)"
 if finished; then
