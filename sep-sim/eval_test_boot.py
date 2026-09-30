@@ -73,7 +73,9 @@ def ckpt_of(u):
 eps, t1 = collections.defaultdict(dict), collections.defaultdict(dict)
 for u in want_keys:
     psha = json.load(open(os.path.join(ckpt_of(u), "state.json")))["policy_sha"]
-    want_ad = VP.adapter_name(run, "sft_e0" if u == "base" else u)
+    # the served-adapter checks apply to a real vLLM run (a dry run's stub adapter directory is never served)
+    real_vllm = args.get("planner_backend") == "vllm" and not args.get("dry_run")
+    want_ad = VP.adapter_name(run, "sft_e0" if u == "base" else u) if real_vllm else None
     s = summ[u]
     ok(s["policy_sha"] == psha, "%s summary policy sha != checkpoint" % LABEL[u])
     ok(s["seeds"] == seeds and s["task2_ids"] == test and s["task1_ids"] == test_all, "%s summary seeds / ids != meta" % LABEL[u])
@@ -111,9 +113,10 @@ def t2stats(u, keys):
     E = [eps[u][k] for k in keys if eps[u][k]["clean"]]
     sim = [e["emitted_user_turns"] for e in E]
     hum = [min(int(e["human_turns"]), T_MAX) for e in E]            # capped for W1, as validate()
-    return {"w1": TP.turn_w1(sim, hum), "abs_err": sum(abs(e["emitted_user_turns"] - e["human_turns"]) for e in E) / len(E),
+    # human turns capped at t_max everywhere (fix round 1, D-N5; TP.turn_stats_of); the uncapped mean is "hum_uncapped"
+    return {"w1": TP.turn_w1(sim, hum), "abs_err": sum(abs(a_ - b_) for a_, b_ in zip(sim, hum)) / len(E),
             "cov": sum(float(e["coverage"]) for e in E) / len(E), "sim": sum(sim) / len(sim),
-            "hum": sum(e["human_turns"] for e in E) / len(E)}              # uncapped, as the summary's human_turns_mean
+            "hum": sum(hum) / len(hum), "hum_uncapped": sum(e["human_turns"] for e in E) / len(E)}
 
 
 def t1stats(u, convs):
@@ -134,7 +137,8 @@ for u in want_keys:
         ts = s[tag] or {}
         full2 = t2stats(u, sorted(k for k in eps[u] if k[1] in sd))
         for k_s, k_r in (("turn_w1", "w1"), ("abs_diff_mean", "abs_err"), ("coverage_mean", "cov"),
-                         ("sim_turns_mean", "sim"), ("human_turns_mean", "hum")):
+                         ("sim_turns_mean", "sim"), ("human_turns_mean", "hum"),
+                         ("human_turns_mean_uncapped", "hum_uncapped")):
             ok(ts.get(k_s) is not None and abs(ts[k_s] - full2[k_r]) < 1e-9,
                "%s %s.%s %r != recomputed %r" % (LABEL[u], tag, k_s, ts.get(k_s), full2[k_r]))
         print("%-18s Task 2 %-18s %2d episodes: sim %.2f human %.2f W1 %.3f |diff| %.2f cov %.3f" % (

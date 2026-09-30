@@ -70,15 +70,7 @@ def summarize(tr, u, psha, seeds, vrows, t1rows, t0):
         eps = [r["episode"] for r in rows if r["episode"]["clean"]]
         if not eps or not all("human_turns" in e for e in eps):
             return None
-        d = [e["emitted_user_turns"] - e["human_turns"] for e in eps]
-        return {"n_episodes": len(eps),
-                "sim_turns_mean": sum(e["emitted_user_turns"] for e in eps) / len(eps),
-                "human_turns_mean": sum(e["human_turns"] for e in eps) / len(eps),
-                "abs_diff_mean": sum(abs(x) for x in d) / len(d),
-                "coverage_mean": sum(float(e["coverage"]) for e in eps) / len(eps),
-                "turn_w1": TP.turn_w1([e["emitted_user_turns"] for e in eps],
-                                      [min(int(e["human_turns"]), t_max) for e in eps]),
-                "end_kinds": {k: sum(e["end_kind"] == k for e in eps) for k in sorted({e["end_kind"] for e in eps})}}
+        return TP.turn_stats_of(eps, t_max)          # human turns capped at t_max (fix round 1, D-N5), as validate()
 
     n_unclean = sum(1 for r in vrows if not r["episode"]["clean"])
     t1 = T1.task1_stop_metrics([r["task1"] for r in t1rows])
@@ -161,6 +153,13 @@ def main(argv=None):
     bu = fin.get("final_update")
     if bu is None or not fin.get("validated"):
         raise SystemExit("final.json has no validated final update: %r" % fin)
+    # fix round 1 (A-7 / C-N9): final.json names the checkpoint that exists; the spec's test seeds are 0..7
+    st_f = json.load(open(os.path.join(a.out, "ckpt", "u%05d" % bu, "state.json"), encoding="utf-8"))
+    if st_f["policy_sha"] != fin.get("policy_sha"):
+        raise SystemExit("final.json policy sha %s != ckpt u%d's %s" % (str(fin.get("policy_sha"))[:12], bu,
+                                                                     st_f["policy_sha"][:12]))
+    if sorted(own.test_seeds) != list(range(8)) and not a.ablation:
+        raise SystemExit("--test-seeds must be 0..7 (spec v17 §5) unless the run is a named --ablation")
     if sorted(set(own.test_updates)) != sorted({0, bu}) or len(own.test_updates) != len(set(own.test_updates)):
         raise SystemExit("--test-updates must be exactly u0 (SFT) and the final u%d, got %s" % (bu, own.test_updates))
     # S13: both need a validation summary that INCLUDES Task 2 (a Task-1-only summary does not count)

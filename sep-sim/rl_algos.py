@@ -331,8 +331,22 @@ def tensor_sha(state):
 REF_ADAPTER = "ref"
 
 
-def ref_param_names(model):
-    return [n for n, _ in model.named_parameters() if (".%s." % REF_ADAPTER) in n]
+def _accepts(fn, name):
+    """True when callable fn takes a keyword `name` (PEFT signatures differ across versions)."""
+    import inspect
+    try:
+        return name in inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return False
+
+
+def set_active_adapter(model, name):
+    """model.set_adapter(name), with inference_mode=True when the installed PEFT accepts it (fix round 1, B-N5: the
+    switched-to adapter is then not made trainable). The callers still assert the trainable set afterwards."""
+    if name != "default" and _accepts(model.set_adapter, "inference_mode"):
+        model.set_adapter(name, inference_mode=True)
+    else:
+        model.set_adapter(name)
 
 
 def load_ref_adapter(model, path, optimizer=None):
@@ -344,8 +358,14 @@ def load_ref_adapter(model, path, optimizer=None):
         raise AssertionError("the ref adapter is already loaded")
     names0 = [n for n, p in model.named_parameters() if p.requires_grad]
     opt0 = [id(p) for g in optimizer.param_groups for p in g["params"]] if optimizer is not None else None
-    model.load_adapter(path, adapter_name=REF_ADAPTER, is_trainable=False)
+    # fix round 1 (B-1): load onto the policy's own device -- PEFT's default device is "cuda" = cuda:0, whatever --gpu is
+    dev = str(next(model.parameters()).device)
+    kw = {"torch_device": dev} if _accepts(model.load_adapter, "torch_device") else {}
+    model.load_adapter(path, adapter_name=REF_ADAPTER, is_trainable=False, **kw)
     model.set_adapter("default")
+    bad = sorted({str(p.device) for n, p in model.named_parameters() if (".%s." % REF_ADAPTER) in n} - {dev})
+    if bad:
+        raise AssertionError("ref adapter parameters on %s, the policy is on %s" % (bad, dev))
     names1 = [n for n, p in model.named_parameters() if p.requires_grad]
     if names1 != names0:
         raise AssertionError("loading the ref adapter changed the trainable parameters (%d -> %d)" % (len(names0), len(names1)))
@@ -414,6 +434,35 @@ def token_logprobs(model, prompt_ids, gen_ids, temperature=1.0, want_hidden=Fals
     logp = torch.log_softmax(logits, dim=-1).gather(-1, tgt.unsqueeze(-1)).squeeze(-1)
     hidden = out.hidden_states[-1][0, P - 1].detach().float() if want_hidden else None
     return logp, hidden
+
+
+def token_logprobs_fp32(model, prompt_ids, gen_ids):
+    """Like token_logprobs (temperature 1, no grad by the caller), but the logits of the generated positions are
+    recomputed in fp32 from the lm_head's own input (captured by a forward hook) and its fp32-upcast weight (fix round
+    1, D-N3: the two value logits of P_end are not rounded to bf16). -> logp [G] float32."""
+    import torch
+    head = model.get_output_embeddings()
+    cap = {}
+    h = head.register_forward_hook(lambda mod, inp, out: cap.__setitem__("x", inp[0]))
+    try:
+        dev = next(model.parameters()).device
+        P, G = len(prompt_ids), len(gen_ids)
+        ids = torch.tensor([list(prompt_ids) + list(gen_ids)], dtype=torch.long, device=dev)
+        try:
+            model(input_ids=ids, use_cache=False, logits_to_keep=G + 1)
+        except TypeError:
+            model(input_ids=ids, use_cache=False)
+    finally:
+        h.remove()
+    hid = cap["x"][0]
+    hid = hid[-(G + 1):-1] if hid.shape[0] != G + 1 else hid[:G]
+    if hid.shape[0] != G:
+        raise AssertionError("lm_head input slice %d != %d generated tokens" % (hid.shape[0], G))
+    logits = hid.float() @ head.weight.float().t()
+    if getattr(head, "bias", None) is not None:
+        logits = logits + head.bias.float()
+    tgt = ids[0, P:P + G]
+    return torch.log_softmax(logits, dim=-1).gather(-1, tgt.unsqueeze(-1)).squeeze(-1)
 
 
 def make_value_head(hidden_size, width):
@@ -490,7 +539,7 @@ class TorchLearner:
                 # flips requires_grad, so the trainable set is checked after switching back); no per-forward
                 # adapter_names=
                 try:
-                    self.model.set_adapter(REF_ADAPTER)
+                    set_active_adapter(self.model, REF_ADAPTER)
                     return token_logprobs(self.model, s["prompt_ids"], s["gen_ids"], s["temperature"], hidden)
                 finally:
                     self.model.set_adapter("default")
@@ -571,7 +620,7 @@ class TorchLearner:
             _, p_before = value_nll_loss(self.model, [dict(x, weight=1.0) for x in aux], 1, backward=False)
             st["aux_n"] = len(aux)
             st["aux_p_correct_before"] = sum(p_before) / len(p_before)
-            st["aux_p_correct_end"] = (sum(p for p, x in zip(p_before, aux) if x["want_end"]) /
+            st["aux_p_correct_before_final"] = (sum(p for p, x in zip(p_before, aux) if x["want_end"]) /
                                        max(1, sum(1 for x in aux if x["want_end"])))
             st["aux_loss"] = 0.0
 
@@ -735,12 +784,13 @@ class TorchLearner:
     def end_prob(self, x):
         """v16 validation Task 1 metric: P(end_session = true) given the prompt and the policy's own greedy prefix
         up to the value, normalised over the two values: exp(lp_true) / (exp(lp_true) + exp(lp_false)), each lp the
-        summed log-prob of that value's tokens (temperature 1, no grad)."""
+        summed log-prob of that value's tokens (temperature 1, no grad). Fix round 1 (D-N3): the value tokens' logits
+        are computed in fp32 (token_logprobs_fp32: the lm_head input and weight upcast), not bf16."""
         import torch
         with torch.no_grad():
             ctx = list(x["prompt_ids"]) + list(x["prefix_ids"])
-            lt = float(token_logprobs(self.model, ctx, x["target_true"], 1.0)[0].sum())
-            lf = float(token_logprobs(self.model, ctx, x["target_false"], 1.0)[0].sum())
+            lt = float(token_logprobs_fp32(self.model, ctx, x["target_true"]).sum())
+            lf = float(token_logprobs_fp32(self.model, ctx, x["target_false"]).sum())
         m = max(lt, lf)
         return math.exp(lt - m) / (math.exp(lt - m) + math.exp(lf - m))
 

@@ -22,7 +22,8 @@ Checks
   14 v17 §3.4 / S4: epochs 2 x minibatches 4 = 8 optimizer steps with the aux split (each example once per epoch),
      per-step statistics; aux-only update = 1 step (flag aux_only)
   11 auxiliary stop supervision: an aux-only update raises p(target tokens | prompt + prefix)
-  15 v17 §1.2: value_nll_loss / the SFT AdamW step raise p(target); p_end_batch == end_prob
+  15 v17 §1.2: value_nll_loss / the SFT AdamW step raise p(target); p_end_batch == end_prob; fp32 value logits agree
+     with the bf16 path; the ref is on --GPU and no other GPU holds memory (fix round 1, D-N3 / B-1)
   9  PPO smoke: value head gets gradients, loss finite (optional algorithm)
 """
 import glob
@@ -106,6 +107,7 @@ def main():
     from task2_env import PlannerLM
     BASE = os.environ.get("BASE") or sorted(glob.glob(BASE_GLOB))[-1]
     log("base", BASE, "gpu", GPU)
+    torch.cuda.set_device(GPU)                    # fix round 1 (B-1): no context on another GPU
     planner = PlannerLM(BASE, gpu=GPU, dtype="bfloat16", max_new=MAX_NEW)
     model = RA.setup_policy(planner, SEED)
     # ---- 1 LoRA layout and dtypes, seeded init (B1)
@@ -328,6 +330,15 @@ def main():
     items = [{"prompt_ids": y["prompt_ids"], "prefix_ids": y["prefix_ids"], "target_true": y["target_ids"],
               "target_false": s1["gen_ids"][cut + 1:cut + 2] or [0]}]
     assert abs(learner.p_end_batch(items)[0] - learner.end_prob(items[0])) < 1e-9
+    # fix round 1 (D-N3): end_prob's value logits are fp32 from the lm_head input; they agree with the bf16 path
+    with torch.no_grad():
+        ctx_ = list(y["prompt_ids"]) + list(y["prefix_ids"])
+        d32 = float((RA.token_logprobs_fp32(model, ctx_, y["target_ids"])
+                     - RA.token_logprobs(model, ctx_, y["target_ids"], 1.0)[0]).abs().max())
+    assert d32 < 0.05, d32
+    # fix round 1 (B-1): the ref adapter lives on the policy's GPU, nothing on any other GPU
+    assert {str(p.device) for n, p in model.named_parameters() if ".ref." in n} == {"cuda:%d" % GPU}
+    assert all(torch.cuda.memory_allocated(i) == 0 for i in range(torch.cuda.device_count()) if i != GPU)
     log("15 ok: SFT step raised target logp %.4g -> %.4g; p_end_batch == end_prob" % (q_b, q_a))
 
     # ---- 9 PPO smoke (optional algorithm)

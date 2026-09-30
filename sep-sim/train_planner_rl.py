@@ -387,9 +387,19 @@ class FakeLearner:
     def save(self, d):
         write_json_atomic(os.path.join(d, "fake_learner.json"),
                           {"theta": self.theta, "value": self.value, "m": self.m})
+        self._stub_adapter(d)
 
     def save_adapter(self, d):
         write_json_atomic(os.path.join(d, "fake_learner.json"), {"theta": self.theta})
+        self._stub_adapter(d)
+
+    def _stub_adapter(self, d):
+        """A stand-in d/adapter/adapter_model.safetensors (the policy only, like the torch learner's "default"-only
+        save), so the verifier's adapter-directory checks (no ref/, u0 bytes == the chosen SFT candidate's) are
+        exercised by the dry run (fix round 1, C-N6)."""
+        os.makedirs(os.path.join(d, "adapter"), exist_ok=True)
+        with open(os.path.join(d, "adapter", "adapter_model.safetensors"), "wb") as f:
+            f.write(json.dumps([round(x, 12) for x in self.theta]).encode())
 
     def load(self, d):
         s = json.load(open(os.path.join(d, "fake_learner.json")))
@@ -488,16 +498,12 @@ def _fake_task1_sample(self, conversation_id, t, user_prompt, real_final, G, tem
         out.append({"t": t, "replicate": g, "real_final": bool(real_final), "ended_planner": bool(stop and valid),
                     "planner_unparsed": not valid, "planner_hit_max_new": False, "decision_valid": valid,
                     "correct": float(valid and stop == bool(real_final)), "mask_ok": mask_ok,
+                    "value_roundtrip_ok": True if mask_ok else None,
                     "prefix_ids": [8] if mask_ok else None, "target_true": [1] if mask_ok else None,
                     "target_false": [0] if mask_ok else None,
                     "planner_gen": {"prompt_ids": [k, t], "gen_ids": [8, act, 7],
                                     "stop_mask": [0, 1, 0] if mask_ok else None, "note_mask": None,
                                     "temperature": temperature, "top_p": top_p, "seed": g}})
-    for x in out:
-        if x["mask_ok"]:
-            out[0]["aux"] = {"prompt_ids": [k, t], "prefix_ids": [8], "target_ids": [int(bool(real_final))],
-                             "want_end": bool(real_final), "gen_len": 3}
-            break
     return out
 
 
@@ -600,8 +606,11 @@ class Trainer:
             self.set_p_h()
             self.load_ref_if_u0()
             return
+        import torch
+        # fix round 1 (B-1): every CUDA allocation of this process (the learner, the ref adapter, Ditto) goes to --gpu;
+        # no context is ever created on another GPU
+        torch.cuda.set_device(int(a.gpu))
         from task2_env import PlannerLM, Task2Env
-        from goal_judge import GoalJudge
         planner = PlannerLM(a.planner_path, gpu=a.gpu, nf4=a.planner_nf4, dtype=a.planner_dtype,
                             adapter=None, trainable=False)
         # v17 B1: the LoRA init is seeded -> the same start policy (and sha) at every launch
@@ -611,8 +620,8 @@ class Trainer:
             # Planner generation by the vLLM server; the HF model stays the learner (it re-scores every token)
             import vllm_planner
             vllm_planner.VLLMPlanner(a.vllm_url).attach(planner)
-        judge = GoalJudge(a.judge_base, adapter=a.judge_adapter, gpu=a.gpu) if a.arm != "pend" else None
-        self.env = Task2Env(arm=a.arm, gpu=a.gpu, planner=planner, judge=judge, batch=bool(a.batch), max_batch=a.max_batch,
+        assert a.arm == "pend", "v17 implements the pend arm only (no goal judge)"
+        self.env = Task2Env(arm=a.arm, gpu=a.gpu, planner=planner, judge=None, batch=bool(a.batch), max_batch=a.max_batch,
                             implicit_profile=bool(a.implicit_profile), selector=a.selector)
         if a.fewshot == "fold":
             from task2_env import make_fewshot_pool
@@ -629,8 +638,11 @@ class Trainer:
 
     def load_ref_if_u0(self):
         """v17 B4: once u0 (the SFT policy) exists, it is the frozen "ref" adapter of the learner (resume and the test
-        evaluation build; a fresh run loads it at the end of sft_stage). After the optimizer exists."""
-        if os.path.exists(os.path.join(self.ckpt_dir(0), "state.json")):
+        evaluation build; a fresh run loads it at the end of sft_stage). After the optimizer exists. Fix round 1 (A-2):
+        only once LATEST.json exists -- a crash between the u0 rename and LATEST leaves an unfinished SFT, which the
+        resume completes (sft_stage re-saves u0 and then loads the ref itself)."""
+        if os.path.exists(os.path.join(self.ckpt_root, "LATEST.json")) and \
+                os.path.exists(os.path.join(self.ckpt_dir(0), "state.json")):
             self.learner.load_ref(os.path.join(self.ckpt_dir(0), "adapter"))
 
     def set_p_h(self):
@@ -754,6 +766,8 @@ class Trainer:
                                        "no checkpoint selection",
                 "planner_path": a.planner_path, "init_adapter": None, "init_adapter_sha256": None,
                 "sft_examples_sha256": sha_file(self.p_sft_ex) if os.path.exists(self.p_sft_ex) else None,
+                "sft_args": {"sft_lr": a.sft_lr, "sft_epochs_max": a.sft_epochs_max,
+                             "sft_samples_per_point": a.sft_samples_per_point},
                 "sft_chosen_epoch": (self.sft_info or {}).get("chosen_epoch"),
                 "ref_policy_sha": (self.sft_info or {}).get("policy_sha"),
                 "arm": a.arm, "implicit_profile": a.implicit_profile, "fewshot": a.fewshot, "selector": a.selector,
@@ -839,7 +853,8 @@ class Trainer:
 
         def one_conv(cid):
             n = self.env.human_turns(cid)
-            ex, base, pts, cnt = [], [], [], {"unparsed": 0, "hit_max_new": 0, "invalid_value": 0, "mask_not_found": 0}
+            ex, base, pts, cnt = [], [], [], {"unparsed": 0, "hit_max_new": 0, "invalid_value": 0, "mask_not_found": 0,
+                                              "value_roundtrip_fail": 0}
             if n < 2:
                 return ex, base, pts, cnt           # turn 1 never ends: no decision point
             prompts = self.env.task1_prompts(cid)
@@ -866,6 +881,8 @@ class Trainer:
                     if not x.get("mask_ok"):
                         cnt["mask_not_found"] += 1
                         continue
+                    # D-N7: the re-encoded value of the plan's OWN decision differs from the sampled value tokens
+                    cnt["value_roundtrip_fail"] += int(x.get("value_roundtrip_ok") is False)
                     ex.append({"conversation_id": cid, "t": t, "n": n, "real_final": t == n,
                                "kind": "greedy" if k == 0 else "sample", "k": k,
                                "seed": seed_of(a.seed, "sft", cid, t, k),
@@ -899,7 +916,8 @@ class Trainer:
         examples = sorted((e for r in res for e in r[0]), key=lambda e: (e["conversation_id"], e["t"], e["k"]))
         base = sorted((b for r in res for b in r[1]), key=lambda b: (b["conversation_id"], b["t"]))
         points = sorted((p for r in res for p in r[2]), key=lambda p: (p[0], p[1]))
-        counts = {k: sum(r[3][k] for r in res) for k in ("unparsed", "hit_max_new", "invalid_value", "mask_not_found")}
+        counts = {k: sum(r[3][k] for r in res) for k in ("unparsed", "hit_max_new", "invalid_value", "mask_not_found",
+                                                          "value_roundtrip_fail")}
         counts.update(n_conversations=len(cids), n_points=sum(1 for p in points if p[3] == "ok"),
                       n_points_skipped_capped=sum(1 for p in points if p[3] != "ok"),
                       n_plans=sum(1 for p in points if p[3] == "ok") * (1 + a.sft_samples_per_point),
@@ -1153,7 +1171,8 @@ class Trainer:
         both x (1 - note); never on the value tokens; stop credit does not apply.
         -> (samples, counts, per-group advantage records)."""
         samples, recs = [], []
-        cnt = {"groups_skipped_zero_std": 0, "n_groups_lt2": 0, "n_groups_all_invalid": 0, "n_groups_used": 0}
+        cnt = {"groups_skipped_zero_std": 0, "n_groups_lt2": 0, "n_groups_all_invalid": 0, "n_groups_used": 0,
+               "n_groups_used_final": 0, "n_groups_used_nonfinal": 0, "n_groups_used_adv_gt_1e3": 0}
         for r in t1rows:
             assert r["policy_version"] == pv and r["policy_sha"] == psha, "off-policy task1 rollout"
             assert r["t"] >= 2, "Task 1 stop group at turn 1"
@@ -1173,6 +1192,8 @@ class Trainer:
                 recs.append([r["conversation_id"], r["t"], "zero_std", []])
                 continue
             cnt["n_groups_used"] += 1
+            cnt["n_groups_used_final" if r["real_final"] else "n_groups_used_nonfinal"] += 1
+            cnt["n_groups_used_adv_gt_1e3"] += int(max(abs(A) for A in adv) > 1e-3)
             used = []
             for x, A in zip(kept, adv):
                 g = dict(x["planner_gen"])
@@ -1328,6 +1349,12 @@ class Trainer:
                        "reward_std_mean": (sum(kept_std) / len(kept_std)) if kept_std else None,
                        "groups_skipped_zero_std": t1_cnt["groups_skipped_zero_std"],
                        "n_groups_lt2": t1_cnt["n_groups_lt2"], "n_groups_used": t1_cnt["n_groups_used"],
+                       # D-N1: the used groups at the final / an earlier position, and with a non-negligible advantage
+                       "n_groups_used_final": t1_cnt["n_groups_used_final"],
+                       "n_groups_used_nonfinal": t1_cnt["n_groups_used_nonfinal"],
+                       "n_groups_used_adv_gt_1e3": t1_cnt["n_groups_used_adv_gt_1e3"],
+                       # D-N7: scored samples whose re-encoded own value differs from the sampled value tokens
+                       "n_value_roundtrip_fail": sum(1 for x in t1_all if x.get("value_roundtrip_ok") is False),
                        "n_groups_no_decision": t1_cnt["n_groups_all_invalid"]}
             # the full record under the spec's names (S15 n_invalid, B7 n_groups_all_invalid) lives in the update row's
             # task1_stats: the controller history may not carry a key that contains "valid" (rl_controllers
@@ -1401,7 +1428,7 @@ class Trainer:
                                     "task1": (t1_hist or {}).get("reward_std_mean")},
                 "aux_weight": w_aux, "lr": cfg["lr"], "kl_coef": cfg["kl_coef"],
                 "aux_stats": {k: stats.get(k) for k in ("aux_n", "aux_loss", "aux_grad_norm", "aux_grad_norm_max",
-                                                         "aux_p_correct_before", "aux_p_correct_end")},
+                                                         "aux_p_correct_before", "aux_p_correct_before_final")},
                 **{k: stats.get(k) for k in ("loss", "kl", "ratio_mean", "clip_frac", "grad_norm", "n_tokens",
                                               "value_mse", "ratio_init_maxdev", "rl_grad_norm", "rl_grad_norm_max",
                                               "kl_step_mean", "kl_step_max", "clip_frac_step_mean",
@@ -1489,15 +1516,7 @@ class Trainer:
         score = sum(totals) / len(totals) if totals else None
         turn_stats = None
         if eps and all("human_turns" in e for e in eps):
-            d = [e["emitted_user_turns"] - e["human_turns"] for e in eps]
-            turn_stats = {"n_episodes": len(eps),
-                          "sim_turns_mean": sum(e["emitted_user_turns"] for e in eps) / len(eps),
-                          "human_turns_mean": sum(e["human_turns"] for e in eps) / len(eps),
-                          "abs_diff_mean": sum(abs(x) for x in d) / len(d),
-                          "coverage_mean": sum(float(e["coverage"]) for e in eps) / len(eps),
-                          "turn_w1": turn_w1([e["emitted_user_turns"] for e in eps],
-                                             [min(int(e["human_turns"]), int(self.selection_cfg["t_max"])) for e in eps]),
-                          "end_kinds": {k: sum(e["end_kind"] == k for e in eps) for k in sorted({e["end_kind"] for e in eps})}}
+            turn_stats = turn_stats_of(eps, int(self.selection_cfg["t_max"]))
         t1 = T1.task1_stop_metrics([r["task1"] for r in t1rows])
         t1.update(T1.task1_prob_metrics([p_ for r in t1rows for p_ in r["end_probs"]]))
         if u == 0 and self.task1_base is None:
@@ -1531,10 +1550,21 @@ class Trainer:
         fin = {"final_update": u, "stop_reason": reason, "policy_sha": st["policy_sha"], "validated": False,
                "length_drift_margin": self.a.length_drift_margin, "drift_stats": self.drift_stats(),
                "time": time.time()}
+        # fix round 1 (A-3): the run_meta stop row first, then final.json (a resume adds a missing stop row)
+        self.ensure_stop_row(u, reason)
         write_json_atomic(self.p_final, fin)
-        append_jsonl(self.p_meta, {**self.meta("stop"), "final_update": u, "stop_reason": reason})
         print(json.dumps({"final_update": u, "stop_reason": reason}), flush=True)
         return fin
+
+    def ensure_stop_row(self, u, reason):
+        if not any(m.get("kind") == "stop" for m in read_jsonl(self.p_meta)):
+            append_jsonl(self.p_meta, {**self.meta("stop"), "final_update": u, "stop_reason": reason})
+
+    def ensure_sft_row(self):
+        """Fix round 1 (B-S1): a crash between save_checkpoint(0) and the run_meta "sft" row is repaired on resume from
+        u0's own state (the row names the ref = u0 sha)."""
+        if self.sft_info is not None and not any(m.get("kind") == "sft" for m in read_jsonl(self.p_meta)):
+            append_jsonl(self.p_meta, {**self.meta("sft"), "sft_info": self.sft_info, "repaired_on_resume": True})
 
     def val_due(self, u):
         return self.a.val_every > 0 and u % self.a.val_every == 0
@@ -1562,6 +1592,10 @@ class Trainer:
         if not resumed:
             random.seed(a.seed)
             self.sft_stage()                          # -> u0 = SFT, LATEST, the ref adapter
+        else:
+            self.ensure_sft_row()
+            if fin is not None:
+                self.ensure_stop_row(fin["final_update"], fin["stop_reason"])
         if fin is None:
             # recomputed from the records (a crash between the last checkpoint and final.json)
             fu, reason = drift_decision(self.drift_stats(), a.length_drift_margin, a.updates)
@@ -1592,6 +1626,21 @@ class Trainer:
         fin["validated_time"] = time.time()
         write_json_atomic(self.p_final, fin)
         return self
+
+
+def turn_stats_of(eps, t_max):
+    """Task 2 turn statistics of clean episodes. Fix round 1 (D-N5): the human side is min(human_turns, t_max) (a
+    simulated session cannot exceed t_max), in human_turns_mean, abs_diff_mean and turn_w1 alike; the uncapped mean is
+    kept as human_turns_mean_uncapped."""
+    hum = [min(int(e["human_turns"]), t_max) for e in eps]
+    sim = [int(e["emitted_user_turns"]) for e in eps]
+    return {"n_episodes": len(eps), "sim_turns_mean": sum(sim) / len(sim), "human_turns_mean": sum(hum) / len(hum),
+            "human_turns_mean_uncapped": sum(int(e["human_turns"]) for e in eps) / len(eps),
+            "human_turns_capped_at": t_max,
+            "abs_diff_mean": sum(abs(a - b) for a, b in zip(sim, hum)) / len(sim),
+            "coverage_mean": sum(float(e["coverage"]) for e in eps) / len(eps),
+            "turn_w1": turn_w1(sim, hum),
+            "end_kinds": {k: sum(e["end_kind"] == k for e in eps) for k in sorted({e["end_kind"] for e in eps})}}
 
 
 def turn_w1(sim, human):

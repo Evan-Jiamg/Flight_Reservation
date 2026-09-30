@@ -5,7 +5,9 @@
 # base numbers are the v16 run's u0 test rows, B6); then eval_test_boot.py (check + paired bootstrap), verify_pipeline
 # (the training files still verify) and threshold_control.py (base with one fitted logit offset). A GPU OUT OF MEMORY
 # (another job; judged on THIS attempt's log lines only) is retried up to 10 times (finished rows are reused); anything
-# else stops. Starts the placeholder, releases every GPU we hold at the end. Usage: run_v17_test.sh F   (F = 0, 1 or 2)
+# else stops. Reuses the placeholder / servers left by run_v17_fold.sh (fix round 1, B-N4) or starts them; releases
+# every GPU we hold at the end. Fold 2 also prints the v16 run's u0 test rows labelled "base" (A-6).
+# Usage: run_v17_test.sh F   (F = 0, 1 or 2)
 set -uo pipefail
 F=${1:-}
 case $F in 0|1|2) ;; *) echo "STOP: fold must be 0, 1 or 2"; exit 1;; esac
@@ -40,8 +42,8 @@ release() {
   done
   echo "TEST: GPUs released $(date)"
 }
-if pgrep -u mzjiang -f "train_planner_rl.py|eval_test_rl.py|vllm serve|gpu_holder2|run_v17_fold|run_v16_fold|run_v16_test" > /dev/null; then
-  echo "TEST: our training / servers / placeholder already running - not starting"; exit 1; fi
+if pgrep -u mzjiang -f "train_planner_rl.py|eval_test_rl.py|smoke_v17.py|run_v17_fold|run_v16_fold|run_v16_test" > /dev/null; then
+  echo "TEST: our training / evaluation is running - not starting"; exit 1; fi
 cd $C || { echo "STOP: no snapshot $C"; exit 1; }
 sha256sum -c --quiet local_sha_v17.txt || { echo "STOP: pend_v17 snapshot sha mismatch"; exit 1; }
 [ -f $RUN/final.json ] || { echo "STOP: $RUN has no final.json (training not finished)"; exit 1; }
@@ -50,9 +52,13 @@ FU=$($PY -c "import json; f = json.load(open('$RUN/final.json')); assert f['vali
 REASON=$($PY -c "import json; print(json.load(open('$RUN/final.json'))['stop_reason'])")
 BASE=""; [ "$F" != "2" ] && BASE="--include-base"
 trap release EXIT
-rm -rf $H; mkdir -p $H
-PYTHONNOUSERSITE=1 setsid nohup $PY $G/gpu_holder2.py $H >> $G/gpu_holder2.log 2>&1 < /dev/null &
-sleep 10
+if pgrep -u mzjiang -f gpu_holder2.py > /dev/null; then
+  echo "TEST: reusing the running placeholder ($H)"
+else
+  rm -rf $H; mkdir -p $H
+  PYTHONNOUSERSITE=1 setsid nohup $PY $G/gpu_holder2.py $H >> $G/gpu_holder2.log 2>&1 < /dev/null &
+  sleep 10
+fi
 echo "=== TEST fold $F start $(date): SFT (u0) and final u$FU ($REASON), seeds 0..7 $BASE"
 rc=1
 for attempt in $(seq 1 10); do
@@ -77,8 +83,15 @@ $PY verify_pipeline.py --rl-dir $RUN --splits $G/splits_v1.json --fold $F --spli
 grep -q "PIPELINE VERIFICATION PASSED" $RUN/verify_test.txt || {
   echo "STOP: verify of the training files failed"; grep -E "FAIL" $RUN/verify_test.txt | head -10 | cut -c1-260; exit 1; }
 echo "verify passed (training files unchanged, tested updates = {0, final})"
-if [ "$F" = "2" ]; then TT="--test $V16F2/test.jsonl --test-update 0"; else TT="--test $RUN/test_base.jsonl --test-update base"; fi
-$PY threshold_control.py --train $RUN/base_pend_train.jsonl $TT --json-out $RUN/threshold_control.json > $RUN/threshold_control.txt 2>&1
+if [ "$F" = "2" ]; then
+  TT="--test $V16F2/test.jsonl --test-update 0"
+  echo "=== base (the untrained policy = v16 u0 of runs/pend_f2_v16, not re-run; SPEC v17 §5/§7):"
+  grep -E "^u0 +Task (1|2)" $V16F2/test_boot.txt | sed -E 's/^u0( +)/base\1/' || { echo "STOP: no u0 rows in $V16F2/test_boot.txt"; exit 1; }
+else
+  TT="--test $RUN/test_base.jsonl --test-update base"
+fi
+$PY threshold_control.py --train $RUN/base_pend_train.jsonl $TT --splits $G/splits_v1.json --fold $F \
+    --json-out $RUN/threshold_control.json > $RUN/threshold_control.txt 2>&1
 trc=$?; cat $RUN/threshold_control.txt
 [ $trc -eq 0 ] || { echo "STOP: threshold control failed (rc $trc)"; exit 1; }
 echo "TEST fold $F DONE $(date)"

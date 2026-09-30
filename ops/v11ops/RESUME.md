@@ -33,3 +33,9 @@ python train_planner_rl.py --fold 2 --planner-path $Q4 --gpu <GPU> --G 4 --scena
 4. 接續完成後，跑一次 `verify_pipeline.py --rl-dir ...`，必須 PASSED。
 
 如果原本的執行目錄已經遺失，就把 `run/` 複製回一個新位置（`cp -a`，再 `chmod -R u+w`），並把 `--out` 指向那裡。checkpoint 內的路徑都是相對於執行目錄。
+
+## pend_v17 程式快照（fix round 1, 2026-09-30）
+- `ops/local_sha_v17.txt` 是 **working copy 的位元組** 的 sha256（本機 `core.autocrlf=true`，.py 可能是 CRLF）。
+  因此 `code_snapshots/pend_v17` 必須用 working copy 打包（tar）上傳，不可在別台機器重新 checkout 後再比對。
+- `.sh` 一律 LF（`.gitattributes`: `*.sh text eol=lf`）。
+- 腳本：`run_v17_smoke.sh`（GPU smoke，先跑）→ `run_v17_fold.sh F`（訓練＋verify）→ `run_v17_test.sh F`（test、boot、verify、threshold control）。

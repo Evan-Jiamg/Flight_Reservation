@@ -1329,26 +1329,28 @@ class Task2Env:
                 tt = self.planner.stop_target(gen["gen_ids"], sm, True)
                 tf = self.planner.stop_target(gen["gen_ids"], sm, False)
             mask_ok = bool(tt is not None and tf is not None and tt["prefix_ids"] == tf["prefix_ids"])
+            # fix round 1 (D-N7): the plan's OWN value re-encoded must give back the sampled value tokens
+            # (tok(decode(span)) == gen_ids[i:j+1]); a mismatch is counted, not dropped
+            rt_ok = None
+            if mask_ok:
+                i = sm.index(1)
+                j = len(sm) - 1 - sm[::-1].index(1)
+                rt_ok = (tt if end else tf)["target_ids"] == list(gen["gen_ids"][i:j + 1])
             out.append({"t": t, "replicate": g, "real_final": bool(real_final), "ended_planner": bool(end),
                         "planner_unparsed": unparsed, "planner_hit_max_new": gen["hit_max_new"],
                         "decision_valid": valid, "planner_diag": diag, "planner_fit": gen.get("fit"),
                         # v17: the 0/1 agreement is logged only (the reward is the trainer's Brier score)
                         "correct": float(valid and bool(end) == bool(real_final)),
-                        "mask_ok": mask_ok, "prefix_ids": tt["prefix_ids"] if mask_ok else None,
+                        "mask_ok": mask_ok, "value_roundtrip_ok": rt_ok,
+                        "prefix_ids": tt["prefix_ids"] if mask_ok else None,
                         "target_true": tt["target_ids"] if mask_ok else None,
                         "target_false": tf["target_ids"] if mask_ok else None,
                         "planner_gen": {"prompt_ids": gen["prompt_ids"], "gen_ids": gen["gen_ids"], "stop_mask": sm,
                                         "note_mask": nm, "hit_max_new": gen["hit_max_new"],
                                         "gen_logprobs": gen.get("gen_logprobs"), "gen_adapter": gen.get("gen_adapter"),
                                         "temperature": temperature, "top_p": top_p, "seed": pseed}})
-        # one stop-supervision example per position: the first VALID sample with a located stop mask
-        for x in out:
-            if not x["decision_valid"] or x["planner_gen"]["stop_mask"] is None:
-                continue
-            tgt = self.planner.stop_target(x["planner_gen"]["gen_ids"], x["planner_gen"]["stop_mask"], real_final)
-            if tgt is not None:
-                out[0]["aux"] = dict(tgt, prompt_ids=list(x["planner_gen"]["prompt_ids"]))
-                break
+        # (v17: the stop-supervision example of a position is built by the trainer from the first valid sample's own
+        # prefix and targets -- Trainer.aux_examples; the v16 per-row "aux" field is gone, fix round 1 A-5)
         return out
 
     def task1_end_probe(self, conversation_id, t, user_prompt, real_final):

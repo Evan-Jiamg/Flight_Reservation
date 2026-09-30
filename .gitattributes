@@ -1,0 +1,4 @@
+# Shell scripts run on the Linux server: always LF, whatever core.autocrlf says (fix round 1, B-N1, 2026-09-30).
+# Python files are left as they are: the code-snapshot sha lists (ops/local_sha_v*.txt) are sha256 of the WORKING-COPY
+# bytes, so a snapshot must be a tar of the working copy, never a fresh checkout on another machine.
+*.sh text eol=lf

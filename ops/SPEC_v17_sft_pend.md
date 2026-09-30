@@ -291,6 +291,13 @@ v17 必須檢查：
 - **N4**：`turn_stats_seeds01` 的說明從「D5」改成「seeds 0/1 子集」。
 - **N5**：所有 docstring 與提示文字中關於 D2、reselect、best 的描述更新。
 
+### 實作補註（fix round 1，2026-09-30）
+- **S15 鍵名（A-9）**：控制器 history 不可含有 `valid` 字樣的鍵（`rl_controllers.FORBIDDEN_KEY_PARTS`），所以 history 裡的
+  `task1_train` 用 `n_not_decisions`／`n_groups_no_decision`；規格名稱 `n_invalid`／`n_groups_all_invalid` 放在 updates 列的
+  `task1_stats`（verify 讀這一份）。
+- **截斷歷史的跳過（C-S3）**：verify 只能檢查被跳過的決策點在 SFT 與 Task 1 都是後綴（t ≥ t0）；某則訊息是否 emitted_capped
+  本身無法只靠紀錄重算（需要原始資料），這一點由 trainer 的 assert 與紀錄負責。
+
 ### 實作清單
 
 gap check 報告的「B. 實作清單」第 1–41 項全部納入。缺一項即視為未完成，由稽核逐項核對。

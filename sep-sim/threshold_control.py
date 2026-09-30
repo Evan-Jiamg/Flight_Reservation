@@ -15,7 +15,11 @@ is reported as it is.
   An unscored point (invalid plan -> p_end 0; valid decision without a located value -> its greedy decision) is not a
   probability: it keeps its p_end and its logged greedy decision (the shift applies to scored points only).
 
-Usage: threshold_control.py --train RUN/base_pend_train.jsonl --test FILE [--test-update 0|base] [--json-out OUT]
+Leakage gate (fix round 1, C-N10): with --splits / --fold, every train point must be a train_all conversation (and
+not forbidden) and every test conversation a test_all one; anything else is refused.
+
+Usage: threshold_control.py --train RUN/base_pend_train.jsonl --test FILE --splits splits_v1.json --fold F
+                            [--test-update 0|base] [--json-out OUT]
   FILE = a test.jsonl / test_base.jsonl of eval_test_rl.py (rows kind "task1"; the latest row per conversation of that
   update with the policy sha of its summary)
 """
@@ -145,22 +149,33 @@ def main(argv=None):
     ap.add_argument("--train", required=True, help="RUN/base_pend_train.jsonl")
     ap.add_argument("--test", required=True, help="test.jsonl (update 0 = base of a v16 run) or test_base.jsonl")
     ap.add_argument("--test-update", default="0", help="the update of the base policy in --test: 0 (v16 u0) or base")
+    ap.add_argument("--splits", required=True, help="the split file of the run (train_all / test_all gate)")
+    ap.add_argument("--fold", type=int, required=True)
     ap.add_argument("--json-out")
     a = ap.parse_args(argv)
     train = [json.loads(l) for l in open(a.train, encoding="utf-8") if l.strip()]
     for p in train:
         if not (0.0 <= float(p["p_end"]) <= 1.0):
             raise SystemExit("train p_end %r outside [0, 1]" % p["p_end"])
+    f = {int(x["fold"]): x for x in json.load(open(a.splits, encoding="utf-8"))["folds"]}[a.fold]
+    train_all, test_all, forb = set(f["train_all"]), set(f["test_all"]), set(f["forbidden_for_training"])
+    bad = sorted({p.get("conversation_id") for p in train} - train_all) + \
+        sorted({p.get("conversation_id") for p in train} & forb)
+    if bad:
+        raise SystemExit("train points outside train_all / in forbidden: %s" % bad[:5])
     b = fit_offset(train)
     at_bound = abs(b) >= 50.0 - 1e-9
     rows, psha = load_test(a.test, a.test_update)
+    bad = sorted({r["conversation_id"] for r in rows} - test_all)
+    if bad:
+        raise SystemExit("test conversations outside test_all: %s" % bad[:5])
     res = {"offset_b": b, "offset_at_bound": at_bound,
            "train": {"n_points": len(train), "n_valid": sum(1 for p in train if p.get("valid", True)),
                      "nll_b0": nll(train, 0.0), "nll_b": nll(train, b)},
            "test_update": a.test_update, "test_policy_sha": psha, "test_conversations": [r["conversation_id"] for r in rows],
            "base_logged_greedy": T1.task1_stop_metrics(stop_rows(rows, 0.0, use_greedy=True)),
            "base_at_0.5": metrics(rows, 0.0), "threshold_control": metrics(rows, b),
-           "inputs_sha256": {a.train: sha(a.train), a.test: sha(a.test)}}
+           "inputs_sha256": {a.train: sha(a.train), a.test: sha(a.test), a.splits: sha(a.splits)}, "fold": a.fold}
     print("offset b = %.4f%s (train nll %.4f -> %.4f on %d valid points)" % (
         b, " (AT THE BOUND: one label only?)" if at_bound else "", res["train"]["nll_b0"], res["train"]["nll_b"],
         res["train"]["n_valid"]))

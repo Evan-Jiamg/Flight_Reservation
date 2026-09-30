@@ -233,36 +233,50 @@ def test_ref_stub_and_saved_checkpoints_have_no_ref():
     assert not [dp for dp, ds, _ in os.walk(os.path.join(out, "ckpt")) for x in ds if x == "ref"]
     rep = v17_report(out, sp)
     assert no_fail(rep)
+    n_adapters = len([d for d in os.listdir(os.path.join(out, "ckpt")) if os.path.isdir(os.path.join(out, "ckpt", d, "adapter"))])
+    assert n_adapters >= 3 + 4 and rep.checks["rl.ref_adapter"]["n"] >= n_adapters       # C-N6: u0..u2 + sft_e0..e3
     os.makedirs(os.path.join(out, "ckpt", "u00001", "adapter", "ref"))            # a checkpoint with the ref inside
     assert v17_report(out, sp).checks["rl.ref_adapter"]["fail"] == 1
 
 
 class _P:
-    def __init__(self, g):
-        self.requires_grad = g
+    def __init__(self, g, device="cuda:1"):
+        self.requires_grad, self.device = g, device
 
 
 class _MockPeft:
-    """Just enough of a PeftModel for load_ref_adapter / save_adapter (no torch)."""
+    """Just enough of a PeftModel for load_ref_adapter / save_adapter (no torch). The policy lives on cuda:1; a
+    load_adapter without torch_device would put the ref on PEFT's default "cuda" = cuda:0 (fix round 1, B-1)."""
 
-    def __init__(self):
+    def __init__(self, with_inference_mode=True):
         self.params = {"m.lora_A.default.weight": _P(True), "m.lora_B.default.weight": _P(True), "m.base": _P(False)}
         self.peft_config = {"default": object()}
-        self.active, self.saved = "default", []
+        self.active, self.saved, self.calls = "default", [], []
+        if not with_inference_mode:
+            self.set_adapter = self._set_adapter_old
 
     def named_parameters(self):
         return list(self.params.items())
 
     def parameters(self):
-        return list(self.params.values())
+        return iter(list(self.params.values()))
 
-    def load_adapter(self, path, adapter_name, is_trainable):
+    def load_adapter(self, path, adapter_name, is_trainable, torch_device=None):
         assert is_trainable is False
+        self.calls.append(("load_adapter", torch_device))
         self.peft_config[adapter_name] = object()
-        self.params["m.lora_A.%s.weight" % adapter_name] = _P(False)
-        self.params["m.lora_B.%s.weight" % adapter_name] = _P(False)
+        self.params["m.lora_A.%s.weight" % adapter_name] = _P(False, torch_device or "cuda:0")
+        self.params["m.lora_B.%s.weight" % adapter_name] = _P(False, torch_device or "cuda:0")
 
-    def set_adapter(self, name):                                               # PEFT: the active adapter is trainable
+    def set_adapter(self, name, inference_mode=False):                          # PEFT: the active adapter is trainable
+        self.calls.append(("set_adapter", name, inference_mode))
+        self.active = name
+        for n, p in self.params.items():
+            if ".lora_" in n:
+                p.requires_grad = ((".%s." % name) in n) and not inference_mode
+
+    def _set_adapter_old(self, name):
+        self.calls.append(("set_adapter", name, None))
         self.active = name
         for n, p in self.params.items():
             if ".lora_" in n:
@@ -283,6 +297,18 @@ def test_load_ref_adapter_and_save_default_only_mock():
     opt = _Opt([p for p in m.parameters() if p.requires_grad])
     assert RA.load_ref_adapter(m, "u0/adapter", opt) == 2
     assert m.active == "default" and not any(p.requires_grad for n, p in m.params.items() if ".ref." in n)
+    # B-1: the ref is loaded onto the policy's device (never PEFT's default cuda:0)
+    assert ("load_adapter", "cuda:1") in m.calls
+    assert {p.device for n, p in m.params.items() if ".ref." in n} == {"cuda:1"}
+    # B-N5: the ref forward switches with inference_mode=True when PEFT supports it; back to "default" plainly
+    RA.set_active_adapter(m, RA.REF_ADAPTER)
+    assert m.calls[-1] == ("set_adapter", "ref", True) and not any(p.requires_grad for p in m.params.values())
+    RA.set_active_adapter(m, "default")
+    assert m.calls[-1] == ("set_adapter", "default", False)
+    assert [n for n, p in m.params.items() if p.requires_grad] == ["m.lora_A.default.weight", "m.lora_B.default.weight"]
+    old = _MockPeft(with_inference_mode=False)
+    RA.set_active_adapter(old, RA.REF_ADAPTER)
+    assert old.calls[-1] == ("set_adapter", "ref", None)
     with pytest.raises(AssertionError):
         RA.load_ref_adapter(m, "u0/adapter", opt)                               # already loaded
     m2 = _MockPeft()
@@ -345,7 +371,8 @@ def test_task1_groups_b7_and_advantage_placement():
             row("c", [_sample("valid", 0), _sample("valid", 1), _sample("dropped", 2), _sample("valid", 3)]),       # zero std
             row("e", [_sample("valid", 0), _sample("invalid", 1), _sample("dropped", 2), _sample("valid", 3)])]     # used
     samples, cnt, recs = tr.task1_samples(rows, 0, "s")
-    assert cnt == {"groups_skipped_zero_std": 1, "n_groups_lt2": 1, "n_groups_all_invalid": 1, "n_groups_used": 1}
+    assert cnt == {"groups_skipped_zero_std": 1, "n_groups_lt2": 1, "n_groups_all_invalid": 1, "n_groups_used": 1,
+                   "n_groups_used_final": 1, "n_groups_used_nonfinal": 0, "n_groups_used_adv_gt_1e3": 1}    # D-N1
     assert [r[2] for r in recs] == ["lt2", "all_invalid", "zero_std", "used"]
     assert len(samples) == 3 and {s["replicate"] for s in samples} == {0, 1, 3}      # the dropped sample never enters
     R = [x["reward"] for x in rows[3]["samples"] if not x["dropped"]]
@@ -649,20 +676,42 @@ def test_full_verify_dispatches_to_v17():
     assert "rl.task1_refill" not in rep.checks and "rl.selection" not in rep.checks and "rl.d2_trigger" not in rep.checks
 
 
-def test_env_describe_speaker_fields():
-    """S12: task2_env.describe() names the Speaker's path, class (MRO) and that it has no end token."""
-    import inspect
+def test_env_describe_speaker_fields(monkeypatch):
+    """S12 (fix round 1, C-N5): describe() of a stub env reports the Speaker's real path, class MRO and endconv."""
+    import types
     import task2_env as TE
-    src = inspect.getsource(TE.Task2Env.describe)
-    for k in ("speaker_path", "speaker_class", "speaker_endconv_is_none"):
-        assert '"%s"' % k in src
+    monkeypatch.setenv("SEPSIM_ACT_PRIOR", "nostopclobber")
+
+    class Speaker:
+        pass
+
+    class DittoSpeaker(Speaker):
+        def __init__(self):
+            self.path, self.endconv, self.max_new = "/tmp2/mzjiang_usersim/models/Ditto-8B", None, 512
+    env = types.SimpleNamespace(
+        arm="pend", planner=types.SimpleNamespace(path="Q4", adapter=None, budget=100, max_new=1536),
+        system="sys", judge=None, r0=types.SimpleNamespace(model="gpt-oss-120b", gpt5_dialect=False), r0_effort="low",
+        ledger_judge=types.SimpleNamespace(model="gpt-oss-120b", gpt5=False, floor=4000), judge_effort="low",
+        t1_sampling=None, ip=True, fewshot=None, selector="borda", speaker=DittoSpeaker(), task1_only=False,
+        planner_batcher=None, speaker_batcher=None)
+    d = TE.Task2Env.describe(env)
+    assert d["speaker_path"].endswith("Ditto-8B") and d["speaker_endconv_is_none"] is True
+    assert d["speaker_class"][0].endswith(".DittoSpeaker") and d["speaker_class"][-1] == "builtins.object"
+    env.speaker.endconv = 42                                                       # a Speaker with an end token
+    assert TE.Task2Env.describe(env)["speaker_endconv_is_none"] is False
+    del env.speaker.endconv
+    assert TE.Task2Env.describe(env)["speaker_endconv_is_none"] is False
 
 
 # ------------------------------------------------------------------ §6 threshold control
 def test_threshold_control(tmp_path):
     # train: base P_end systematically too low (true rate at the final points 0.8, the policy says 0.4)
-    train = [{"real_final": True, "p_end": 0.4, "valid": True}] * 8 + [{"real_final": False, "p_end": 0.1, "valid": True}] * 8 \
-        + [{"real_final": True, "p_end": 0.0, "valid": False}]
+    train = [{"conversation_id": "c01", "real_final": True, "p_end": 0.4, "valid": True}] * 8 \
+        + [{"conversation_id": "c02", "real_final": False, "p_end": 0.1, "valid": True}] * 8 \
+        + [{"conversation_id": "c03", "real_final": True, "p_end": 0.0, "valid": False}]
+    sp = str(tmp_path / "splits.json")
+    json.dump({"folds": [{"fold": 0, "train": ["c01", "c02"], "train_all": ["c01", "c02", "c03"], "validation": [],
+                          "test": ["t0"], "test_all": ["t0", "t1"], "forbidden_for_training": ["t0", "t1"]}]}, open(sp, "w"))
     b = TC.fit_offset(train)
     zs = [(TC.logit(p["p_end"]), 1.0 if p["real_final"] else 0.0) for p in train if p["valid"]]
     assert abs(sum(TC.sigmoid(z + b) - y for z, y in zs)) < 1e-9                # first-order optimum
@@ -685,12 +734,23 @@ def test_threshold_control(tmp_path):
     rows.append({"kind": "summary", "update": 0, "policy_sha": "s", "task1_ids": ["t0", "t1"]})
     ptest = tmp_path / "test.jsonl"
     ptest.write_text("".join(json.dumps(r) + "\n" for r in rows))
-    res = TC.main(["--train", str(ptrain), "--test", str(ptest), "--test-update", "0", "--json-out", str(tmp_path / "o.json")])
+    res = TC.main(["--train", str(ptrain), "--test", str(ptest), "--test-update", "0", "--json-out", str(tmp_path / "o.json"),
+                   "--splits", sp, "--fold", "0"])
     assert res["base_at_0.5"]["term_f1"] == 0.0 and res["threshold_control"]["term_f1"] == 1.0   # the shift ends at n
     assert res["threshold_control"]["n_invalid"] == 1 and res["threshold_control"]["nll"] < res["base_at_0.5"]["nll"]
     shifted = TC.shifted(rows[1]["end_probs"], b)
     assert shifted[0]["p_end"] == 0.0                                          # an unscored point is not shifted
     assert json.load(open(tmp_path / "o.json"))["offset_b"] == b
+    # C-N10: a train point outside train_all, or a test conversation outside test_all, is refused
+    bad = tmp_path / "bad_train.jsonl"
+    bad.write_text("".join(json.dumps(dict(r, conversation_id="t0")) + "\n" for r in train))
+    with pytest.raises(SystemExit):
+        TC.main(["--train", str(bad), "--test", str(ptest), "--splits", sp, "--fold", "0"])
+    s2 = json.load(open(sp))
+    s2["folds"][0]["test_all"] = ["t0"]
+    json.dump(s2, open(sp, "w"))
+    with pytest.raises(SystemExit):
+        TC.main(["--train", str(ptrain), "--test", str(ptest), "--splits", sp, "--fold", "0"])
 
 
 def test_crash_between_checkpoint_and_final_json_is_recomputed(monkeypatch):
@@ -712,3 +772,228 @@ def test_crash_between_checkpoint_and_final_json_is_recomputed(monkeypatch):
     fin = json.load(open(os.path.join(out, "final.json")))
     assert fin["final_update"] == 2 and fin["stop_reason"] == "max_updates" and fin["validated"]
     assert no_fail(v17_report(out, sp)), fails(v17_report(out, sp))
+
+
+# ================================================================== fix round 1 (audits A-D of 328a2d4, 2026-09-30)
+def test_bs1_crash_before_sft_meta_row_is_repaired(monkeypatch):
+    d = tempfile.mkdtemp()
+    sp, out = make_splits(d), os.path.join(d, "run")
+    orig = T.append_jsonl
+
+    def crash(path, row):
+        if path.endswith("run_meta.jsonl") and row.get("kind") == "sft":
+            raise RuntimeError("crash after u0, before the sft meta row")
+        return orig(path, row)
+    monkeypatch.setattr(T, "append_jsonl", crash)
+    with pytest.raises(RuntimeError):
+        T.main(args(sp, out, updates=2))
+    monkeypatch.setattr(T, "append_jsonl", orig)
+    assert os.path.exists(os.path.join(out, "ckpt", "LATEST.json"))
+    assert v17_report(out, sp).checks["rl.ref_adapter"]["fail"] >= 1          # no sft row naming the ref yet
+    T.main(args(sp, out, "--resume", updates=2))
+    rows = [m for m in T.read_jsonl(os.path.join(out, "run_meta.jsonl")) if m["kind"] == "sft"]
+    assert len(rows) == 1 and rows[0]["repaired_on_resume"] is True
+    assert no_fail(v17_report(out, sp)), fails(v17_report(out, sp))
+
+
+def test_a2_crash_between_u0_and_latest_resumes(monkeypatch):
+    d = tempfile.mkdtemp()
+    sp, out = make_splits(d), os.path.join(d, "run")
+    orig = T.Trainer.save_checkpoint
+
+    def crash(self, u, row):
+        orig(self, u, row)
+        if u == 0:
+            os.remove(os.path.join(self.ckpt_root, "LATEST.json"))          # u0 renamed, LATEST not yet written
+            raise RuntimeError("crash between the u0 rename and LATEST")
+    monkeypatch.setattr(T.Trainer, "save_checkpoint", crash)
+    with pytest.raises(RuntimeError):
+        T.main(args(sp, out, updates=2))
+    monkeypatch.setattr(T.Trainer, "save_checkpoint", orig)
+    assert os.path.exists(os.path.join(out, "ckpt", "u00000")) and not os.path.exists(os.path.join(out, "ckpt", "LATEST.json"))
+    T.main(args(sp, out, "--resume", updates=2))                              # the ref is not loaded at build: SFT completes
+    assert json.load(open(os.path.join(out, "final.json")))["validated"]
+    assert no_fail(v17_report(out, sp)), fails(v17_report(out, sp))
+
+
+def test_a3_stop_row_before_final_json_and_repair(monkeypatch):
+    d = tempfile.mkdtemp()
+    sp, out = make_splits(d), os.path.join(d, "run")
+    orig = T.write_json_atomic
+
+    def crash(path, obj):
+        if path.endswith("final.json"):
+            raise RuntimeError("crash before final.json")
+        return orig(path, obj)
+    monkeypatch.setattr(T, "write_json_atomic", crash)
+    with pytest.raises(RuntimeError):
+        T.main(args(sp, out, updates=2))
+    monkeypatch.setattr(T, "write_json_atomic", orig)
+    assert [m["kind"] for m in T.read_jsonl(os.path.join(out, "run_meta.jsonl"))][-1] == "stop"   # stop row first
+    T.main(args(sp, out, "--resume", updates=2))
+    assert sum(m["kind"] == "stop" for m in T.read_jsonl(os.path.join(out, "run_meta.jsonl"))) == 1
+    assert no_fail(v17_report(out, sp)), fails(v17_report(out, sp))
+    # final.json exists (not yet validated) without a stop row: the resume adds it
+    d2 = tempfile.mkdtemp()
+    sp2, out2 = make_splits(d2), os.path.join(d2, "run")
+    o_val = T.Trainer.validate
+    monkeypatch.setattr(T.Trainer, "validate", lambda self, u, task2: (_ for _ in ()).throw(RuntimeError("x"))
+                        if (u == 2 and task2) else o_val(self, u, task2))
+    with pytest.raises(RuntimeError):
+        T.main(args(sp2, out2, updates=2))
+    monkeypatch.setattr(T.Trainer, "validate", o_val)
+    mp = os.path.join(out2, "run_meta.jsonl")
+    _rewrite(mp, [m for m in T.read_jsonl(mp) if m["kind"] != "stop"])
+    T.main(args(sp2, out2, "--resume", updates=2))
+    assert sum(m["kind"] == "stop" for m in T.read_jsonl(mp)) == 1
+    assert no_fail(v17_report(out2, sp2)), fails(v17_report(out2, sp2))
+
+
+def test_a4_manifest_and_new_stat_fields():
+    sp, out = fresh(updates=2)
+    man = json.load(open(os.path.join(out, "ckpt", "u00001", "rl_manifest.json")))
+    assert man["sft_args"] == {"sft_lr": 5e-5, "sft_epochs_max": 3, "sft_samples_per_point": 2}
+    u = T.read_jsonl(os.path.join(out, "updates.jsonl"))[0]
+    th = u["train_aggregate"]["task1_train"]
+    assert th["n_groups_used"] == th["n_groups_used_final"] + th["n_groups_used_nonfinal"] >= th["n_groups_used_adv_gt_1e3"]
+    assert th["n_value_roundtrip_fail"] == 0                                   # D-N7 (fake plans always round-trip)
+    assert "value_roundtrip_fail" in json.load(open(os.path.join(out, "sft_examples_meta.json")))["counts"]
+    assert "aux_p_correct_before_final" in u["train_aggregate"]["aux_stats"]   # D-N6
+    assert "aux_p_correct_end" not in json.dumps(u)
+    s = [v for v in T.read_jsonl(os.path.join(out, "validation.jsonl")) if v["kind"] == "summary" and v["task2"]][0]
+    ts = s["turn_stats"]                                                        # D-N5: human turns capped at t_max
+    assert ts["human_turns_capped_at"] == 10 and ts["human_turns_mean"] <= ts["human_turns_mean_uncapped"]
+
+
+def test_dn5_turn_stats_capped():
+    eps = [{"human_turns": 13, "emitted_user_turns": 10, "coverage": 1.0, "end_kind": "t_max"},
+           {"human_turns": 3, "emitted_user_turns": 4, "coverage": 0.5, "end_kind": "planner_end"}]
+    ts = T.turn_stats_of(eps, 10)
+    assert ts["human_turns_mean"] == 6.5 and ts["human_turns_mean_uncapped"] == 8.0 and ts["abs_diff_mean"] == 0.5
+    assert ts["turn_w1"] == T.turn_w1([10, 4], [10, 3])
+
+
+def test_a5_no_v16_aux_field_in_task1_samples():
+    tr_env = T.FakeEnv(T.FakeLearner("grpo", {}, 1e-5))
+    out = tr_env.task1_sample("c01", 3, "p", True, 4, 1.0, 1.0, 7)
+    assert all("aux" not in x for x in out) and all("value_roundtrip_ok" in x for x in out)
+    import task2_env as TE
+    import inspect
+    assert 'out[0]["aux"]' not in inspect.getsource(TE.Task2Env.task1_sample)
+    assert not hasattr(RA, "ref_param_names")
+
+
+@pytest.mark.parametrize("what", ["steps_len", "n_aux", "ag_kl", "final_drift", "sft_seed", "brier_mean", "kl_q_ph",
+                                  "n_real", "missing_row", "skip_not_suffix", "sft_skip_not_suffix", "summary_sha",
+                                  "no_final_t2", "not_validated"])
+def test_verify_round1_catches(what):
+    sp, out = fresh(updates=2)
+    assert no_fail(v17_report(out, sp)), fails(v17_report(out, sp))
+    pu, pt = os.path.join(out, "updates.jsonl"), os.path.join(out, "rollouts_task1.jsonl")
+    ups, t1 = T.read_jsonl(pu), T.read_jsonl(pt)
+    fp, pv = os.path.join(out, "final.json"), os.path.join(out, "validation.jsonl")
+    pm = os.path.join(out, "sft_examples_meta.json")
+    check = {"steps_len": "rl.v17_steps", "n_aux": "rl.v17_steps", "ag_kl": "rl.v17_update", "final_drift": "rl.v17_stop",
+             "sft_seed": "rl.sft_data", "brier_mean": "rl.v17_task1", "kl_q_ph": "rl.v17_drift", "n_real": "rl.v17_task1",
+             "missing_row": "rl.v17_task1", "skip_not_suffix": "rl.v17_task1", "sft_skip_not_suffix": "rl.sft_data",
+             "summary_sha": "rl.v17_validation", "no_final_t2": "rl.v17_validation", "not_validated": "rl.v17_stop"}[what]
+    if what == "steps_len":
+        ups[0]["learner_stats"]["steps"] = ups[0]["learner_stats"]["steps"][:-1]
+        _rewrite(pu, ups)
+    elif what == "n_aux":
+        ups[0]["learner_stats"]["steps"][0]["n_aux"] += 1
+        _rewrite(pu, ups)
+    elif what == "ag_kl":
+        ups[1]["train_aggregate"]["kl_coef"] = 0.04
+        _rewrite(pu, ups)
+    elif what == "final_drift":
+        f = json.load(open(fp))
+        f["drift_stats"]["1"] += 0.5
+        json.dump(f, open(fp, "w"))
+    elif what == "sft_seed":
+        p = os.path.join(out, "sft_examples.jsonl")
+        ex = T.read_jsonl(p)
+        ex[0]["seed"] += 1
+        _rewrite(p, ex)
+        m = json.load(open(pm))
+        m["examples_sha256"] = T.sha_file(p)                                   # even with a consistent sha
+        json.dump(m, open(pm, "w"))
+    elif what == "brier_mean":
+        ups[0]["task1_stats"]["brier_mean"] += 0.01
+        _rewrite(pu, ups)
+    elif what == "kl_q_ph":
+        ups[0]["train_aggregate"]["kl_q_ph"] += 0.01
+        _rewrite(pu, ups)
+    elif what == "n_real":
+        for r in t1:
+            if r["update"] == 1:
+                r["n_real"] += 1
+                break
+        _rewrite(pt, t1)
+    elif what == "missing_row":
+        ts = ups[0]["task1_stats"]
+        gone = ts["groups"][0]
+        ts["groups"] = ts["groups"][1:]
+        ts["advantages"] = [a_ for a_ in ts["advantages"] if [a_[0], a_[1]] != gone]
+        _rewrite(pu, ups)
+    elif what == "skip_not_suffix":
+        ts = ups[0]["task1_stats"]
+        c, t = ts["groups"][0]                                                 # the conversation's t=2 marked skipped
+        ts["groups"] = ts["groups"][1:]
+        ts["advantages"] = [a_ for a_ in ts["advantages"] if [a_[0], a_[1]] != [c, t]]
+        ts["skipped_capped"] = [[c, t]]
+        _rewrite(pu, ups)
+    elif what == "sft_skip_not_suffix":
+        m = json.load(open(pm))
+        p0 = next(p for p in m["points"] if p[2] >= 3 and p[1] == 2)
+        p0[3], p0[4] = "skipped_capped_history", 0
+        json.dump(m, open(pm, "w"))
+    elif what == "summary_sha":
+        val = T.read_jsonl(pv)
+        next(v for v in val if v["kind"] == "summary" and v["update"] == 1)["policy_sha"] = "0" * 64
+        _rewrite(pv, val)
+    elif what == "no_final_t2":
+        val = T.read_jsonl(pv)
+        _rewrite(pv, [v for v in val if not (v["kind"] == "summary" and v["update"] == 2 and v["task2"])])
+    elif what == "not_validated":
+        f = json.load(open(fp))
+        f["validated"] = False
+        json.dump(f, open(fp, "w"))
+    rep = v17_report(out, sp)
+    assert rep.checks[check]["fail"] >= 1, (what, rep.checks[check])
+
+
+def test_bs3_verify_requires_kl_from_u2_on_real_runs():
+    """B-S3: on a real (non-dry) run the logged KL to the ref must be > 0 from u2 on (dry runs log 0)."""
+    sp, out = fresh(updates=2)
+    mp, pu = os.path.join(out, "run_meta.jsonl"), os.path.join(out, "updates.jsonl")
+    meta = T.read_jsonl(mp)
+    for m in meta:
+        m["config"]["args"].update(dry_run=False, planner_backend="hf")       # pretend real (no vLLM adapter checks)
+    _rewrite(mp, meta)
+    ups = T.read_jsonl(pu)
+    ups[1]["learner_stats"]["kl"] = 1e-4
+    _rewrite(pu, ups)
+    assert v17_report(out, sp).checks["rl.v17_update"]["fail"] == 0
+    ups[1]["learner_stats"]["kl"] = 0.0
+    _rewrite(pu, ups)
+    assert v17_report(out, sp).checks["rl.v17_update"]["fail"] == 1
+
+
+def test_a7_eval_gates_test_seeds_and_final_sha(tmp_path):
+    import eval_test_rl as E
+    d = tempfile.mkdtemp()
+    sp, out = make_splits(d), os.path.join(d, "run")
+    spec = ["--dry-run", "--fold", "0", "--splits", sp, "--out", out, "--scenarios-per-update", "3"]
+    T.main(spec)                                                               # spec values, no --ablation
+    fin = json.load(open(os.path.join(out, "final.json")))
+    ups = ["--test-updates", "0", str(fin["final_update"])]
+    with pytest.raises(SystemExit) as e:
+        E.main(["--final", "--test-seeds", "0", "1"] + ups + spec)
+    assert "0..7" in str(e.value)
+    f2 = dict(fin, policy_sha="0" * 64)
+    json.dump(f2, open(os.path.join(out, "final.json"), "w"))
+    with pytest.raises(SystemExit) as e:
+        E.main(["--final", "--test-seeds"] + [str(i) for i in range(8)] + ups + spec)
+    assert "policy sha" in str(e.value)
+    assert not os.path.exists(os.path.join(out, "test.jsonl"))
