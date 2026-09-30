@@ -1060,7 +1060,18 @@ def check_v17(rl_dir, rep, splits_path=None):
                    "decision points are not t = 2..%d" % n)
             rep.ok("rl.sft_data", _skips_form_suffix([t for (c, t), v in pts.items() if c == cid and v[0] != "ok"], n),
                    "sft %s" % str(cid)[:10], "points skipped for a capped message do not form a suffix t0..n")
-        rep.ok("rl.sft_data", sorted(n_of) == sorted(train_all), mp, "the SFT points do not cover every train_all conversation")
+        # fix round 2 (A R2-1): n of EVERY train_all conversation (n_by_conv); a conversation without points is accepted
+        # only when it has fewer than 2 messages (turn 1 never ends: no decision point)
+        n_by = {c: int(v) for c, v in (em.get("n_by_conv") or {}).items()}
+        rep.ok("rl.sft_data", sorted(n_by) == sorted(train_all), mp, "n_by_conv does not list exactly train_all")
+        for cid in sorted(train_all):
+            if cid in n_of:
+                rep.ok("rl.sft_data", n_by.get(cid) == n_of[cid], "sft %s" % str(cid)[:10],
+                       "n_by_conv %r != the points' n %r" % (n_by.get(cid), n_of[cid]))
+            else:
+                rep.ok("rl.sft_data", n_by.get(cid) is not None and n_by[cid] < 2, "sft %s" % str(cid)[:10],
+                       "no SFT point for a conversation with %r messages" % n_by.get(cid))
+        n_of = dict(n_by)
         per = {}
         for e in ex:
             w = "sft %s t%s k%s" % (str(e.get("conversation_id"))[:10], e.get("t"), e.get("k"))
@@ -1205,6 +1216,10 @@ def check_v17(rl_dir, rep, splits_path=None):
         # A-8: KL(q || p_h), q from every clean episode of the update (the reward's q), p_h from run_meta
         all_c = [r["episode"] for (uu, _, _), r in t2.items() if uu == u and r["episode"].get("clean")]
         ph = (cfg0.get("p_h") or {}).get("dist")
+        # fix round 2 (C NIT): a missing p_h or kl_q_ph FAILs (never skipped)
+        rep.ok("rl.v17_drift", bool(ph), "run_meta", "config.p_h.dist missing: kl_q_ph cannot be recomputed")
+        if all_c:
+            rep.ok("rl.v17_drift", ag.get("kl_q_ph") is not None, w, "train_aggregate.kl_q_ph missing")
         if all_c and ph and ag.get("kl_q_ph") is not None:
             import rl_reward as RR_
             q = RR_.turn_distribution([e["emitted_user_turns"] for e in all_c], cfg["t_max"], cfg["alpha_smooth"])
@@ -1390,8 +1405,9 @@ def check_v17(rl_dir, rep, splits_path=None):
             if real_vllm:
                 # C-N1: every Task 2 Planner step served by the policy of update u
                 want_ad = adapter_name(rl_dir, u)
+                # fix round 2 (C NIT): a step without planner_fit cannot be attributed to an adapter -> FAIL
                 bad = [k for k, r in ep.items() for st_ in (r["episode"].get("trace") or [])
-                       if st_.get("planner_fit") and (st_["planner_fit"] or {}).get("gen_adapter") != want_ad]
+                       if (st_.get("planner_fit") or {}).get("gen_adapter") != want_ad]
                 rep.ok("rl.v17_validation", not bad, w, "Task 2 steps not served by %r: %s" % (want_ad, bad[:3]))
             rep.ok("rl.v17_validation", v.get("n_episodes", 0) + v.get("n_unclean_episodes", 0) == len(val) * len(seeds_want), w,
                    "episode counts")

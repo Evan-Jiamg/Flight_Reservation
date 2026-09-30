@@ -884,8 +884,8 @@ def test_a5_no_v16_aux_field_in_task1_samples():
 
 
 @pytest.mark.parametrize("what", ["steps_len", "n_aux", "ag_kl", "final_drift", "sft_seed", "brier_mean", "kl_q_ph",
-                                  "n_real", "missing_row", "skip_not_suffix", "sft_skip_not_suffix", "summary_sha",
-                                  "no_final_t2", "not_validated"])
+                                  "n_real", "summary_sha", "no_final_t2", "not_validated", "kl_q_ph_missing",
+                                  "p_h_missing"])
 def test_verify_round1_catches(what):
     sp, out = fresh(updates=2)
     assert no_fail(v17_report(out, sp)), fails(v17_report(out, sp))
@@ -895,8 +895,8 @@ def test_verify_round1_catches(what):
     pm = os.path.join(out, "sft_examples_meta.json")
     check = {"steps_len": "rl.v17_steps", "n_aux": "rl.v17_steps", "ag_kl": "rl.v17_update", "final_drift": "rl.v17_stop",
              "sft_seed": "rl.sft_data", "brier_mean": "rl.v17_task1", "kl_q_ph": "rl.v17_drift", "n_real": "rl.v17_task1",
-             "missing_row": "rl.v17_task1", "skip_not_suffix": "rl.v17_task1", "sft_skip_not_suffix": "rl.sft_data",
-             "summary_sha": "rl.v17_validation", "no_final_t2": "rl.v17_validation", "not_validated": "rl.v17_stop"}[what]
+             "summary_sha": "rl.v17_validation", "no_final_t2": "rl.v17_validation", "not_validated": "rl.v17_stop",
+             "kl_q_ph_missing": "rl.v17_drift", "p_h_missing": "rl.v17_drift"}[what]
     if what == "steps_len":
         ups[0]["learner_stats"]["steps"] = ups[0]["learner_stats"]["steps"][:-1]
         _rewrite(pu, ups)
@@ -930,24 +930,15 @@ def test_verify_round1_catches(what):
                 r["n_real"] += 1
                 break
         _rewrite(pt, t1)
-    elif what == "missing_row":
-        ts = ups[0]["task1_stats"]
-        gone = ts["groups"][0]
-        ts["groups"] = ts["groups"][1:]
-        ts["advantages"] = [a_ for a_ in ts["advantages"] if [a_[0], a_[1]] != gone]
+    elif what == "kl_q_ph_missing":                                            # fix round 2: FAIL, not skip
+        del ups[0]["train_aggregate"]["kl_q_ph"]
         _rewrite(pu, ups)
-    elif what == "skip_not_suffix":
-        ts = ups[0]["task1_stats"]
-        c, t = ts["groups"][0]                                                 # the conversation's t=2 marked skipped
-        ts["groups"] = ts["groups"][1:]
-        ts["advantages"] = [a_ for a_ in ts["advantages"] if [a_[0], a_[1]] != [c, t]]
-        ts["skipped_capped"] = [[c, t]]
-        _rewrite(pu, ups)
-    elif what == "sft_skip_not_suffix":
-        m = json.load(open(pm))
-        p0 = next(p for p in m["points"] if p[2] >= 3 and p[1] == 2)
-        p0[3], p0[4] = "skipped_capped_history", 0
-        json.dump(m, open(pm, "w"))
+    elif what == "p_h_missing":
+        mp = os.path.join(out, "run_meta.jsonl")
+        meta = T.read_jsonl(mp)
+        for m in meta:
+            del m["config"]["p_h"]
+        _rewrite(mp, meta)
     elif what == "summary_sha":
         val = T.read_jsonl(pv)
         next(v for v in val if v["kind"] == "summary" and v["update"] == 1)["policy_sha"] = "0" * 64
@@ -997,3 +988,111 @@ def test_a7_eval_gates_test_seeds_and_final_sha(tmp_path):
         E.main(["--final", "--test-seeds"] + [str(i) for i in range(8)] + ups + spec)
     assert "policy sha" in str(e.value)
     assert not os.path.exists(os.path.join(out, "test.jsonl"))
+
+
+# ================================================================== fix round 2 (audits A, B of 9768cc6)
+def _t1_stats_of(rows):
+    """The trainer's Task 1 statistics (one_update) of these rows, for rewriting a tampered record consistently."""
+    allx = [x for r in rows for x in r["samples"]]
+    sc = [x["reward"] for x in allx if not x.get("dropped")]
+    pf = [x["p_end"] for r in rows if r["real_final"] for x in r["samples"] if x.get("p_end") is not None]
+    pm = [x["p_end"] for r in rows if not r["real_final"] for x in r["samples"] if x.get("p_end") is not None]
+    stds = [RA.pstd([x["reward"] for x in r["samples"] if not x.get("dropped")]) for r in rows
+            if sum(1 for x in r["samples"] if not x.get("dropped")) >= 2]
+    return {"brier_mean": (sum(sc) / len(sc)) if sc else None, "p_end_final_mean": (sum(pf) / len(pf)) if pf else None,
+            "p_end_nonfinal_mean": (sum(pm) / len(pm)) if pm else None,
+            "n_dropped_mask": sum(1 for x in allx if x.get("dropped")),
+            "n_invalid": sum(1 for x in allx if x.get("status") == "invalid"),
+            "reward_std_mean": (sum(stds) / len(stds)) if stds else None}
+
+
+def _drop_task1_point(out, u, skipped):
+    """Remove update u's Task 1 group at t = 2 of a conversation with n >= 3 CONSISTENTLY (rows, groups, advantage
+    records, skip counters, recomputed statistics, the aux example and its two per-epoch uses); with skipped=True the
+    point is recorded as skipped for a capped message instead. -> (cid, t)."""
+    pu, pt = os.path.join(out, "updates.jsonl"), os.path.join(out, "rollouts_task1.jsonl")
+    ups, t1 = T.read_jsonl(pu), T.read_jsonl(pt)
+    row = next(r for r in ups if r["update"] == u)
+    ts, st = row["task1_stats"], row["learner_stats"]
+    cid, t = next([c, t_] for c, t_ in ts["groups"] if t_ == 2 and any(r["conversation_id"] == c and r["n_real"] >= 3
+                                                                        for r in t1 if r["update"] == u))
+    ts["groups"] = [g for g in ts["groups"] if g != [cid, t]]
+    rec = next(a_ for a_ in ts["advantages"] if [a_[0], a_[1]] == [cid, t])
+    ts["advantages"] = [a_ for a_ in ts["advantages"] if a_ is not rec]
+    key = {"lt2": "n_groups_lt2", "all_invalid": "n_groups_all_invalid", "zero_std": "groups_skipped_zero_std"}.get(rec[2])
+    if key:
+        ts[key] -= 1
+    if [cid, t] in ts["aux_points"]:
+        ts["aux_points"] = [p for p in ts["aux_points"] if p != [cid, t]]
+        st["aux_n"] -= 1
+        half = len(st["steps"]) // 2
+        for part in (st["steps"][:half], st["steps"][half:]):
+            next(x for x in part if x["n_aux"] > 0)["n_aux"] -= 1
+    t1 = [r for r in t1 if not (r["update"] == u and r["conversation_id"] == cid and r["t"] == t)]
+    ts.update(_t1_stats_of([r for r in t1 if r["update"] == u and [r["conversation_id"], r["t"]] in ts["groups"]]))
+    if skipped:
+        ts["skipped_capped"] = sorted(ts["skipped_capped"] + [[cid, t]])
+    _rewrite(pu, ups)
+    _rewrite(pt, t1)
+    return cid, t
+
+
+def _only_failure(rep, name, text):
+    bad = fails(rep)
+    assert set(bad) == {name} and bad[name]["fail"] == 1 and text in bad[name]["examples"][0], bad
+
+
+def test_verify_task1_missing_point_fails_only_completeness():
+    sp, out = fresh(updates=2)
+    _drop_task1_point(out, 1, skipped=False)
+    _only_failure(v17_report(out, sp), "rl.v17_task1", "decision points")
+
+
+def test_verify_task1_skip_not_suffix_fails_only_suffix():
+    sp, out = fresh(updates=2)
+    _drop_task1_point(out, 1, skipped=True)
+    _only_failure(v17_report(out, sp), "rl.v17_task1", "do not form a suffix")
+
+
+def test_verify_sft_skip_not_suffix_fails_only_suffix():
+    sp, out = fresh(updates=2)
+    pm, pe, pb = [os.path.join(out, f) for f in ("sft_examples_meta.json", "sft_examples.jsonl", "base_pend_train.jsonl")]
+    m = json.load(open(pm))
+    p0 = next(p for p in m["points"] if p[2] >= 3 and p[1] == 2 and p[3] == "ok")
+    cid = p0[0]
+    p0[3], p0[4] = "skipped_capped_history", 0
+    ex = [e for e in T.read_jsonl(pe) if not (e["conversation_id"] == cid and e["t"] == 2)]
+    _rewrite(pe, ex)
+    _rewrite(pb, [b for b in T.read_jsonl(pb) if not (b["conversation_id"] == cid and b["t"] == 2)])
+    m["counts"]["n_examples"] = len(ex)
+    m["counts"]["n_points"] = sum(1 for p in m["points"] if p[3] == "ok")
+    m["examples_sha256"], m["base_pend_sha256"] = T.sha_file(pe), T.sha_file(pb)
+    json.dump(m, open(pm, "w"))
+    _only_failure(v17_report(out, sp), "rl.sft_data", "do not form a suffix")
+
+
+def test_one_message_conversation(monkeypatch):
+    """A R2-1: a train_all conversation with a single message has no decision point: no SFT point, no Task 1 row;
+    n_by_conv records its n = 1 and verify accepts the gap only because n < 2."""
+    orig = T.FakeEnv.human_turns
+    monkeypatch.setattr(T.FakeEnv, "human_turns", lambda self, cid: 1 if cid == "x_noshard" else orig(self, cid))
+    d = tempfile.mkdtemp()
+    sp, out = make_splits(d), os.path.join(d, "run")
+    T.main(args(sp, out, "--task1-convs", "15", updates=2))                  # every train_all conversation in Task 1
+    m = json.load(open(os.path.join(out, "sft_examples_meta.json")))
+    assert m["n_by_conv"]["x_noshard"] == 1 and not [p for p in m["points"] if p[0] == "x_noshard"]
+    assert sorted(m["n_by_conv"]) == sorted(json.load(open(sp))["folds"][0]["train_all"])
+    ups = T.read_jsonl(os.path.join(out, "updates.jsonl"))
+    assert all("x_noshard" in u["task1_stats"]["convs"] for u in ups)
+    assert not [r for r in T.read_jsonl(os.path.join(out, "rollouts_task1.jsonl")) if r["conversation_id"] == "x_noshard"]
+    assert no_fail(v17_report(out, sp)), fails(v17_report(out, sp))
+    # a conversation without points whose recorded n is >= 2 FAILs
+    pm = os.path.join(out, "sft_examples_meta.json")
+    m["n_by_conv"]["x_noshard"] = 3
+    json.dump(m, open(pm, "w"))
+    rep = v17_report(out, sp)
+    assert rep.checks["rl.sft_data"]["fail"] >= 1 and rep.checks["rl.v17_task1"]["fail"] >= 1
+    # n_by_conv that does not list exactly train_all FAILs
+    del m["n_by_conv"]["x_noshard"]
+    json.dump(m, open(pm, "w"))
+    assert v17_report(out, sp).checks["rl.sft_data"]["fail"] >= 1

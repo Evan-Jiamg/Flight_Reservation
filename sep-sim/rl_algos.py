@@ -436,10 +436,18 @@ def token_logprobs(model, prompt_ids, gen_ids, temperature=1.0, want_hidden=Fals
     return logp, hidden
 
 
-def token_logprobs_fp32(model, prompt_ids, gen_ids):
+FP32_VOCAB_CHUNK = 16384
+
+
+def token_logprobs_fp32(model, prompt_ids, gen_ids, vocab_chunk=FP32_VOCAB_CHUNK):
     """Like token_logprobs (temperature 1, no grad by the caller), but the logits of the generated positions are
-    recomputed in fp32 from the lm_head's own input (captured by a forward hook) and its fp32-upcast weight (fix round
-    1, D-N3: the two value logits of P_end are not rounded to bf16). -> logp [G] float32."""
+    recomputed in fp32 from the lm_head's own input (captured by a forward hook) (fix round 1, D-N3: the two value logits
+    of P_end are not rounded to bf16). Fix round 2 (D R2-1): the lm_head weight is never copied to fp32 as a whole (a
+    tied 151k x 2560 head is ~1.56 GB in fp32): the target rows are gathered and upcast, and the log-normaliser is a
+    logsumexp accumulated over vocab chunks of `vocab_chunk` rows.
+    Thread safety (A R2-5): the forward hook is registered on the SHARED lm_head for the duration of this one forward;
+    that is safe only because every caller (end_prob via task1_eval_row / score_task1 / sft_probe / sft_examples) holds
+    env.gpu_lock, so no other forward of this model runs meanwhile. -> logp [G] float32."""
     import torch
     head = model.get_output_embeddings()
     cap = {}
@@ -458,11 +466,22 @@ def token_logprobs_fp32(model, prompt_ids, gen_ids):
     hid = hid[-(G + 1):-1] if hid.shape[0] != G + 1 else hid[:G]
     if hid.shape[0] != G:
         raise AssertionError("lm_head input slice %d != %d generated tokens" % (hid.shape[0], G))
-    logits = hid.float() @ head.weight.float().t()
-    if getattr(head, "bias", None) is not None:
-        logits = logits + head.bias.float()
+    hid = hid.float()
+    W = head.weight
+    bias = getattr(head, "bias", None)
     tgt = ids[0, P:P + G]
-    return torch.log_softmax(logits, dim=-1).gather(-1, tgt.unsqueeze(-1)).squeeze(-1)
+    tl = (hid * W[tgt].float()).sum(-1)                        # the target logits, fp32
+    if bias is not None:
+        tl = tl + bias[tgt].float()
+    lse = None
+    for i in range(0, W.shape[0], int(vocab_chunk)):
+        lc = hid @ W[i:i + int(vocab_chunk)].float().t()
+        if bias is not None:
+            lc = lc + bias[i:i + int(vocab_chunk)].float()
+        c = torch.logsumexp(lc, dim=-1)
+        lse = c if lse is None else torch.logaddexp(lse, c)
+        del lc
+    return tl - lse
 
 
 def make_value_head(hidden_size, width):

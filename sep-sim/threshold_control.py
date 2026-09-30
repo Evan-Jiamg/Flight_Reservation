@@ -7,8 +7,8 @@ is reported as it is.
      (RUN/base_pend_train.jsonl, written by the trainer's SFT stage), minimising the NLL of the human labels:
          P' = sigmoid(logit(P_end) + b),   P_end clipped to [1e-6, 1 - 1e-6];
      only the VALID points (a scored probability) enter the fit;
-  2. apply b to the base policy's test end probabilities (fold 2: the v16 run's test.jsonl rows of update 0; folds 0 / 1:
-     RUN/test_base.jsonl from eval_test_rl.py --include-base) and report nll (valid points), bal_p, auc (task1_stop
+  2. apply b to the base policy's test end probabilities (every fold, fix round 2: RUN/test_base.jsonl from
+     eval_test_rl.py --include-base, fp32 P_end; the v16 u0 rows are not used) and report nll (valid points), bal_p, auc (task1_stop
      .task1_prob_metrics) and, deciding "end" where P' > 0.5, the M2 stop metrics (task1_stop.task1_stop_metrics:
      term_f1, premature, ...). The same numbers at b = 0 (the base policy read at 0.5) and the logged greedy decisions
      are reported next to them.

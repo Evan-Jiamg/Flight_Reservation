@@ -39,3 +39,9 @@ python train_planner_rl.py --fold 2 --planner-path $Q4 --gpu <GPU> --G 4 --scena
   因此 `code_snapshots/pend_v17` 必須用 working copy 打包（tar）上傳，不可在別台機器重新 checkout 後再比對。
 - `.sh` 一律 LF（`.gitattributes`: `*.sh text eol=lf`）。
 - 腳本：`run_v17_smoke.sh`（GPU smoke，先跑）→ `run_v17_fold.sh F`（訓練＋verify）→ `run_v17_test.sh F`（test、boot、verify、threshold control）。
+- 佔位程式（fix round 2）：`run_v17_fold.sh` 需要 `gpu_holder2.py` 已在執行，否則直接停止。`run_v17_smoke.sh` 若是自己啟動佔位程式，
+  結束時會把它（以及它自己啟動的 vLLM servers）關掉；之後要先重新啟動佔位程式再跑 fold：
+  `rm -rf /tmp2/mzjiang_usersim/grpo_planner/hold && mkdir -p /tmp2/mzjiang_usersim/grpo_planner/hold && PYTHONNOUSERSITE=1 setsid nohup /home/mzjiang/miniconda3/envs/consistent-test/bin/python /tmp2/mzjiang_usersim/grpo_planner/gpu_holder2.py /tmp2/mzjiang_usersim/grpo_planner/hold >> /tmp2/mzjiang_usersim/grpo_planner/gpu_holder2.log 2>&1 < /dev/null &`
+  若佔位程式不是 smoke 啟動的，smoke 只把訓練 GPU 還給它，不會關掉佔位程式或已在執行的 servers。
+- fold 2 的 base（fix round 2，使用者決定）：`run_v17_test.sh` 對每個 fold（包括 fold 2）都用 `--include-base` 以 v17 定義重新評估 base
+  （fp32 P_end、human turns 以 t_max 截斷）；v16 `runs/pend_f2_v16/test_boot.txt` 的 u0 列只以「v16-base-ref」參考列印出，不當作 base。

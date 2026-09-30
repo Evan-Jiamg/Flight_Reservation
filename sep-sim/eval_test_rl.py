@@ -5,8 +5,9 @@ procedure of train_planner_rl.validate(): Task 2 = sampled Planner (--val-temper
 unclean episode re-run up to VAL_RETRIES times), Task 1 = greedy run + teacher-forced end probabilities
 (Trainer.task1_eval_row). Writes RUN/test.jsonl (episode / task1 / summary rows, split "test") and RUN/test_meta.jsonl;
 never writes a training file (checkpoints, validation.jsonl, final.json, sft*).
---include-base (v17 B6, folds 0 / 1): also the untrained start policy "base" (ckpt/sft_e0, served as sft_e0-<sha>) with
-the same procedure -> RUN/test_base.jsonl (fold 2's base numbers already exist: the v16 run's u0 test rows).
+--include-base (v17 B6; fix round 2: EVERY fold, fold 2 included -- the base is re-scored under the v17 definitions):
+also the untrained start policy "base" (ckpt/sft_e0, served as sft_e0-<sha>) with the same procedure ->
+RUN/test_base.jsonl. The v16 run's u0 test rows (bf16 P_end) are a reference only, never the base.
 
 Gates: --final; the trainer arguments are the run's own (check_provenance: same code, splits, arguments); final.json is
 validated and the updates are exactly {0, final}, both with a validation summary that includes Task 2 (S13); every test id

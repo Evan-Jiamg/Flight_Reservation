@@ -1,12 +1,14 @@
 #!/bin/bash
 # Test evaluation of a finished v17 fold (ops/SPEC_v17_sft_pend.md §5-§7, user-approved 2026-09-30): eval_test_rl.py on
 # runs/pend_f<F>_v17 with the run's own trainer arguments, the updates exactly {0 = SFT (u0), final} read from final.json,
-# seeds 0..7 -> test.jsonl; folds 0 / 1 also the untrained base (--include-base: ckpt/sft_e0 -> test_base.jsonl; fold 2's
-# base numbers are the v16 run's u0 test rows, B6); then eval_test_boot.py (check + paired bootstrap), verify_pipeline
-# (the training files still verify) and threshold_control.py (base with one fitted logit offset). A GPU OUT OF MEMORY
+# seeds 0..7 -> test.jsonl; EVERY fold also the untrained base re-scored under the v17 definitions (--include-base:
+# ckpt/sft_e0 -> test_base.jsonl; fix round 2, user decision: fp32 P_end, capped turn stats); then eval_test_boot.py
+# (check + paired bootstrap), verify_pipeline (the training files still verify) and threshold_control.py (the v17 base
+# test_base.jsonl with one fitted logit offset). A GPU OUT OF MEMORY
 # (another job; judged on THIS attempt's log lines only) is retried up to 10 times (finished rows are reused); anything
 # else stops. Reuses the placeholder / servers left by run_v17_fold.sh (fix round 1, B-N4) or starts them; releases
-# every GPU we hold at the end. Fold 2 also prints the v16 run's u0 test rows labelled "base" (A-6).
+# every GPU we hold at the end. Fold 2 also prints the v16 run's u0 test rows, only as a labelled REFERENCE (v16 base:
+# bf16 P_end, uncapped |diff|), never as "base".
 # Usage: run_v17_test.sh F   (F = 0, 1 or 2)
 set -uo pipefail
 F=${1:-}
@@ -50,7 +52,7 @@ sha256sum -c --quiet local_sha_v17.txt || { echo "STOP: pend_v17 snapshot sha mi
 FU=$($PY -c "import json; f = json.load(open('$RUN/final.json')); assert f['validated'], 'final.json not validated'; print(f['final_update'])") \
   || { echo "STOP: final.json is not validated"; exit 1; }
 REASON=$($PY -c "import json; print(json.load(open('$RUN/final.json'))['stop_reason'])")
-BASE=""; [ "$F" != "2" ] && BASE="--include-base"
+BASE="--include-base"                 # every fold (fix round 2): the base under the v17 definitions
 trap release EXIT
 if pgrep -u mzjiang -f gpu_holder2.py > /dev/null; then
   echo "TEST: reusing the running placeholder ($H)"
@@ -84,12 +86,10 @@ grep -q "PIPELINE VERIFICATION PASSED" $RUN/verify_test.txt || {
   echo "STOP: verify of the training files failed"; grep -E "FAIL" $RUN/verify_test.txt | head -10 | cut -c1-260; exit 1; }
 echo "verify passed (training files unchanged, tested updates = {0, final})"
 if [ "$F" = "2" ]; then
-  TT="--test $V16F2/test.jsonl --test-update 0"
-  echo "=== base (the untrained policy = v16 u0 of runs/pend_f2_v16, not re-run; SPEC v17 §5/§7):"
-  grep -E "^u0 +Task (1|2)" $V16F2/test_boot.txt | sed -E 's/^u0( +)/base\1/' || { echo "STOP: no u0 rows in $V16F2/test_boot.txt"; exit 1; }
-else
-  TT="--test $RUN/test_base.jsonl --test-update base"
+  echo "=== REFERENCE ONLY -- v16 base (runs/pend_f2_v16 u0; bf16 P_end, uncapped |diff|; NOT the v17 base above):"
+  grep -E "^u0 +Task (1|2)" $V16F2/test_boot.txt | sed -E 's/^u0( +)/v16-base-ref\1/' || echo "(no u0 rows in $V16F2/test_boot.txt)"
 fi
+TT="--test $RUN/test_base.jsonl --test-update base"
 $PY threshold_control.py --train $RUN/base_pend_train.jsonl $TT --splits $G/splits_v1.json --fold $F \
     --json-out $RUN/threshold_control.json > $RUN/threshold_control.txt 2>&1
 trc=$?; cat $RUN/threshold_control.txt

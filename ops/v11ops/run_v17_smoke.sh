@@ -3,7 +3,10 @@
 # real Qwen3-4B learner + Planner vLLM + Ditto-8B + gpt-oss (a few Task 2 episodes), on a subset of fold F, in a fresh
 # scratch dir runs/smoke_v17_f<F>_<time>. Same exports / snapshot sha check / servers / placeholder handoff as
 # run_v17_fold.sh (the training GPU is taken from the placeholder only when it holds the whole 45 GiB, i.e. nobody else
-# uses it); starts the placeholder if it is not running and releases every GPU we hold at the end.
+# uses it). Fix round 2: it releases ONLY what it started -- the placeholder (and the vLLM servers) are stopped at the
+# end only if this script started them; otherwise the training GPU is handed back to the running placeholder and the
+# servers are left up. After a smoke run that started and released the placeholder, run_v17_fold.sh needs the
+# placeholder started again (ops/v11ops/RESUME.md).
 # Usage: run_v17_smoke.sh [F]   (default F = 2)
 set -uo pipefail
 F=${1:-2}
@@ -26,9 +29,15 @@ take_train_gpu() {
   settarget $TG 0; until [ "$(held $TG)" -le 0 ]; do sleep 1; done
   GPU=$TG
 }
+STARTED_HOLDER=0; STARTED_SERVERS=0
 release() {
   [ -n "$TG" ] && settarget $TG 45
+  if [ "$STARTED_HOLDER" != "1" ]; then
+    echo "SMOKE: training GPU handed back to the placeholder we did not start; placeholder / servers left running $(date)"
+    return
+  fi
   touch $H/stop; sleep 3; pkill -u mzjiang -f gpu_holder2.py
+  if [ "$STARTED_SERVERS" != "1" ]; then echo "SMOKE: placeholder stopped; servers were already up - left running"; return; fi
   for port in 8029 8031; do
     pkill -u mzjiang -f "vllm serve .*--port $port"
     for i in $(seq 1 60); do pgrep -u mzjiang -f "vllm serve .*--port $port" > /dev/null || break; sleep 2; done
@@ -46,7 +55,9 @@ if pgrep -u mzjiang -f "train_planner_rl.py|eval_test_rl.py|smoke_v17.py|run_v17
 cd $C || { echo "STOP: no snapshot $C"; exit 1; }
 sha256sum -c --quiet local_sha_v17.txt || { echo "STOP: pend_v17 snapshot sha mismatch"; exit 1; }
 trap release EXIT
+pgrep -u mzjiang -f "vllm serve" > /dev/null || STARTED_SERVERS=1
 if ! pgrep -u mzjiang -f gpu_holder2.py > /dev/null; then
+  STARTED_HOLDER=1
   rm -rf $H; mkdir -p $H
   PYTHONNOUSERSITE=1 setsid nohup $PY $G/gpu_holder2.py $H >> $G/gpu_holder2.log 2>&1 < /dev/null &
   sleep 10

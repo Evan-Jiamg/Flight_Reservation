@@ -22,7 +22,7 @@ Checks
   14 v17 §3.4 / S4: epochs 2 x minibatches 4 = 8 optimizer steps with the aux split (each example once per epoch),
      per-step statistics; aux-only update = 1 step (flag aux_only)
   11 auxiliary stop supervision: an aux-only update raises p(target tokens | prompt + prefix)
-  15 v17 §1.2: value_nll_loss / the SFT AdamW step raise p(target); p_end_batch == end_prob; fp32 value logits agree
+  15 v17 §1.2: value_nll_loss / the SFT AdamW step raise p(target); p_end_batch == end_prob; fp32 value logits agree (0.25 nats)
      with the bf16 path; the ref is on --GPU and no other GPU holds memory (fix round 1, D-N3 / B-1)
   9  PPO smoke: value head gets gradients, loss finite (optional algorithm)
 """
@@ -335,7 +335,7 @@ def main():
         ctx_ = list(y["prompt_ids"]) + list(y["prefix_ids"])
         d32 = float((RA.token_logprobs_fp32(model, ctx_, y["target_ids"])
                      - RA.token_logprobs(model, ctx_, y["target_ids"], 1.0)[0]).abs().max())
-    assert d32 < 0.05, d32
+    assert d32 < 0.25, d32                        # bf16 logit error up to (|logit|+|max logit|) 2^-8 (fix round 2)
     # fix round 1 (B-1): the ref adapter lives on the policy's GPU, nothing on any other GPU
     assert {str(p.device) for n, p in model.named_parameters() if ".ref." in n} == {"cuda:%d" % GPU}
     assert all(torch.cuda.memory_allocated(i) == 0 for i in range(torch.cuda.device_count()) if i != GPU)

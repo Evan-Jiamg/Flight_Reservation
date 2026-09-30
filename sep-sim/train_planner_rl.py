@@ -927,7 +927,10 @@ class Trainer:
             raise SystemExit("SFT: no valid plan with a located value on train_all (counts %r)" % counts)
         write_jsonl_atomic(self.p_sft_ex, examples)
         write_jsonl_atomic(self.p_base_pend, base)
-        m = {"key": key, "counts": counts, "points": points, "examples_sha256": sha_file(self.p_sft_ex),
+        # fix round 2 (A R2-1): the length of EVERY train_all conversation, also those with one message (no point)
+        n_by_conv = {cid: int(self.env.human_turns(cid)) for cid in cids}
+        m = {"key": key, "counts": counts, "points": points, "n_by_conv": n_by_conv,
+             "examples_sha256": sha_file(self.p_sft_ex),
              "base_pend_sha256": sha_file(self.p_base_pend), "gen_adapter": self.gen_name,
              "conversations": cids, "sft_s": round(time.time() - t0, 1), "time": time.time()}
         write_json_atomic(self.p_sft_meta, m)          # written last: its presence marks a complete cache

@@ -298,6 +298,14 @@ v17 必須檢查：
 - **截斷歷史的跳過（C-S3）**：verify 只能檢查被跳過的決策點在 SFT 與 Task 1 都是後綴（t ≥ t0）；某則訊息是否 emitted_capped
   本身無法只靠紀錄重算（需要原始資料），這一點由 trainer 的 assert 與紀錄負責。
 
+### 實作補註（fix round 2，2026-09-30）
+- **fold 2 的 base（使用者決定）**：取代 §5 最後一點與 B6 中「fold 2 用 v16 run 的 test.jsonl（u0 列）」：所有 fold（包括 fold 2）都用
+  `eval_test_rl --include-base` 以 `ckpt/sft_e0` 在 v17 定義下重新評估 base（fp32 value logits 的 P_end、human turns 以 t_max 截斷），
+  寫入 `test_base.jsonl`；§6 的門檻對照一律用這份 v17 `test_base.jsonl`。v16 `runs/pend_f2_v16/test_boot.txt` 的 u0 列只當作
+  標明的參考（「v16 base：bf16 P_end、未截斷 |diff|」），不再稱為 base。
+- **只有一則訊息的對話**：沒有決策點（t = 2..n 為空）；`sft_examples_meta.json` 以 `n_by_conv` 記錄每段 train_all 對話的 n，
+  verify 只接受 n < 2 的對話沒有 SFT 點或 Task 1 列。
+
 ### 實作清單
 
 gap check 報告的「B. 實作清單」第 1–41 項全部納入。缺一項即視為未完成，由稽核逐項核對。
