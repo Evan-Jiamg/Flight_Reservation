@@ -124,6 +124,7 @@ JUDGE_MIN_TOKENS = int(os.environ.get("JUDGE_MIN_TOKENS", "4000"))
 
 
 R0_CONTEXT = int(os.environ.get("R0_CONTEXT", "12288"))     # gpt-oss-120b on the vLLM server: max_model_len
+R0_EMPTY_REDRAWS = 2        # re-draws of an R0 reply empty at every benchmark budget (make_tracking_r0.reply)
 JUDGE_RETRY_TOKENS = int(os.environ.get("JUDGE_RETRY_TOKENS", "8000"))   # one re-request of an unparseable verdict
 PEND_PORT = os.environ.get("PEND_R0_PORT", "8029")        # our gpt-oss-120b vLLM server (user decision, option A)
 
@@ -227,10 +228,26 @@ def make_tracking_r0(R0Client):
             self.gpt5 = bool(getattr(self, "gpt5_dialect", False))
             self.ctx = None if self.gpt5 else R0_CONTEXT
             self.n_len_retries = self.n_len_truncated = self.n_ctx_fit = self.n_empty_final = 0
+            self.n_empty_redraws = 0
             self._tlock = threading.Lock()
 
         def reply(self, *a, **kw):
-            out = super().reply(*a, **kw)
+            # 2026-10-01 (fold-2 v17 stopped at 02:57): the local gpt-oss (sampled, temperature 0.4) can loop in its
+            # reasoning and hit finish_reason=length at BOTH benchmark budgets (3000, 6000) -> the benchmark client
+            # raises "empty reply at every budget". Such a reply is re-drawn with the benchmark's own ladder (a fresh
+            # sample; empty replies are never cached) up to R0_EMPTY_REDRAWS times, counted in n_empty_redraws; if
+            # every re-draw is empty too, the error is raised as before.
+            for k in range(R0_EMPTY_REDRAWS + 1):
+                try:
+                    out = super().reply(*a, **kw)
+                    break
+                except RuntimeError as e:
+                    if "empty reply at every budget" not in str(e) or k == R0_EMPTY_REDRAWS:
+                        raise
+                    with self._tlock:
+                        self.n_empty_redraws += 1
+                    print("[r0-empty] every budget empty -> re-draw %d/%d" % (k + 1, R0_EMPTY_REDRAWS),
+                          file=sys.stderr, flush=True)
             if not (out or "").strip():            # still empty after the client's own budget ladder
                 with self._tlock:
                     self.n_empty_final += 1
@@ -1159,6 +1176,7 @@ class Task2Env:
                 "ledger_judge_empty_total": self.ledger_judge.n_empty,
                 "ledger_judge_unparseable_total": self.ledger_judge.n_unparseable,
                 "r0_empty_retries_total": getattr(self.r0, "n_empty_retries", None),
+                "r0_empty_redraws_total": getattr(self.r0, "n_empty_redraws", None),
                 "r0_len_retries_total": self.r0.n_len_retries, "r0_len_truncated_total": self.r0.n_len_truncated,
                 "r0_ctx_fit_total": self.r0.n_ctx_fit,
                 "process_token": PROCESS_TOKEN,

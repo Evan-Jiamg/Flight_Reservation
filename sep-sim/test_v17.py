@@ -1172,3 +1172,40 @@ def test_one_message_conversation(monkeypatch):
     del m["n_by_conv"]["x_noshard"]
     json.dump(m, open(pm, "w"))
     assert v17_report(out, sp).checks["rl.sft_data"]["fail"] >= 1
+
+
+def _fake_r0_base(script):
+    """A stand-in for the benchmark R0Client: reply() replays `script` (an Exception is raised, a str returned)."""
+    class FakeR0:
+        def __init__(self, reasoning_effort=None):
+            self.reasoning_effort, self.gpt5_dialect, self.calls = reasoning_effort, False, 0
+
+        def reply(self, *a, **kw):
+            self.calls += 1
+            x = script.pop(0)
+            if isinstance(x, BaseException):
+                raise x
+            return x
+    return FakeR0
+
+
+def test_r0_empty_every_budget_redraw(monkeypatch):
+    """2026-10-01 fold-2 incident: an R0 reply empty at every benchmark budget is re-drawn up to
+    R0_EMPTY_REDRAWS (= 2) times; a third failure and any other RuntimeError are raised."""
+    import task2_env as TE
+    assert TE.R0_EMPTY_REDRAWS == 2
+    empty = lambda: RuntimeError("R0 returned an empty reply at every budget")         # noqa: E731
+    for n in (1, 2):
+        r0 = TE.make_tracking_r0(_fake_r0_base([empty() for _ in range(n)] + ["hello"]))(reasoning_effort="low")
+        assert r0.reply("msgs") == "hello"
+        assert r0.n_empty_redraws == n and r0.calls == n + 1 and r0.n_empty_final == 0
+    r0 = TE.make_tracking_r0(_fake_r0_base([empty() for _ in range(3)] + ["never"]))(reasoning_effort="low")
+    with pytest.raises(RuntimeError, match="empty reply at every budget"):
+        r0.reply("msgs")
+    assert r0.n_empty_redraws == 2 and r0.calls == 3
+    r0 = TE.make_tracking_r0(_fake_r0_base([RuntimeError("HTTP 500 from R0"), "never"]))(reasoning_effort="low")
+    with pytest.raises(RuntimeError, match="HTTP 500"):
+        r0.reply("msgs")
+    assert r0.n_empty_redraws == 0 and r0.calls == 1
+    r0 = TE.make_tracking_r0(_fake_r0_base(["ok"]))(reasoning_effort="low")          # the common path is untouched
+    assert r0.reply("msgs") == "ok" and r0.n_empty_redraws == 0 and r0.calls == 1
