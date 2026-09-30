@@ -20,8 +20,8 @@ non-essential checks are reported, never counted as passes.
           gen_logprobs (mean |diff| <= the TIS abort 0.1); afterwards max|ref_logp - u0_logp| < 1e-4, max|policy_logp -
           u0_logp| > 0 and kl_step_max > 0 (B-S3);
   gpu     memory_allocated(i) == 0 on every other visible GPU, and this process's pid on no other GPU in nvidia-smi
-          (bare CUDA contexts, B-1); torch.cuda.max_memory_reserved(--gpu) < 45 GiB at every phase (the placeholder
-          hands over 45 GiB);
+          (bare CUDA contexts, B-1; compared by device UUID); torch.cuda.max_memory_reserved(--gpu) < 43 GiB at every
+          phase (the placeholder hands over 45 GiB; 2 GiB margin for the CUDA context / cuBLAS workspace);
   resume  LEARNER-ONLY (fix round 2: a second full Trainer with Ditto would not fit): a second base model + seeded LoRA +
           TorchLearner, the ref loaded like a resume build (load_ref_if_u0), load_checkpoint(u1): optimizer state loaded
           with the ref present, policy sha = u1's; then an eval_test_rl-style load_policy(sft_e0) with the ref loaded.
@@ -48,7 +48,7 @@ import train_planner_rl as T  # noqa: E402
 
 NM = "not measurable"
 GIB = 1024 ** 3
-BUDGET_GIB = 45
+BUDGET_GIB = 43          # the placeholder hands over 45 GiB; 2 GiB are left for the CUDA context / cuBLAS workspace
 ESSENTIAL = ("b1_start_policy_reproducible", "pend_batch_equals_single", "pend_fp32_path_consistent",
              "sft_load_policy_sha", "ref_trainables_unchanged", "ref_optimizer_params_unchanged", "ref_policy_sha_unchanged",
              "ref_params_frozen", "ref_on_train_gpu", "u0_adapter_bytes_equal_chosen", "update_mixed_sources",
@@ -94,16 +94,33 @@ def physical_index(gpu):
 
 
 def gpus_with_my_pid():
-    """Physical GPU indices on which nvidia-smi lists this process (a bare CUDA context counts)."""
-    idx = subprocess.run(["nvidia-smi", "--query-gpu=index,uuid", "--format=csv,noheader"], capture_output=True, text=True)
+    """GPU UUIDs (normalised, no "GPU-" prefix) on which nvidia-smi lists this process (a bare CUDA context counts).
+    None when nvidia-smi fails; [] when it lists no process of ours at all (e.g. a PID-namespaced container, where
+    nvidia-smi shows host pids: then nothing can be concluded, fix round 3)."""
     apps = subprocess.run(["nvidia-smi", "--query-compute-apps=pid,gpu_uuid", "--format=csv,noheader"],
                           capture_output=True, text=True)
-    if idx.returncode or apps.returncode:
+    if apps.returncode:
         return None
-    by_uuid = {l.split(",")[1].strip(): int(l.split(",")[0]) for l in idx.stdout.splitlines() if l.strip()}
     me = str(os.getpid())
-    return sorted({by_uuid.get(l.split(",")[1].strip()) for l in apps.stdout.splitlines()
+    return sorted({norm_uuid(l.split(",")[1]) for l in apps.stdout.splitlines()
                    if l.strip() and l.split(",")[0].strip() == me})
+
+
+def norm_uuid(u):
+    u = str(u).strip()
+    return u[4:] if u.upper().startswith("GPU-") else u
+
+
+def my_gpu_uuid(gpu):
+    """The training GPU's UUID compared by value (fix round 3: independent of CUDA_DEVICE_ORDER / index mapping):
+    torch's device property when available, else nvidia-smi's UUID of the physical index."""
+    import torch
+    u = getattr(torch.cuda.get_device_properties(gpu), "uuid", None)
+    if u is not None:
+        return norm_uuid(u)
+    idx = subprocess.run(["nvidia-smi", "--query-gpu=index,uuid", "--format=csv,noheader"], capture_output=True, text=True)
+    by_index = {int(l.split(",")[0]): norm_uuid(l.split(",")[1]) for l in idx.stdout.splitlines() if l.strip()}
+    return by_index.get(physical_index(gpu))
 
 
 START_SHA_CODE = r'''
@@ -330,8 +347,14 @@ def main(argv=None):
     logs["other_gpu_bytes_end"] = og
     chk["no_other_gpu_memory_end"] = all(v == 0 for v in og.values())
     on = gpus_with_my_pid()
-    logs["nvidia_smi_gpus_of_this_pid"] = on
-    chk["no_context_on_other_gpu"] = (on == [physical_index(gpu)]) if on is not None else NM
+    mine = my_gpu_uuid(gpu)
+    logs["nvidia_smi_gpu_uuids_of_this_pid"], logs["training_gpu_uuid"] = on, mine
+    # fix round 3 (A N3): no pid of ours listed at all (PID namespace) -> "not measurable" (the check stays essential,
+    # so the smoke then fails with this reason instead of a misleading False)
+    chk["no_context_on_other_gpu"] = (on == [mine]) if on else NM
+    if not on:
+        logs["no_context_on_other_gpu_reason"] = ("nvidia-smi failed" if on is None else
+                                                  "nvidia-smi lists no process with this pid (PID-namespaced container?)")
     phase("end")
     chk["memory_under_budget"] = all(v < BUDGET_GIB for v in mem.values())
     res["total_s"] = round(time.time() - t0, 1)

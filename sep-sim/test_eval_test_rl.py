@@ -43,8 +43,10 @@ def run_files_sha(out):
     return h.hexdigest()
 
 
-def ev(sp, out, ups, *extra):
-    return E.main(TEST + ["--test-updates"] + [str(u) for u in ups] + list(extra) + args(sp, out, updates=N_UP))
+def ev(sp, out, ups, *extra, base=True):
+    """A v17 test evaluation always includes the base (fix round 3, A N2); base=False is the refused layout."""
+    return E.main(TEST + ["--test-updates"] + [str(u) for u in ups] + (["--include-base"] if base else [])
+                  + list(extra) + args(sp, out, updates=N_UP))
 
 
 def boot(out):
@@ -70,7 +72,7 @@ def test_eval_and_check():
     meta = T.read_jsonl(os.path.join(out, "test_meta.jsonl"))[-1]
     assert set(meta["eval_code_sha256"]) == {"eval_test_rl.py", "eval_test_boot.py"}
     assert meta["final_update"] == N_UP and meta["final_json_sha256"] == T.sha_file(os.path.join(out, "final.json"))
-    assert not os.path.exists(os.path.join(out, "test_base.jsonl"))
+    assert os.path.exists(os.path.join(out, "test_base.jsonl"))
     r = boot(out)
     assert r.returncode == 0 and "TEST CHECK PASSED" in r.stdout and "seeds 0/1" in r.stdout \
         and "Task 1:" in r.stdout and "WARNING" not in r.stdout and "SFT (u0)" in r.stdout \
@@ -79,7 +81,7 @@ def test_eval_and_check():
     import verify_pipeline as V
     rep = V.Report()
     V.check_v17(out, rep, sp)
-    assert rep.checks["rl.v17_test"]["fail"] == 0 and rep.checks["rl.v17_test"]["n"] == 1
+    assert rep.checks["rl.v17_test"]["fail"] == 0 and rep.checks["rl.v17_test"]["n"] == 2       # the update set + the base
     # test once: a second run evaluates nothing again
     n = len(rows)
     ev(sp, out, ups)
@@ -101,9 +103,22 @@ def test_eval_and_check():
     assert rep.checks["rl.v17_test"]["fail"] == 1
 
 
+def test_v17_test_run_without_base_fails():
+    """Fix round 3 (A N2): a v17 test evaluation without the base FAILs eval_test_boot and verify's rl.v17_test."""
+    import verify_pipeline as V
+    sp, out, ups = _setup()
+    ev(sp, out, ups, base=False)
+    assert not os.path.exists(os.path.join(out, "test_base.jsonl"))
+    r = boot(out)
+    assert r.returncode == 1 and "without the base" in r.stdout, r.stdout + r.stderr
+    rep = V.Report()
+    V.check_v17(out, rep, sp)
+    assert rep.checks["rl.v17_test"]["fail"] == 1 and "lacks the base" in rep.checks["rl.v17_test"]["examples"][0]
+
+
 def test_include_base():
     sp, out, ups = _setup()
-    ev(sp, out, ups, "--include-base")
+    ev(sp, out, ups)
     base = T.read_jsonl(os.path.join(out, "test_base.jsonl"))
     s = [r for r in base if r["kind"] == "summary"]
     assert len(s) == 1 and s[0]["update"] == "base"

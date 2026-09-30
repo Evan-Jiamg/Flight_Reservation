@@ -704,6 +704,20 @@ def test_env_describe_speaker_fields(monkeypatch):
 
 
 # ------------------------------------------------------------------ §6 threshold control
+def test_threshold_control_default_is_v17_base():
+    import inspect
+    src = inspect.getsource(TC.main)                                           # the parser is built inside main
+    assert 'ap.add_argument("--test-update", default="base"' in src                # fix round 3 (A N1)
+
+
+def test_short_conversations_note_when_none():
+    sp, out = fresh(updates=1)
+    rep = v17_report(out, sp)
+    assert rep.status("rl.sft_short_conversations") == "PASS" or rep.checks["rl.sft_short_conversations"]["notes"] == \
+        ["0 train_all conversations with n_by_conv < 2"]
+    assert not rep.checks["rl.sft_short_conversations"]["warn"]
+
+
 def test_threshold_control(tmp_path):
     # train: base P_end systematically too low (true rate at the final points 0.8, the policy says 0.4)
     train = [{"conversation_id": "c01", "real_final": True, "p_end": 0.4, "valid": True}] * 8 \
@@ -1084,6 +1098,8 @@ def test_one_message_conversation(monkeypatch):
     assert sorted(m["n_by_conv"]) == sorted(json.load(open(sp))["folds"][0]["train_all"])
     ups = T.read_jsonl(os.path.join(out, "updates.jsonl"))
     assert all("x_noshard" in u["task1_stats"]["convs"] for u in ups)
+    rep = v17_report(out, sp)                                                  # fix round 3 (C N1): listed, not failed
+    assert rep.status("rl.sft_short_conversations") == "WARN" and "x_noshard" in rep.checks["rl.sft_short_conversations"]["notes"][0]
     assert not [r for r in T.read_jsonl(os.path.join(out, "rollouts_task1.jsonl")) if r["conversation_id"] == "x_noshard"]
     assert no_fail(v17_report(out, sp)), fails(v17_report(out, sp))
     # a conversation without points whose recorded n is >= 2 FAILs

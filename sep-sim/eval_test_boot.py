@@ -53,6 +53,10 @@ ok(sorted(meta["updates"]) == sorted({0, fu}), "tested updates %s are not u0 + t
 T_MAX = int(first["config"]["selection_cfg"]["t_max"])
 rows = [r for r in TP.read_jsonl(os.path.join(run, "test.jsonl"))]
 with_base = bool(meta.get("include_base"))
+# fix round 3 (A N2): a v17 test evaluation always includes the base re-scored under the v17 definitions (every fold)
+if (first.get("config") or {}).get("spec_version") == "v17":
+    ok(with_base and os.path.exists(os.path.join(run, "test_base.jsonl")),
+       "a v17 test run without the base (eval_test_rl.py --include-base -> test_base.jsonl)")
 if with_base:
     rows += TP.read_jsonl(os.path.join(run, "test_base.jsonl"))
 summ = {r["update"]: r for r in rows if r.get("kind") == "summary"}

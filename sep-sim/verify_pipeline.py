@@ -1064,6 +1064,14 @@ def check_v17(rl_dir, rep, splits_path=None):
         # only when it has fewer than 2 messages (turn 1 never ends: no decision point)
         n_by = {c: int(v) for c, v in (em.get("n_by_conv") or {}).items()}
         rep.ok("rl.sft_data", sorted(n_by) == sorted(train_all), mp, "n_by_conv does not list exactly train_all")
+        # fix round 3 (C N1): the conversations recorded with fewer than 2 messages (no decision point) are always listed
+        # in the report, so a forged n = 1 is visible (INFO when there are none, WARN otherwise; never a FAIL)
+        short = sorted(c for c, v in n_by.items() if v < 2)
+        if short:
+            rep.warn("rl.sft_short_conversations", "%d train_all conversation(s) with n_by_conv < 2 (no decision point, "
+                     "no SFT / Task 1 data): %s" % (len(short), short))
+        else:
+            rep.note("rl.sft_short_conversations", "0 train_all conversations with n_by_conv < 2")
         for cid in sorted(train_all):
             if cid in n_of:
                 rep.ok("rl.sft_data", n_by.get(cid) == n_of[cid], "sft %s" % str(cid)[:10],
@@ -1433,6 +1441,11 @@ def check_v17(rl_dir, rep, splits_path=None):
     if tm:
         rep.ok("rl.v17_test", fin is not None and sorted(tm[-1].get("updates") or []) == sorted({0, final_u}), "test_meta",
                "tested updates %r, final.json names u%s" % (tm[-1].get("updates"), final_u))
+        # fix round 3 (A N2): the base (ckpt/sft_e0, v17 definitions) is part of every v17 test evaluation
+        tb = _jl(os.path.join(rl_dir, "test_base.jsonl"))
+        rep.ok("rl.v17_test", tm[-1].get("include_base") is True
+               and any(r.get("kind") == "summary" and r.get("update") == "base" for r in tb), "test_meta",
+               "the v17 test evaluation lacks the base (eval_test_rl.py --include-base -> test_base.jsonl)")
 
 
 def _check_t1prob_file(rl_dir, fname, rep, real_vllm):

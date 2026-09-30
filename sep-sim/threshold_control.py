@@ -19,7 +19,7 @@ Leakage gate (fix round 1, C-N10): with --splits / --fold, every train point mus
 not forbidden) and every test conversation a test_all one; anything else is refused.
 
 Usage: threshold_control.py --train RUN/base_pend_train.jsonl --test FILE --splits splits_v1.json --fold F
-                            [--test-update 0|base] [--json-out OUT]
+                            [--test-update base|0] [--json-out OUT]
   FILE = a test.jsonl / test_base.jsonl of eval_test_rl.py (rows kind "task1"; the latest row per conversation of that
   update with the policy sha of its summary)
 """
@@ -148,7 +148,9 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--train", required=True, help="RUN/base_pend_train.jsonl")
     ap.add_argument("--test", required=True, help="test.jsonl (update 0 = base of a v16 run) or test_base.jsonl")
-    ap.add_argument("--test-update", default="0", help="the update of the base policy in --test: 0 (v16 u0) or base")
+    ap.add_argument("--test-update", default="base",
+                    help="the update key of the base policy's rows in --test: base (the v17 test_base.jsonl of "
+                         "eval_test_rl.py --include-base, every fold; default) or 0 (an archived v16 test.jsonl, reference only)")
     ap.add_argument("--splits", required=True, help="the split file of the run (train_all / test_all gate)")
     ap.add_argument("--fold", type=int, required=True)
     ap.add_argument("--json-out")
