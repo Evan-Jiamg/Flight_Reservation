@@ -73,7 +73,7 @@ for attempt in $(seq 1 10); do
       --fold $F --planner-path $Q4 --gpu $GPU --rollout-workers 4 --out $RUN >> $RUN/test.log 2>&1
   rc=$?; settarget $TG 45; echo "test rc=$rc $(date)"
   [ $rc -eq 0 ] && break
-  if tail -c +$((SZ + 1)) $RUN/test.log | grep -cE "CUDA out of memory|OutOfMemoryError" > /dev/null; then
+  if tail -c +$((SZ + 1)) $RUN/test.log | grep -cE "CUDA out of memory|CUDA error: out of memory|OutOfMemoryError|GPU budget not available" > /dev/null; then
     echo "OOM (another job on the GPU) -> retry (finished rows are reused)"; sleep 60; continue; fi
   echo "STOP: test evaluation failed"; grep -v "Loading weights" $RUN/test.log | tail -8 | cut -c1-300; exit 1
 done

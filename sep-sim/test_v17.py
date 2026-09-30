@@ -6,6 +6,7 @@ import os
 import shutil
 import sys
 import tempfile
+import types
 
 import pytest
 
@@ -240,8 +241,20 @@ def test_ref_stub_and_saved_checkpoints_have_no_ref():
 
 
 class _P:
-    def __init__(self, g, device="cuda:1"):
-        self.requires_grad, self.device = g, device
+    def __init__(self, g, device="cuda:1", dtype="float32", value=0.0):
+        self.requires_grad, self.device, self.dtype, self.value = g, device, dtype, value
+
+
+def _mock_file_io(monkeypatch, file_sd, loaded=None):
+    """The adapter file (key -> value) and set_peft_model_state_dict of the mock: copies the file values into the ref."""
+    monkeypatch.setattr(RA, "_load_adapter_file", lambda path: dict(file_sd))
+
+    def set_state(model, sd, name):
+        for k, v in sd.items():
+            model.params[RA._ref_name(k)].value = v if loaded is None else loaded(k, v)
+        return types.SimpleNamespace(unexpected_keys=[])
+    monkeypatch.setattr(RA, "_set_adapter_state", set_state)
+    monkeypatch.setattr(RA, "_bit_equal", lambda param, t: param.value == t)
 
 
 class _MockPeft:
@@ -292,10 +305,46 @@ class _Opt:
         self.param_groups = [{"name": "policy", "params": params}]
 
 
-def test_load_ref_adapter_and_save_default_only_mock():
+def test_ref_adapter_bit_exact_tiny_peft_cpu(tmp_path):
+    """CPU check with a real (tiny) PEFT model when torch / peft / safetensors are installed (skipped otherwise): a bf16
+    base, an fp32 LoRA saved to disk, loaded as the ref through load_ref_adapter -> the ref tensors equal the file."""
+    torch = pytest.importorskip("torch")
+    peft = pytest.importorskip("peft")
+    pytest.importorskip("safetensors")
+
+    class Tiny(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.q_proj = torch.nn.Linear(16, 16, bias=False)
+
+        def forward(self, x):
+            return self.q_proj(x)
+    torch.manual_seed(0)
+    base = Tiny().to(torch.bfloat16)
+    model = peft.get_peft_model(base, peft.LoraConfig(r=4, lora_alpha=8, target_modules=["q_proj"], lora_dropout=0.0))
+    for n, p in model.named_parameters():
+        if p.requires_grad:
+            p.data = (torch.randn_like(p.data.float()) * 0.1 + 1e-4).float()     # fp32 values not representable in bf16
+    d = str(tmp_path / "u0")
+    model.save_pretrained(os.path.join(d, "adapter"), selected_adapters=["default"])
+    opt = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=1e-5)
+    opt.param_groups[0]["name"] = "policy"
+    RA.load_ref_adapter(model, os.path.join(d, "adapter"), opt)
+    from safetensors.torch import load_file
+    sd = load_file(os.path.join(d, "adapter", "adapter_model.safetensors"))
+    params = dict(model.named_parameters())
+    assert sd and all(torch.equal(params[RA._ref_name(k)].detach().cpu(), v.to(params[RA._ref_name(k)].dtype))
+                      for k, v in sd.items())
+    for k in sd:                                                           # = the policy's own (default) weights
+        assert torch.equal(params[RA._ref_name(k)], params[RA._ref_name(k).replace(".ref.", ".default.")])
+
+
+def test_load_ref_adapter_and_save_default_only_mock(monkeypatch):
     m = _MockPeft()
+    _mock_file_io(monkeypatch, {"m.lora_A.weight": 0.25, "m.lora_B.weight": -0.5})
     opt = _Opt([p for p in m.parameters() if p.requires_grad])
     assert RA.load_ref_adapter(m, "u0/adapter", opt) == 2
+    assert m.params["m.lora_A.ref.weight"].value == 0.25 and m.params["m.lora_B.ref.weight"].value == -0.5
     assert m.active == "default" and not any(p.requires_grad for n, p in m.params.items() if ".ref." in n)
     # B-1: the ref is loaded onto the policy's device (never PEFT's default cuda:0)
     assert ("load_adapter", "cuda:1") in m.calls
@@ -314,6 +363,17 @@ def test_load_ref_adapter_and_save_default_only_mock():
     m2 = _MockPeft()
     with pytest.raises(AssertionError):
         RA.load_ref_adapter(m2, "u0/adapter", _Opt([m2.params["m.base"]]))     # optimizer set != trainable set
+    # the ref must be BIT-equal to the file (PEFT 0.14 rounded it through bf16 on cfda5): a rounded copy is refused
+    m3 = _MockPeft()
+    _mock_file_io(monkeypatch, {"m.lora_A.weight": 0.25, "m.lora_B.weight": -0.5}, loaded=lambda k, v: v + 6e-5)
+    with pytest.raises(AssertionError) as e:
+        RA.load_ref_adapter(m3, "u0/adapter", _Opt([p for p in m3.parameters() if p.requires_grad]))
+    assert "bit-equal" in str(e.value)
+    m4 = _MockPeft()                                                        # a file without one of the ref tensors
+    _mock_file_io(monkeypatch, {"m.lora_A.weight": 0.25})
+    with pytest.raises(AssertionError) as e:
+        RA.load_ref_adapter(m4, "u0/adapter", _Opt([p for p in m4.parameters() if p.requires_grad]))
+    assert "without a file key" in str(e.value)
     tl = RA.TorchLearner.__new__(RA.TorchLearner)
     tl.model = m
     d = tempfile.mkdtemp()

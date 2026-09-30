@@ -306,6 +306,16 @@ v17 必須檢查：
 - **只有一則訊息的對話**：沒有決策點（t = 2..n 為空）；`sft_examples_meta.json` 以 `n_by_conv` 記錄每段 train_all 對話的 n，
   verify 只接受 n < 2 的對話沒有 SFT 點或 Task 1 列。
 
+### 實作補註（先佔資源，使用者 2026-09-30：「不能被搶卡，先佔資源」）
+- 訓練／test／smoke 行程在 build 結束時（所有模型都已在訓練 GPU 上）以 `rl_algos.reserve_gpu_budget` 讓 PyTorch caching allocator
+  持有 `--gpu-budget-gib`（SPEC 43，佔位程式交出 45 GiB，留 2 GiB 給 CUDA context）減 0.5 GiB：先配置再釋放（不 empty_cache），
+  釋放的區塊仍由本行程保留、可供自己的 tensor 使用；expandable_segments 下同樣成立（只有 empty_cache 或 allocator 內部 OOM 重試
+  才會把快取還給驅動程式）。每個階段（SFT、每次 update、每次 validation、test 的每個 policy）都重新檢查、補回；本程式的執行路徑
+  沒有任何 empty_cache。
+- 若預算已被別人拿走：印出「GPU budget not available … CUDA out of memory」並以 exit code 75 結束，run 腳本當成 OOM 重試（grep 也含
+  "GPU budget not available"）。`--gpu-budget-gib` 是資源設定：可在 resume 時改（RESUME_MAY_CHANGE），正式 run 用 43 以外的值需要
+  `--ablation`。vLLM servers 與佔位程式不變。
+
 ### 實作清單
 
 gap check 報告的「B. 實作清單」第 1–41 項全部納入。缺一項即視為未完成，由稽核逐項核對。

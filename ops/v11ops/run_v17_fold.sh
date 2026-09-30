@@ -51,8 +51,8 @@ else
     $PY train_planner_rl.py --fold $F --planner-path $Q4 --gpu $GPU --rollout-workers 4 --out $RUN $RES >> $RUN/train.log 2>&1
     rc=$?; giveback; echo "train rc=$rc $(date)"
     [ $rc -eq 0 ] && break
-    if tail -c +$((SZ + 1)) $RUN/train.log | grep -cE "CUDA out of memory|OutOfMemoryError" > /dev/null; then   # this attempt's lines only; grep -c reads all input (no SIGPIPE under pipefail)
-      echo "fold $F: OOM (another job on the GPU) -> retry with --resume"; sleep 60; continue; fi
+    if tail -c +$((SZ + 1)) $RUN/train.log | grep -cE "CUDA out of memory|CUDA error: out of memory|OutOfMemoryError|GPU budget not available" > /dev/null; then   # this attempt's lines only; grep -c reads all input (no SIGPIPE under pipefail)
+      echo "fold $F: OOM / GPU budget taken (another job on the GPU; exit 75 = budget) -> retry with --resume"; sleep 60; continue; fi
     echo "STOP: training failed"; grep -v "Loading weights" $RUN/train.log | tail -8 | cut -c1-300; exit 1
   done
   [ $rc -eq 0 ] || { echo "STOP: 10 OOM retries used"; exit 1; }

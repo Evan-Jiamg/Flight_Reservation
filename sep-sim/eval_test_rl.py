@@ -194,6 +194,7 @@ def main(argv=None):
                                                      if own.include_base else [])
     for u, p in jobs:
         s = evaluate(tr, u, own.test_seeds, test, test_all, p)
+        tr.keep_budget("test %s" % u)             # the budget stays held (reserved in build; user 2026-09-30)
         ts, t1 = s["turn_stats"] or {}, s["task1"] or {}
         print(json.dumps({"test_update": u, "n_episodes": s["n_episodes"], "unclean": s["n_unclean_episodes"],
                           "sim_turns": ts.get("sim_turns_mean"), "human_turns": ts.get("human_turns_mean"),

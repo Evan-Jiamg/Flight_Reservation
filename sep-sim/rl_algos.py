@@ -314,6 +314,105 @@ def setup_policy(planner, lora_init_seed, gradient_checkpointing=True, init_adap
     return model
 
 
+GIB = 1024 ** 3
+GPU_BUDGET_EXIT = 75          # exit code of a launch whose GPU budget is no longer free (EX_TEMPFAIL; the scripts retry)
+
+
+class GpuBudgetError(RuntimeError):
+    pass
+
+
+RESERVE_CHUNK = 256 * 1024 * 1024
+
+
+def reserve_gpu_budget(gpu, budget_gib, margin_gib=0.5, small_pool_mib=512, torch_mod=None, log=None,
+                       chunk_bytes=RESERVE_CHUNK):
+    """User 2026-09-30 ("不能被搶卡，先佔資源"): once every model of this process is on the training GPU, make the PyTorch
+    caching allocator HOLD the whole budget, so other users cannot take memory inside it later.
+
+    How: allocate and immediately free (a) small_pool_mib of 512 KiB tensors (the allocator's small-block pool, used by
+    allocations < 1 MiB) and (b) tensors of chunk_bytes (256 MiB) until torch.cuda.memory_reserved(gpu) reaches
+    (budget - margin) -- in chunks, never one big tensor (audit S1): the allocator serves a request only from ONE cached
+    block (or the free tail of a segment) large enough for it, not from scattered free fragments, so a single tensor of
+    "target - allocated" bytes could map new memory on top of the fragments and overshoot the budget; each chunk that
+    would push the reservation past the budget is cut to the remaining room, and a result above the budget (allocator
+    rounding) is logged as a WARNING. The freed
+    blocks stay RESERVED by this process (cached, reusable by our own tensors) because the caching allocator returns
+    memory to the driver only through torch.cuda.empty_cache() or, internally, when a cudaMalloc fails (it then releases
+    its cached blocks and retries: c10/cuda/CUDACachingAllocator.cpp, the retry chain; Context7 /pytorch/pytorch and the
+    2.13 CUDA-semantics notes). expandable_segments:True (our PYTORCH_CUDA_ALLOC_CONF) does not change this: its mapped
+    pages are unmapped by the same release path only, and a freed range inside an expandable segment can serve an
+    allocation of any size, so the reserve is used without fragmentation. The small-pool warm-up lowers the chance of the
+    internal release (a small allocation needing a new 2 MiB page on a full GPU); Trainer.keep_budget re-checks the
+    reservation at every phase boundary and re-reserves (or stops) if it was released.
+
+    Never reserves beyond the budget: a process already above (budget - margin) is only logged. If the missing memory is
+    not free on the GPU any more (somebody took it after the handoff), raises GpuBudgetError with "GPU budget not
+    available ... CUDA out of memory" (the run scripts treat it like an OOM: retry later). -> info dict."""
+    if torch_mod is None:
+        import torch as torch_mod
+    torch = torch_mod
+    log = log or (lambda s: print(s, flush=True))
+    budget, target = int(budget_gib * GIB), int((budget_gib - margin_gib) * GIB)
+    if target <= 0:
+        raise ValueError("GPU budget %r GiB with margin %r leaves nothing to reserve" % (budget_gib, margin_gib))
+    dev = "cuda:%d" % int(gpu)
+    before = int(torch.cuda.memory_reserved(gpu))
+    info = {"gpu": int(gpu), "budget_gib": budget_gib, "margin_gib": margin_gib, "target_bytes": target,
+            "reserved_before": before}
+    if before >= target:
+        info.update(reserved_after=before, added=0, over_budget=before > budget)
+        if before > budget:
+            log("WARNING: GPU %d: this process already reserves %.2f GiB > the %.2f GiB budget" % (gpu, before / GIB, budget_gib))
+        return info
+    free, _total = torch.cuda.mem_get_info(gpu)
+
+    def fail(why):
+        msg = ("GPU budget not available on GPU %d: %s (reserved %.2f GiB, target %.2f GiB, free %.2f GiB) -- "
+               "CUDA out of memory while reserving the %g GiB budget" % (gpu, why, torch.cuda.memory_reserved(gpu) / GIB,
+                                                                         target / GIB, free / GIB, budget_gib))
+        log(msg)
+        raise GpuBudgetError(msg)
+    if target - before > free:
+        fail("%.2f GiB more needed" % ((target - before) / GIB))
+    held = []
+    n_small = n_chunks = 0
+    try:
+        room = target - before
+        n_small = min(int(small_pool_mib) * 2, max(0, room // (1024 * 1024) // 2))
+        for _ in range(n_small):
+            held.append(torch.empty(512 * 1024, dtype=torch.uint8, device=dev))
+        chunk = int(chunk_bytes)
+        max_chunks = 2 * (budget // chunk + 1) + 64     # cached fragments >= a chunk are used up first, then new memory
+        while int(torch.cuda.memory_reserved(gpu)) < target:
+            n = min(chunk, budget - int(torch.cuda.memory_reserved(gpu)))
+            if n <= 0:
+                break
+            if n_chunks >= max_chunks:
+                fail("the reservation did not converge after %d chunks" % n_chunks)
+            held.append(torch.empty(n, dtype=torch.uint8, device=dev))
+            n_chunks += 1
+    except GpuBudgetError:
+        del held[:]
+        raise
+    except Exception as e:                           # torch.cuda.OutOfMemoryError (a RuntimeError subclass) and friends
+        del held[:]
+        if "out of memory" not in str(e).lower():
+            raise
+        fail("allocation failed: %s" % str(e).splitlines()[0][:200])
+    del held[:]                                      # freed into the cache, NOT emptied: the blocks stay reserved
+    after = int(torch.cuda.memory_reserved(gpu))
+    info.update(reserved_after=after, added=after - before, over_budget=after > budget, small_blocks=n_small,
+                chunks=n_chunks)
+    if after < target:
+        fail("the reservation did not hold (%.2f GiB reserved after freeing)" % (after / GIB))
+    if after > budget:
+        log("WARNING: GPU %d: the reservation reached %.3f GiB > the %.2f GiB budget (allocator rounding)"
+            % (gpu, after / GIB, budget_gib))
+    log("GPU %d: reserved %.2f GiB of the %.2f GiB budget (+%.2f GiB)" % (gpu, after / GIB, budget_gib, (after - before) / GIB))
+    return info
+
+
 def lora_state(model):
     from peft import get_peft_model_state_dict
     return get_peft_model_state_dict(model)
@@ -349,11 +448,34 @@ def set_active_adapter(model, name):
         model.set_adapter(name)
 
 
+def _load_adapter_file(path):
+    import os
+    from safetensors.torch import load_file
+    return load_file(os.path.join(path, "adapter_model.safetensors"))
+
+
+def _set_adapter_state(model, sd, adapter_name):
+    from peft import set_peft_model_state_dict
+    return set_peft_model_state_dict(model, sd, adapter_name=adapter_name)
+
+
+def _bit_equal(param, t):
+    import torch
+    return torch.equal(param.detach().cpu(), t.to(param.dtype).cpu())
+
+
+def _ref_name(file_key):
+    """adapter_model.safetensors key -> the ref parameter's name: ".lora_A.weight" -> ".lora_A.ref.weight" (lora_B too)."""
+    import re
+    return re.sub(r"\.(lora_[AB])\.(weight|bias)$", r".\1.%s.\2" % REF_ADAPTER, file_key)
+
+
 def load_ref_adapter(model, path, optimizer=None):
     """v17 §2 / B4 (user 2026-09-30): load the adapter at `path` (the SFT policy u0) as a second, FROZEN adapter named
     "ref" -- the KL reference. Called after the optimizer exists; the active adapter stays "default", the trainable
     parameter set and the optimizer's parameter set are asserted unchanged and every ref parameter has
-    requires_grad False. Checkpoints save "default" only (TorchLearner.save). -> number of ref parameters."""
+    requires_grad False; every ref weight is bit-equal to the adapter file (and so to u0's "default" weights when u0 is
+    loaded). Checkpoints save "default" only (TorchLearner.save). -> number of ref parameters."""
     if REF_ADAPTER in (getattr(model, "peft_config", None) or {}):
         raise AssertionError("the ref adapter is already loaded")
     names0 = [n for n, p in model.named_parameters() if p.requires_grad]
@@ -362,6 +484,38 @@ def load_ref_adapter(model, path, optimizer=None):
     dev = str(next(model.parameters()).device)
     kw = {"torch_device": dev} if _accepts(model.load_adapter, "torch_device") else {}
     model.load_adapter(path, adapter_name=REF_ADAPTER, is_trainable=False, **kw)
+    # fix (smoke on cfda5, PEFT 0.14.0): load_adapter builds the ref LoRA layers in the base's bf16, copies the fp32 file
+    # weights in (rounding them) and only then autocasts to fp32 -- the ref differed from u0 by up to 6e-5 per weight
+    # (logp up to 0.59 on a smoke sample). So: every ref parameter takes the dtype of its "default" twin, the file is
+    # loaded again with set_peft_model_state_dict into the ref, and every ref weight is asserted BIT-EQUAL to the file.
+    params = dict(model.named_parameters())
+    for n, p in params.items():
+        if (".%s." % REF_ADAPTER) in n:
+            twin = params.get(n.replace(".%s." % REF_ADAPTER, ".default."))
+            if twin is None:
+                raise AssertionError("ref parameter %s has no default twin" % n)
+            if p.dtype != twin.dtype:
+                p.data = p.data.to(twin.dtype)
+            p.requires_grad = False
+    sd = _load_adapter_file(path)
+    res = _set_adapter_state(model, sd, REF_ADAPTER)
+    unexpected = getattr(res, "unexpected_keys", None)
+    if unexpected:
+        raise AssertionError("unexpected keys loading the ref adapter: %s" % list(unexpected)[:5])
+    params = dict(model.named_parameters())
+    ref_names = {n for n in params if (".%s." % REF_ADAPTER) in n}
+    if not sd:
+        raise AssertionError("the adapter file of %s has no tensor" % path)
+    mapped = set()
+    for k, t in sd.items():
+        rn = _ref_name(k)
+        if rn not in params:
+            raise AssertionError("adapter file key %s has no ref parameter (%s)" % (k, rn))
+        if not _bit_equal(params[rn], t):
+            raise AssertionError("ref parameter %s is not bit-equal to the adapter file" % rn)
+        mapped.add(rn)
+    if mapped != ref_names:
+        raise AssertionError("ref parameters without a file key: %s" % sorted(ref_names - mapped)[:5])
     model.set_adapter("default")
     bad = sorted({str(p.device) for n, p in model.named_parameters() if (".%s." % REF_ADAPTER) in n} - {dev})
     if bad:

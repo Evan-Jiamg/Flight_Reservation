@@ -22,6 +22,9 @@ non-essential checks are reported, never counted as passes.
   gpu     memory_allocated(i) == 0 on every other visible GPU, and this process's pid on no other GPU in nvidia-smi
           (bare CUDA contexts, B-1; compared by device UUID); torch.cuda.max_memory_reserved(--gpu) < 43 GiB at every
           phase (the placeholder hands over 45 GiB; 2 GiB margin for the CUDA context / cuBLAS workspace);
+  budget  (user 2026-09-30, "先佔資源") build() reserved --gpu-budget-gib minus 0.5 GiB in the caching allocator; it is
+          still reserved before the resume check and at the end (no empty_cache anywhere); reserved memory is logged
+          after the reserve and at every phase;
   resume  LEARNER-ONLY (fix round 2: a second full Trainer with Ditto would not fit): a second base model + seeded LoRA +
           TorchLearner, the ref loaded like a resume build (load_ref_if_u0), load_checkpoint(u1): optimizer state loaded
           with the ref present, policy sha = u1's; then an eval_test_rl-style load_policy(sft_e0) with the ref loaded.
@@ -56,7 +59,8 @@ ESSENTIAL = ("b1_start_policy_reproducible", "pend_batch_equals_single", "pend_f
              "kl_step_max_positive", "ref_unchanged_by_update", "update_trainables_unchanged",
              "no_other_gpu_memory_after_ref", "no_other_gpu_memory_after_update", "no_other_gpu_memory_end",
              "no_context_on_other_gpu", "memory_under_budget", "resume_ref_loaded_at_build", "resume_load_checkpoint",
-             "resume_optimizer_state_loaded", "base_load_with_ref", "no_ref_dir_in_checkpoints")
+             "resume_optimizer_state_loaded", "base_load_with_ref", "no_ref_dir_in_checkpoints",
+             "budget_reserved_at_build", "budget_still_reserved_before_resume", "budget_still_reserved_at_end")
 
 
 def pop_int(argv, flag, default):
@@ -145,15 +149,26 @@ def main(argv=None):
     if os.path.exists(os.path.join(a.out, "ckpt", "LATEST.json")) or os.path.exists(os.path.join(a.out, "sft_examples.jsonl")):
         raise SystemExit("%s already holds a run; use a fresh scratch dir" % a.out)
     gpu = int(a.gpu)
+    # ---- b1 FIRST (user 2026-09-30): the reference start policy of a fresh process, computed and released BEFORE this
+    # process reserves the GPU budget in build(), so the subprocess never needs memory outside the budget
+    b1_code = START_SHA_CODE % (HERE, gpu, a.planner_path, gpu, T.seed_of(a.seed, "lora_init"))
+    b1_out = subprocess.run([sys.executable, "-c", b1_code], capture_output=True, text=True, timeout=1800)
+    b1_sub = [l[4:] for l in b1_out.stdout.splitlines() if l.startswith("SHA ")]
     tr = T.Trainer(a)
     t0 = time.time()
-    tr.build()                                           # torch.cuda.set_device(--gpu) inside (B-1)
+    tr.build()                                           # torch.cuda.set_device(--gpu) + the budget reservation inside
     res = {"build_s": round(time.time() - t0, 1), "checks": {}, "logs": {}, "memory_gib": {}}
     chk, logs, mem = res["checks"], res["logs"], res["memory_gib"]
 
     def phase(name):
         mem[name] = round(torch.cuda.max_memory_reserved(gpu) / GIB, 2)
+        logs.setdefault("reserved_gib_by_phase", {})[name] = round(torch.cuda.memory_reserved(gpu) / GIB, 2)
 
+    # user 2026-09-30: build() already reserved the budget (Trainer.keep_budget -> rl_algos.reserve_gpu_budget)
+    target = (float(a.gpu_budget_gib) - 0.5) * GIB
+    logs["reserved_gib_after_build_reserve"] = round(torch.cuda.memory_reserved(gpu) / GIB, 2)
+    budget_on = float(a.gpu_budget_gib) > 0          # --gpu-budget-gib 0: nothing reserved -> the checks are NM (N3)
+    chk["budget_reserved_at_build"] = (torch.cuda.memory_reserved(gpu) >= target) if budget_on else NM
     phase("build")
     lr = tr.learner
     full_train_all = sorted(tr.split["train_all"])
@@ -161,13 +176,11 @@ def main(argv=None):
     tr.split = dict(tr.split, train_all=full_train_all[:n_conv],
                     validation_all=sorted(tr.split["validation_all"])[:n_val])
     a.task1_convs = n_conv
-    # ---- b1: the start policy is reproducible (fresh process, same seed)
+    # ---- b1: the start policy is reproducible (the fresh process above, same seed)
     start_sha = lr.policy_sha()
-    code = START_SHA_CODE % (HERE, gpu, a.planner_path, gpu, T.seed_of(a.seed, "lora_init"))
-    out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=1800)
-    sub = [l[4:] for l in out.stdout.splitlines() if l.startswith("SHA ")]
-    logs["start_policy_sha"], logs["start_policy_sha_subprocess"] = start_sha, (sub[-1] if sub else out.stderr[-500:])
-    chk["b1_start_policy_reproducible"] = bool(sub) and sub[-1] == start_sha
+    logs["start_policy_sha"] = start_sha
+    logs["start_policy_sha_subprocess"] = b1_sub[-1] if b1_sub else b1_out.stderr[-500:]
+    chk["b1_start_policy_reproducible"] = bool(b1_sub) and b1_sub[-1] == start_sha
     # ---- SFT data (start policy served as sft_e0)
     tr.save_sft_candidate(0)
     t1 = time.time()
@@ -324,10 +337,15 @@ def main(argv=None):
     tr.update_done = 1
     tr.save_checkpoint(1, None)
     u1_sha = lr.policy_sha()
-    # free what the resume check does not need (the rollout samples' tensors; the allocator cache)
+    # free what the resume check does not need (the rollout samples' tensors) INTO our cache -- no empty_cache (user
+    # 2026-09-30: the budget stays held; the freed blocks serve the second learner); re-check the reservation
     del samples, t2s, t1s, aux, t1rows
     gc.collect()
-    torch.cuda.empty_cache()
+    # measured BEFORE keep_budget (audit S2: keep_budget re-reserves, so a check after it could not fail)
+    held_before_resume = torch.cuda.memory_reserved(gpu)
+    logs["reserved_gib_before_resume_check"] = round(held_before_resume / GIB, 2)
+    chk["budget_still_reserved_before_resume"] = (held_before_resume >= target) if budget_on else NM
+    tr.keep_budget("smoke pre-resume")
     # ---- resume, learner-only (fix round 2): second base model + seeded LoRA + TorchLearner, ref like a resume build
     from task2_env import PlannerLM
     tr2 = T.Trainer(a)
@@ -355,6 +373,10 @@ def main(argv=None):
     if not on:
         logs["no_context_on_other_gpu_reason"] = ("nvidia-smi failed" if on is None else
                                                   "nvidia-smi lists no process with this pid (PID-namespaced container?)")
+    held_end = torch.cuda.memory_reserved(gpu)       # before keep_budget (audit S2)
+    logs["reserved_gib_end_check"] = round(held_end / GIB, 2)
+    chk["budget_still_reserved_at_end"] = (held_end >= target) if budget_on else NM
+    tr.keep_budget("smoke end")
     phase("end")
     chk["memory_under_budget"] = all(v < BUDGET_GIB for v in mem.values())
     res["total_s"] = round(time.time() - t0, 1)

@@ -74,12 +74,13 @@ TIME_KEYS = ("time", "wall_s", "rollout_s", "update_s", "timing", "validation_s"
 VAL_RETRIES = 2          # an unclean validation episode (infrastructure incident) is re-run up to this many times
 # v17 B2: "updates" is NOT here (the run is 5 updates, fixed); the v16 re-selection flags are gone
 RESUME_MAY_CHANGE = ("resume", "allow_code_change", "rollout_workers", "gpu", "max_batch",
-                     "keep_optimizer_last", "dry_run_crash_after_episodes", "vllm_url", "intervention")
+                     "keep_optimizer_last", "dry_run_crash_after_episodes", "vllm_url", "intervention",
+                     "gpu_budget_gib")        # a resource setting (user 2026-09-30), no behavioural effect
 # SPEC v17 values (user 2026-09-30; S10: kept here, rl_controllers.TRAIN_DEFAULTS is unchanged)
 SPEC_V17 = {"lr": 1e-5, "kl": 0.01, "sft_lr": 5e-5, "sft_epochs_max": 3, "sft_samples_per_point": 2, "task1_G": 4,
             "task1_convs": 8, "task1_reward": "brier", "task1_positions": "all", "aux_weight": 0.5, "updates": 5,
             "val_every": 1, "val_seeds": [0, 1, 2, 3, 4, 5, 6, 7], "length_drift_margin": 1.0, "controller": "fixed",
-            "stop_credit": 1, "epochs": 2, "minibatches": 4}
+            "stop_credit": 1, "epochs": 2, "minibatches": 4, "gpu_budget_gib": 43}
 SFT_BATCH = 8            # §1.2: SFT minibatch of 8 examples
 SFT_TEMPERATURE = 1.0    # §1.1: the sampled SFT plans (T 1, top-p 1)
 SFT_TOP_P = 1.0
@@ -635,6 +636,26 @@ class Trainer:
         self.config_record["env"] = self.env.describe()
         self.config_record["trainable_params"] = self.learner.trainable_names()[:8] + ["..."]
         self.load_ref_if_u0()
+        self.keep_budget("build")             # user 2026-09-30: hold the whole GPU budget from the start
+
+    def keep_budget(self, where):
+        """User 2026-09-30 ("不能被搶卡，先佔資源"): the training GPU's budget (--gpu-budget-gib, minus a 0.5 GiB margin)
+        stays reserved by this process's caching allocator (rl_algos.reserve_gpu_budget). Called after build and at every
+        phase boundary (SFT, each update, each validation): a reservation released by the allocator's internal OOM retry
+        is taken again; if the memory is gone, the run stops with "GPU budget not available ... CUDA out of memory" and
+        exit code 75 (the run scripts retry like an OOM). Each call is logged to gpu_budget.jsonl. No-op for a dry run or
+        --gpu-budget-gib 0."""
+        a = self.a
+        if a.dry_run or not a.gpu_budget_gib:
+            return None
+        try:
+            info = RA.reserve_gpu_budget(int(a.gpu), float(a.gpu_budget_gib))
+        except RA.GpuBudgetError as e:
+            append_jsonl(os.path.join(a.out, "gpu_budget.jsonl"), {"where": where, "error": str(e), "time": time.time()})
+            print(str(e), file=sys.stderr, flush=True)
+            raise SystemExit(RA.GPU_BUDGET_EXIT)
+        append_jsonl(os.path.join(a.out, "gpu_budget.jsonl"), {"where": where, **info, "time": time.time()})
+        return info
 
     def load_ref_if_u0(self):
         """v17 B4: once u0 (the SFT policy) exists, it is the frozen "ref" adapter of the learner (resume and the test
@@ -1595,6 +1616,7 @@ class Trainer:
         if not resumed:
             random.seed(a.seed)
             self.sft_stage()                          # -> u0 = SFT, LATEST, the ref adapter
+            self.keep_budget("sft")
         else:
             self.ensure_sft_row()
             if fin is not None:
@@ -1608,10 +1630,13 @@ class Trainer:
         if fin is None:
             if self.update_done == 0:
                 self.validate(0, task2=True)
+                self.keep_budget("validate u0")
             elif self.val_due(self.update_done):
                 self.validate(self.update_done, task2=False)   # completes a validation cut short by a crash
+                self.keep_budget("validate u%d" % self.update_done)
             for u in range(self.update_done + 1, a.updates + 1):
                 r = self.one_update(u)
+                self.keep_budget("update u%d" % u)
                 print(json.dumps({"update": u, "reward_mean": r["train_aggregate"]["reward_mean"],
                                   "skipped": r["train_aggregate"]["n_groups_skipped_zero_std"],
                                   "drift": round(r["train_aggregate"]["drift_stat"], 3),
@@ -1622,6 +1647,7 @@ class Trainer:
                     break
                 if self.val_due(u):
                     self.validate(u, task2=False)             # u1 .. u(final-1): Task 1 only
+                    self.keep_budget("validate u%d" % u)
         assert fin["final_update"] == self.update_done, "final.json names u%d, the latest checkpoint is u%d" % (
             fin["final_update"], self.update_done)
         self.validate(fin["final_update"], task2=True)
@@ -1734,6 +1760,10 @@ def parse_args(argv=None):
     ap.add_argument("--keep-optimizer-last", type=int, default=3,
                     help="delete optimizer.pt of checkpoints older than this many updates (adapters kept); 0 = keep all")
     ap.add_argument("--gpu", type=int, default=0)
+    ap.add_argument("--gpu-budget-gib", type=float, default=SPEC_V17["gpu_budget_gib"],
+                    help="GiB of the training GPU this process holds from build on (user 2026-09-30: the placeholder hands "
+                         "over 45 GiB; 43 leaves room for the CUDA context); 0 = do not reserve. A resource setting: it may "
+                         "change on resume; another value than 43 needs --ablation on a real run")
     ap.add_argument("--dry-run", action="store_true", help="fake env + pure-python learner (no torch, no GPU)")
     ap.add_argument("--dry-run-crash-after-episodes", type=int, default=0, help=argparse.SUPPRESS)
     a = ap.parse_args(argv)
@@ -1766,7 +1796,11 @@ def parse_args(argv=None):
             off[k] = getattr(a, k)
     if sorted(a.val_seeds) != SPEC_V17["val_seeds"]:
         off["val_seeds"] = a.val_seeds
+    if not (0.0 <= a.gpu_budget_gib <= 80.0):
+        ap.error("--gpu-budget-gib must lie in [0, 80]")
     if not a.dry_run:
+        if a.gpu_budget_gib != SPEC_V17["gpu_budget_gib"]:
+            off["gpu_budget_gib"] = a.gpu_budget_gib
         for k, want in (("scenarios_per_update", 4), ("val_every", SPEC_V17["val_every"])):
             if getattr(a, k) != want:
                 off[k] = getattr(a, k)
