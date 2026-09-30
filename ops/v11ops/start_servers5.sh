@@ -17,7 +17,10 @@ waitheld_ge() { n=0; until [ "$(held $1)" -ge $2 ]; do [ $((n % 600)) -eq 0 ] &&
 wait_up() {
   for i in $(seq 1 120); do
     up $1 $2 && return 0
-    if ! pgrep -u mzjiang -f "$3" > /dev/null; then echo "server process died:"; grep -E "Error|error" $4 | tail -3 | cut -c1-250; return 1; fi
+    # 2026-09-30: grace of 3 checks (30 s) before calling the process dead -- right after `setsid nohup bash serve.sh &`
+    # the command line is still "bash serve.sh" until its `exec vllm serve ... --port N` runs, so an immediate pgrep on
+    # "port N" raced and aborted a healthy launch (smoke v17, 21:35).
+    if [ $i -gt 3 ] && ! pgrep -u mzjiang -f "$3" > /dev/null; then echo "server process died:"; grep -E "Error|error" $4 | tail -3 | cut -c1-250; return 1; fi
     sleep 10
   done
   return 1

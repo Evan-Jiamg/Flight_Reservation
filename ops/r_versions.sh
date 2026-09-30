@@ -1,0 +1,3 @@
+PYTHONNOUSERSITE=1 /home/mzjiang/miniconda3/envs/consistent-test/bin/python -c "import peft, torch, transformers, inspect; from peft import PeftModel; print('peft', peft.__version__, 'torch', torch.__version__, 'transformers', transformers.__version__); print('load_adapter has torch_device:', 'torch_device' in inspect.signature(PeftModel.load_adapter).parameters); print('set_adapter params:', list(inspect.signature(PeftModel.set_adapter).parameters))"
+grep -c PYTHONNOUSERSITE /tmp2/mzjiang_usersim/grpo_planner/run_v17_smoke.sh /tmp2/mzjiang_usersim/grpo_planner/run_v17_fold.sh /tmp2/mzjiang_usersim/grpo_planner/run_v17_test.sh
+nvidia-smi --query-gpu=index,memory.used --format=csv,noheader
