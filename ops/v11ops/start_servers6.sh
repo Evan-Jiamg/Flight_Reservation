@@ -161,7 +161,7 @@ cat > $R/serve.sh <<EOF
 #!/bin/bash
 export PATH=$PYDIR:\$PATH CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=$2 PYTHONNOUSERSITE=1 HF_HOME=/tmp2/hf_shared VLLM_CACHE_ROOT=$R/cache
 exec $PYDIR/vllm serve $M --served-model-name gpt-oss-120b \\
-  --max-model-len 12288 --host 127.0.0.1 --port 8029 --gpu-memory-utilization $OSS_UTIL
+  --max-model-len ${OSS_MAX_MODEL_LEN:-32768} --host 127.0.0.1 --port 8029 --gpu-memory-utilization $OSS_UTIL
 EOF
     chmod +x $R/serve.sh
   else

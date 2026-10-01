@@ -27,6 +27,7 @@ export CUDA_DEVICE_ORDER=PCI_BUS_ID
 export R0_BASE_URL=http://127.0.0.1:8029/v1 R0_MODEL=gpt-oss-120b R0_REASONING_EFFORT=low
 export JUDGE_BASE_URL=http://127.0.0.1:8029/v1 JUDGE_MODEL=gpt-oss-120b JUDGE_REASONING_EFFORT=low
 export CONTROLLER_BASE_URL=http://127.0.0.1:8029/v1 OPENAI_API_KEY=local-vllm-unused
+export R0_CONTEXT=${OSS_MAX_MODEL_LEN:-32768}   # 2026-10-02: = gpt-oss max_model_len (start_servers6.sh); 12288 overflowed
 export Q4=$(ls -d /tmp2/hf_shared/hub/models--Qwen--Qwen3-4B-Instruct-2507/snapshots/*/ | head -1)
 held() { cat $H/status_$1 2>/dev/null || echo 0; }
 settarget() { echo $2 > $H/target_$1.tmp && mv -f $H/target_$1.tmp $H/target_$1; }

@@ -19,6 +19,7 @@ O=$G/bench_eval_f2_v18; O17=$G/bench_eval_f2_v17; L=$G/labels_v18; RERANK=$L/rer
 PYDIR=/home/mzjiang/miniconda3/envs/consistent-test/bin; PY=$PYDIR/python
 export PATH=$PYDIR:$PATH PYTHONNOUSERSITE=1 HF_HOME=/tmp2/hf_shared PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export CUDA_DEVICE_ORDER=PCI_BUS_ID OPENAI_API_KEY=local-vllm-unused PYTHONDONTWRITEBYTECODE=1
+export R0_CONTEXT=${OSS_MAX_MODEL_LEN:-32768}   # 2026-10-02: = gpt-oss max_model_len (start_servers6.sh); 12288 overflowed
 export Q4=$(ls -d /tmp2/hf_shared/hub/models--Qwen--Qwen3-4B-Instruct-2507/snapshots/*/ | head -1)
 PREFIX=sep_sim_pend_qwen3_4b_planner_ditto_8b_speaker_v18_fold_2
 held() { cat $H/status_$1 2>/dev/null || echo 0; }
