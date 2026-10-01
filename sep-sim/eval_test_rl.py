@@ -15,6 +15,12 @@ is in forbidden_for_training and in no training / validation / few-shot / p_h li
 never evaluated again (test once), an unfinished one is resumed.
 
 Usage: python eval_test_rl.py --final --test-seeds 0 1 2 3 4 5 6 7 --test-updates 0 5 [--include-base] <the trainer arguments>
+
+SPEC v18 §8 (--spec v18 among the trainer arguments): ONLY the final policy of final.json (--test-updates = [final];
+no base), the run's own selector (the reranker when it passed its gate); Task 2 episodes are judged by clean_v18 (a lost
+ledger verdict makes only the coverage diagnostic None -- never a re-run); the comparison rows are v17's existing
+test.jsonl (SFT u0 and GRPO u5, never re-run), whose path and sha256 test_meta records (--v17-run, default
+runs/pend_f<F>_v17 next to the run).
 """
 import argparse
 import json
@@ -36,6 +42,7 @@ def parse(argv=None):
     ap.add_argument("--test-updates", type=int, nargs="+", required=True)
     ap.add_argument("--include-base", action="store_true",
                     help="v17 B6: also evaluate the untrained start policy (ckpt/sft_e0) -> test_base.jsonl")
+    ap.add_argument("--v17-run", default=None, help="v18: the v17 run whose test.jsonl holds the comparison rows")
     own, rest = ap.parse_known_args(argv)
     if not own.final:
         ap.error("the test split is read only with --final")
@@ -63,20 +70,28 @@ def test_ids(a, split):
     return test, test_all
 
 
+def clean_key(tr):
+    """v17: "clean"; SPEC v18 §3.2 / §8: "clean_v18"."""
+    return "clean_v18" if getattr(tr, "spec", "v17") == "v18" else "clean"
+
+
 def summarize(tr, u, psha, seeds, vrows, t1rows, t0):
     """Summary of one update: validate()'s turn_stats / Task 1 metrics (no selection, best or D2 fields)."""
     t_max = int(tr.selection_cfg["t_max"])
+    ck = clean_key(tr)
 
     def turn_stats(rows):
-        eps = [r["episode"] for r in rows if r["episode"]["clean"]]
+        eps = [r["episode"] for r in rows if r["episode"][ck]]
         if not eps or not all("human_turns" in e for e in eps):
             return None
+        if ck == "clean_v18":
+            return TP.turn_stats_v18(eps, t_max)      # coverage = the diagnostic over the non-null episodes
         return TP.turn_stats_of(eps, t_max)          # human turns capped at t_max (fix round 1, D-N5), as validate()
 
-    n_unclean = sum(1 for r in vrows if not r["episode"]["clean"])
+    n_unclean = sum(1 for r in vrows if not r["episode"][ck])
     t1 = T1.task1_stop_metrics([r["task1"] for r in t1rows])
     t1.update(T1.task1_prob_metrics([p for r in t1rows for p in r["end_probs"]]))
-    return {"kind": "summary", "update": u, "policy_sha": psha, "split": "test", "final": True,
+    return {"kind": "summary", "update": u, "policy_sha": psha, "split": "test", "final": True, "clean_key": ck,
             "n_episodes": len(vrows) - n_unclean, "n_unclean_episodes": n_unclean,
             "unclean_after_retries": n_unclean > 0, "val_temperature": tr.a.val_temperature, "seeds": list(seeds),
             "task2_ids": sorted({r["conversation_id"] for r in vrows}),
@@ -106,6 +121,7 @@ def evaluate(tr, u, seeds, test, test_all, p_out):
     else:
         tr.sync_generation_policy(u)        # vLLM generates with this checkpoint's adapter (name p<u>-<sha>)
     a = tr.a
+    ck = clean_key(tr)
     done = {(r["conversation_id"], r["seed"]): r for r in prev if r.get("kind") == "episode" and r["update"] == u}
     done_t1 = {r["conversation_id"]: r for r in prev if r.get("kind") == "task1" and r["update"] == u}
 
@@ -113,7 +129,7 @@ def evaluate(tr, u, seeds, test, test_all, p_out):
         cid, s = job
         assert cid in test, "Task 2 id %r not in the test split" % cid
         r = done.get((cid, s))
-        if r is not None and r["policy_sha"] == psha and (r["episode"]["clean"] or r.get("attempt", 0) >= TP.VAL_RETRIES):
+        if r is not None and r["policy_sha"] == psha and (r["episode"][ck] or r.get("attempt", 0) >= TP.VAL_RETRIES):
             return r
         attempt = r.get("attempt", 0) + 1 if (r is not None and r["policy_sha"] == psha) else 0
         while True:
@@ -123,7 +139,7 @@ def evaluate(tr, u, seeds, test, test_all, p_out):
                  "attempt": attempt, "split": "test", "episode": ep, "time": time.time()}
             with tr.io_lock:
                 TP.append_jsonl(p_out, r)
-            if ep["clean"] or attempt >= TP.VAL_RETRIES:
+            if ep[ck] or attempt >= TP.VAL_RETRIES:
                 return r
             attempt += 1                    # an infrastructure incident, not the policy: run it again
 
@@ -159,13 +175,25 @@ def main(argv=None):
     if st_f["policy_sha"] != fin.get("policy_sha"):
         raise SystemExit("final.json policy sha %s != ckpt u%d's %s" % (str(fin.get("policy_sha"))[:12], bu,
                                                                      st_f["policy_sha"][:12]))
+    v18 = getattr(a, "spec", "v17") == "v18"
     if sorted(own.test_seeds) != list(range(8)) and not a.ablation:
         raise SystemExit("--test-seeds must be 0..7 (spec v17 §5) unless the run is a named --ablation")
-    if sorted(set(own.test_updates)) != sorted({0, bu}) or len(own.test_updates) != len(set(own.test_updates)):
+    if v18:
+        # SPEC v18 §8: the final policy only; v17's u0 / u5 test rows are the comparison (never re-run, no base)
+        if list(own.test_updates) != [bu]:
+            raise SystemExit("v18: --test-updates must be exactly the final u%d of final.json, got %s" % (bu, own.test_updates))
+        if own.include_base:
+            raise SystemExit("v18: no base evaluation (the comparison is v17's test.jsonl)")
+        v17_run = own.v17_run or os.path.join(os.path.dirname(os.path.abspath(a.out)), "pend_f%d_v17" % a.fold)
+        v17_test = os.path.join(v17_run, "test.jsonl")
+        if not os.path.exists(v17_test):
+            raise SystemExit("v18: the v17 comparison file %s does not exist (--v17-run)" % v17_test)
+    elif sorted(set(own.test_updates)) != sorted({0, bu}) or len(own.test_updates) != len(set(own.test_updates)):
         raise SystemExit("--test-updates must be exactly u0 (SFT) and the final u%d, got %s" % (bu, own.test_updates))
     # S13: both need a validation summary that INCLUDES Task 2 (a Task-1-only summary does not count)
     validated = {r["update"] for r in TP.read_jsonl(os.path.join(a.out, "validation.jsonl"))
                  if r.get("kind") == "summary" and r.get("task2")}
+    # v18: the final policy is u0 (GRPO not adopted) or the candidate whose Task 2 check passed -- validated with Task 2
     if set(own.test_updates) - validated:
         raise SystemExit("updates %s have no validation with Task 2" % sorted(set(own.test_updates) - validated))
     if not TP.read_jsonl(os.path.join(a.out, "run_meta.jsonl")):
@@ -175,8 +203,8 @@ def main(argv=None):
     for u in own.test_updates:
         man = json.load(open(os.path.join(tr.ckpt_dir(u), "rl_manifest.json")))
         assert man["fold"] == a.fold and man["splits_sha256"] == tr.split["sha256"], "u%d manifest: other fold / splits" % u
-        for k in ("train_scenarios", "train_conversations", "fewshot_pool"):
-            assert not set(man[k]) & set(test_all), "u%d manifest %s intersects the test split" % (u, k)
+        for k in ("train_scenarios", "train_conversations", "fewshot_pool", "labels_train_conversations"):
+            assert not set(man.get(k) or []) & set(test_all), "u%d manifest %s intersects the test split" % (u, k)
     tr.build()                              # few-shot pool and p_h from train_all (asserted disjoint from forbidden)
     tr.update_done = json.load(open(os.path.join(tr.ckpt_root, "LATEST.json")))["update"]
     row = tr.meta("test")
@@ -184,8 +212,16 @@ def main(argv=None):
     if own.include_base:
         b0 = json.load(open(os.path.join(tr.sft_dir(0), "state.json")))
         assert b0["epoch"] == 0, "ckpt/sft_e0 is not the start policy"
+    extra = {}
+    if v18:
+        fu17 = json.load(open(os.path.join(os.path.dirname(v17_test), "final.json"), encoding="utf-8"))["final_update"]
+        extra["v17_reference"] = {"test_jsonl": v17_test, "test_jsonl_sha256": TP.sha_file(v17_test),
+                                  "sft_update": 0, "grpo_update": fu17,
+                                  "labels": ["v17 SFT (u0)", "v17 GRPO (u%d)" % fu17, "v18 (GRPO+R)"]}
+        extra["selector"] = a.selector
+        extra["reranker_sha256"] = getattr(tr, "reranker_sha", None)
     TP.append_jsonl(os.path.join(a.out, "test_meta.jsonl"),
-                    {**row, "final": True, "updates": list(own.test_updates), "seeds": list(own.test_seeds),
+                    {**row, **extra, "final": True, "updates": list(own.test_updates), "seeds": list(own.test_seeds),
                      "final_json_sha256": TP.sha_file(fp), "final_update": bu, "stop_reason": fin.get("stop_reason"),
                      "include_base": bool(own.include_base), "task2_ids": test, "task1_ids": test_all, "argv": sys.argv,
                      "eval_code_sha256": {f: TP.sha_file(os.path.join(HERE, f)) for f in ("eval_test_rl.py", "eval_test_boot.py")}})

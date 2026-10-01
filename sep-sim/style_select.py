@@ -115,3 +115,117 @@ def select(cands, eligible, target_words, refs, scorer):
     len_dist = [abs(n_words(c) - target_words) if target_words else None for c in cands]
     style = scorer.similarities(cands, refs) if scorer is not None else [None] * len(cands)
     return borda_pick(idxs, len_dist, style)
+
+
+# ================================================================== SPEC v18 §6 (human-likeness reranker)
+STYLE_FEATURES = ("lowercase_start", "ends_with_punct", "n_question", "n_exclaim", "upper_ratio")
+
+
+def style_features(text):
+    """SPEC v18 §6.2: the 5 style features (no length): lowercase first letter, sentence-final punctuation, number of
+    question marks, number of exclamation marks, share of uppercase among the letters."""
+    t = (text or "").strip()
+    letters = [ch for ch in t if ch.isalpha()]
+    first = letters[0] if letters else ""
+    return [1.0 if (first and first.islower()) else 0.0,
+            1.0 if (t and t[-1] in ".!?") else 0.0,
+            float(t.count("?")), float(t.count("!")),
+            (sum(1 for ch in letters if ch.isupper()) / len(letters)) if letters else 0.0]
+
+
+def borda_order(info):
+    """The Borda ranking of borda_pick's info: candidate indices sorted by (score, len_rank, index) -- borda_pick's own
+    tie-break, so order[0] is the Borda choice."""
+    rows = sorted(zip(info["score"], info["len_rank"], info["candidates"]))
+    return [c for _, _, c in rows]
+
+
+def borda_top_k(info, k=2):
+    """§6.4 step 2: the k best Borda candidates in Borda order, plus every candidate tied with the k-th on the Borda
+    score. -> list of candidate indices."""
+    score = dict(zip(info["candidates"], info["score"]))
+    order = borda_order(info)
+    top = order[:k]
+    if len(order) > k:
+        kth = score[top[-1]]
+        top += [c for c in order[k:] if score[c] == kth]
+    return top
+
+
+def rerank_choice(info, rerank_scores, k=2):
+    """§6.4 step 3: among borda_top_k, the highest human-likeness score; ties by the Borda score (lower), then the
+    candidate index. rerank_scores: {candidate index: s(x)} (a candidate without a score -- a blank text -- ranks last).
+    -> (chosen index, top-k list)."""
+    score = dict(zip(info["candidates"], info["score"]))
+    top = borda_top_k(info, k)
+    best = min(top, key=lambda c: (-(rerank_scores.get(c) if rerank_scores.get(c) is not None else -1e300),
+                                   score[c], c))
+    return best, top
+
+
+class HumanLikenessScorer:
+    """SPEC v18 §6.2 runtime half of train_reranker.py: phi(x) = [PCA_32(SimCSE(x)), 5 style features], standardised;
+    s(x) = w . phi(x). The SimCSE vector is StyleScorer.embed's (pooler output, normalised, chunked; CPU), the very
+    function the reranker was fitted with. Only the ranking is used (no calibration)."""
+
+    def __init__(self, path, embedder=None):
+        import json
+        self.path = path
+        raw = open(path, "rb").read()
+        import hashlib
+        self.sha256 = hashlib.sha256(raw).hexdigest()
+        d = json.loads(raw.decode("utf-8"))
+        self.meta = d
+        self.mean = d["pca"]["mean"]
+        self.components = d["pca"]["components"]
+        self.f_mean, self.f_std = d["scaler"]["mean"], d["scaler"]["std"]
+        self.w = d["w"]
+        if d.get("features", {}).get("style") != list(STYLE_FEATURES):
+            raise ValueError("reranker %s: style features %r differ from this code's %r"
+                             % (path, d.get("features", {}).get("style"), STYLE_FEATURES))
+        self.gate_passed = bool((d.get("gate") or {}).get("passed"))
+        self.embedder = embedder
+
+    def features(self, texts, embeddings=None):
+        import numpy as np
+        if embeddings is None:
+            embeddings = self.embedder.embed(texts)
+        E = np.asarray(embeddings.tolist() if hasattr(embeddings, "tolist") else embeddings, dtype=np.float64)
+        P = (E - np.asarray(self.mean)) @ np.asarray(self.components).T
+        S = np.asarray([style_features(t) for t in texts], dtype=np.float64)
+        X = np.concatenate([P, S], axis=1)
+        return (X - np.asarray(self.f_mean)) / np.asarray(self.f_std)
+
+    def scores(self, texts):
+        """s(x) per text; None for a blank text."""
+        import numpy as np
+        live = [i for i, t in enumerate(texts) if (t or "").strip()]
+        out = [None] * len(texts)
+        if not live:
+            return out
+        X = self.features([texts[i] for i in live])
+        s = X @ np.asarray(self.w)
+        for i, v in zip(live, s.tolist()):
+            out[i] = float(v)
+        return out
+
+    def describe(self):
+        g = self.meta.get("gate") or {}
+        return {"path": self.path, "sha256": self.sha256, "C": self.meta.get("C"), "gate": g,
+                "n_pairs": self.meta.get("n_pairs"), "embed_model": self.meta.get("embed_model")}
+
+
+def select_rerank(cands, eligible, target_words, refs, scorer, hl_scorer, k=2):
+    """SPEC v18 §6.4: Borda first (select(), unchanged), then the human-likeness reranker chooses among the Borda top-k
+    (ties at the k-th included). -> (chosen index, info): borda_pick's info plus borda_index (the v17 choice), topk,
+    rerank_scores (aligned with info["candidates"], None where not scored), rerank_changed."""
+    b_idx, info = select(cands, eligible, target_words, refs, scorer)
+    top = borda_top_k(info, k)
+    sc = hl_scorer.scores([cands[i] for i in top])
+    rs = dict(zip(top, sc))
+    choice, top2 = rerank_choice(info, rs, k)
+    assert top2 == top
+    info = dict(info, borda_index=b_idx, topk=top, rerank_k=int(k),
+                rerank_scores=[rs.get(c) for c in info["candidates"]], rerank_changed=choice != b_idx,
+                reranker_sha256=hl_scorer.sha256)
+    return choice, info

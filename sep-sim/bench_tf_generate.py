@@ -44,6 +44,12 @@ test evaluation's Task 1 decisions in RUN/test.jsonl and the K+1 probe file).
   python bench_tf_generate.py --final --run-dir RUN --update 0 --fold 2 --planner-path $Q4 --gpu $GPU \
       --out /tmp2/mzjiang_usersim/grpo_planner/bench_eval_f2_v17/generations_u0.jsonl
 --dry-run: a fake env (no GPU, no model) through the same gates, conversion, validation and files (tests).
+
+SPEC v18 §8 (a run whose rl_manifest says spec_version v18): only the FINAL policy of final.json (u0 when GRPO was not
+adopted), its init adapter (the v17 u0, policy sha locked) accepted; the selector is the run's own -- borda_rerank needs
+--reranker, the very json the run trained with (sha == the manifest's) -- and the samples keep the candidate order
+(§6.5: no reordering by the reranker, Q3); the provenance records the reranker sha and its gate result. Method slot
+sep_sim_pend_qwen3_4b_planner_ditto_8b_speaker_v18_fold_2_grpo_rerank_u<k>; intent_variant pend_v18_f<F>_u<k>.
 """
 from __future__ import annotations
 
@@ -65,6 +71,7 @@ BENCH = "/tmp2/hchsu/trec2026-usersim-benchmark"
 BENCH_MANIFEST = "domains/main_dataset_search/folds3_goal_persona_v1.json"
 # sha pins (2026-10-01): the fold manifest every v17 run read (task2_env.BENCH_DATA_SHA256) and the official corpus
 # (final_dataset_curation_v1.jsonl == /home/mzjiang/v5-latency/data.jsonl == the manifest's source_sha256)
+V18_INIT_POLICY_SHA = "f67d643796951c6bac4aeec7ae1e826fb3f34d6139edaaf167d52e57d81e1ac6"
 BENCH_MANIFEST_SHA256 = "b610ba6b3b680e7d28b371f8207383dc4a8cafec0770089cff9533a87bfdec1f"
 CORPUS_SHA256 = "288f0f4ec7404bca0807567ba15a42ca50bae8c3d01b5416c60b6de7d5eac53f"
 DEFAULT_CORPUS = "/home/mzjiang/v5-latency/data.jsonl"       # Task2Env's default: the corpus training / test read
@@ -423,10 +430,15 @@ def load_gates(a):
     fin = json.load(open(fin_p, encoding="utf-8"))
     if not fin.get("validated") or fin.get("final_update") is None:
         raise SystemExit("final.json has no validated final update: %r" % fin)
-    if a.update not in (0, int(fin["final_update"])):
+    ck = os.path.join(run, "ckpt", "u%05d" % a.update)
+    spec = (json.load(open(os.path.join(ck, "rl_manifest.json"), encoding="utf-8")).get("spec_version")
+            if os.path.exists(os.path.join(ck, "rl_manifest.json")) else None)
+    if spec == "v18":
+        if a.update != int(fin["final_update"]):
+            raise SystemExit("--update %d: SPEC v18 evaluates only the final u%d (§8)" % (a.update, fin["final_update"]))
+    elif a.update not in (0, int(fin["final_update"])):
         raise SystemExit("--update %d: only u0 (SFT) and the final u%d were evaluated on the test split (spec v17 §5)"
                          % (a.update, fin["final_update"]))
-    ck = os.path.join(run, "ckpt", "u%05d" % a.update)
     adapter = os.path.join(ck, "adapter")
     for p in (adapter, os.path.join(ck, "rl_manifest.json"), os.path.join(ck, "state.json")):
         if not os.path.exists(p):
@@ -438,8 +450,30 @@ def load_gates(a):
                                                                        str(fin.get("policy_sha"))[:12]))
     if int(man.get("fold", -1)) != a.fold:
         raise SystemExit("LEAK GATE: adapter trained on fold %s, scored on fold %d" % (man.get("fold"), a.fold))
-    if man.get("init_adapter"):
+    rer = None
+    if spec == "v18":
+        # §2: the v17 u0 is the init (sha locked); §6: the run's own selector, the reranker the run trained with
+        if man.get("init_policy_sha") != V18_INIT_POLICY_SHA and not a.dry_run:
+            raise SystemExit("v18 adapter with an unexpected init policy %s" % str(man.get("init_policy_sha"))[:12])
+        if a.selector is None:
+            a.selector = man.get("selector")
+        if man.get("selector") == "borda_rerank":
+            if not a.reranker:
+                raise SystemExit("the run's selector is borda_rerank: pass --reranker (the json it trained with)")
+            if sha_file(a.reranker) != man.get("reranker_sha256"):
+                raise SystemExit("--reranker %s (sha %s) is not the run's reranker %s" % (
+                    a.reranker, sha_file(a.reranker)[:12], str(man.get("reranker_sha256"))[:12]))
+            rj = json.load(open(a.reranker, encoding="utf-8"))
+            rer = {"path": os.path.abspath(a.reranker), "sha256": sha_file(a.reranker), "gate": rj.get("gate"),
+                   "C": rj.get("C"), "rerank_topk": man.get("rerank_topk")}
+        elif a.reranker:
+            raise SystemExit("the run's selector is %r (the reranker did not pass its gate): no --reranker" % man.get("selector"))
+    elif man.get("init_adapter"):
         raise SystemExit("adapter trained on top of init adapter %s" % man["init_adapter"])
+    elif a.reranker or a.selector == "borda_rerank":
+        raise SystemExit("--reranker / borda_rerank exist for a SPEC v18 run only")
+    if a.selector is None:
+        a.selector = "borda"
     splits_sha = sha_file(a.splits)
     if man.get("splits_sha256") != splits_sha:
         raise SystemExit("LEAK GATE: adapter trained with another split file (sha %s, now %s)"
@@ -449,7 +483,7 @@ def load_gates(a):
     forb = set(sp["forbidden_for_training"])
     if not set(test_all) <= forb:
         raise SystemExit("splits fold %d: test_all not inside forbidden_for_training" % a.fold)
-    for k in ("train_scenarios", "train_conversations", "fewshot_pool", "sft_conversations"):
+    for k in ("train_scenarios", "train_conversations", "fewshot_pool", "sft_conversations", "labels_train_conversations"):
         v = man.get(k)
         ids = v if isinstance(v, (list, tuple)) else (list(v) if isinstance(v, dict) else [])
         bad = set(map(str, ids)) & set(test_all)
@@ -493,15 +527,18 @@ def load_gates(a):
             "state_json_sha256": sha_file(os.path.join(ck, "state.json")),
             "rl_manifest_settings": {k: man.get(k) for k in ("arm", "fold", "implicit_profile", "selector", "fewshot",
                                                             "planner_backend", "planner_path", "spec_version")},
+            "spec_version": spec or "v17", "reranker": rer, "rerank_topk": man.get("rerank_topk"),
             "splits_sha256": splits_sha, "test_all": test_all, "fewshot_pool_ids": sorted(sp["train_all"]),
             "bench_manifest_sha256": bm_sha, "bench_fold": {k: bf.get(k) for k in ("fold", "goals", "personas",
                                                                                     "n_sessions", "n_user_turns")},
             "corpus_sha256": c_sha}
 
 
-def code_provenance():
-    out = {f: sha_file(os.path.join(HERE, f)) for f in CODE_FILES if os.path.exists(os.path.join(HERE, f))}
-    lst = os.path.join(HERE, "local_sha_v17.txt")         # the deployed snapshot's own sha list (code_snapshots/pend_v17)
+def code_provenance(spec="v17"):
+    files = CODE_FILES + (("v18_rules.py",) if spec == "v18" else ())
+    out = {f: sha_file(os.path.join(HERE, f)) for f in files if os.path.exists(os.path.join(HERE, f))}
+    # the deployed snapshot's own sha list (code_snapshots/pend_v17 or pend_v18)
+    lst = os.path.join(HERE, "local_sha_v18.txt" if spec == "v18" else "local_sha_v17.txt")
     snap = None
     if os.path.exists(lst):
         bad = []
@@ -542,8 +579,11 @@ def build_env(a, gates):
                          "ours would unload them. Pass --force-unload only if they are not in use." % (a.vllm_url, foreign))
     planner.remote.use_adapter(gates["adapter_dir"], "p%d" % a.update)
     planner.adapter = gates["adapter_dir"]
+    rer = gates.get("reranker")
     env = Task2Env("pend", a.gpu, planner, judge=None, corpus=a.corpus, batch=bool(a.batch), max_batch=a.max_batch,
-                   implicit_profile=bool(a.implicit_profile), selector=a.selector, task1_only=True)
+                   implicit_profile=bool(a.implicit_profile), selector=a.selector, task1_only=True,
+                   reranker=rer["path"] if (rer and a.selector == "borda_rerank") else None,
+                   rerank_topk=int(gates.get("rerank_topk") or 2))
     env.fewshot = make_fewshot_pool(env.recs, gates["fewshot_pool_ids"])
     return env
 
@@ -563,7 +603,9 @@ def parse(argv=None):
     ap.add_argument("--vllm-url", default="http://127.0.0.1:8031/v1")
     ap.add_argument("--gpu", type=int, default=0, help="Ditto-8B's GPU")
     ap.add_argument("--implicit-profile", type=int, choices=(0, 1), default=1)
-    ap.add_argument("--selector", choices=("length", "borda"), default="borda")
+    ap.add_argument("--selector", choices=("length", "borda", "borda_rerank"), default=None,
+                    help="default: the run's own (v17 borda; v18 borda_rerank when its reranker passed the gate)")
+    ap.add_argument("--reranker", default=None, help="v18: the reranker json the run trained with (sha checked)")
     ap.add_argument("--batch", type=int, choices=(0, 1), default=1)
     ap.add_argument("--max-batch", type=int, default=8)
     ap.add_argument("--workers", type=int, default=4, help="conversations in parallel (the test evaluation used 4)")
@@ -581,7 +623,7 @@ def parse(argv=None):
     if not a.dry_run and not a.planner_path:
         ap.error("--planner-path is required")
     if a.intent_variant is None:
-        a.intent_variant = "pend_v17_f%d_u%d" % (a.fold, a.update)
+        a.intent_variant = ("pend_v18_f%d_u%d" if a.reranker else "pend_v17_f%d_u%d") % (a.fold, a.update)
     if a.test_jsonl is None:
         a.test_jsonl = os.path.join(a.run_dir, "test.jsonl")
     return a
@@ -591,7 +633,9 @@ def main(argv=None):
     a = parse(argv)
     t0 = time.time()
     gates = load_gates(a)
-    code, snap = code_provenance()
+    if gates.get("spec_version") == "v18" and a.intent_variant.startswith("pend_v17_"):
+        a.intent_variant = "pend_v18_" + a.intent_variant[len("pend_v17_"):]
+    code, snap = code_provenance(gates.get("spec_version") or "v17")
     if snap and snap["mismatches"] and not a.dry_run:
         raise SystemExit("code differs from the deployed snapshot's sha list: %s" % snap["mismatches"][:5])
     settings = {"update": a.update, "fold": a.fold, "seed": SEED, "planner_temperature": 0.0, "planner_top_p": 1.0,
@@ -600,6 +644,9 @@ def main(argv=None):
                 "selector": a.selector, "fewshot": "fold (splits[fold].train_all)", "batch": a.batch,
                 "max_batch": a.max_batch, "intent_variant": a.intent_variant, "planner_path": a.planner_path,
                 "vllm_url": a.vllm_url, "annotations": "agent-turn annotations set to {} before generation",
+                "spec_version": gates.get("spec_version"), "reranker_sha256": (gates.get("reranker") or {}).get("sha256"),
+                "reranker_gate": (gates.get("reranker") or {}).get("gate"),
+                "samples_order": "the candidate order (no reranker reordering; SPEC v18 §6.5, Q3)",
                 "dry_run": bool(a.dry_run)}
     prov_p, raw_p = a.out + ".provenance.json", a.out + ".raw.jsonl"
     raw_prev = {d["conversation_id"]: d for d in resume_rows(raw_p)}

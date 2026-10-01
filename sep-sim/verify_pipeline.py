@@ -521,8 +521,9 @@ def check_r0_attribution(rows, rep):
     rep._c("trunc.r0_attributed")
 
 
-def check_pend(rows, rep, arm="pend"):
-    """pend: v3 prompt without the goal judge; Planner end = the planned message is the last one."""
+def check_pend(rows, rep, arm="pend", v18=False):
+    """pend: v3 prompt without the goal judge; Planner end = the planned message is the last one. v18=True (a SPEC v18
+    run): every episode must carry clean_v18 (recomputed)."""
     n_end = n_unparsed = 0
     for r in rows:
         for s in r.get("trace") or []:
@@ -562,9 +563,17 @@ def check_pend(rows, rep, arm="pend"):
         if "clean" in r or "episode_counters" in r:
             c = r.get("episode_counters") or {}
             exp = (c.get("r0_len_truncated", 0) == 0 and c.get("r0_empty", 0) == 0 and c.get("judge_empty", 0) == 0
-                   and c.get("judge_unparseable", 0) == 0 and not r.get("emitted_capped_steps")
+                   and c.get("judge_unparseable", 0) == 0 and c.get("judge_error", 0) == 0
+                   and not r.get("emitted_capped_steps")
                    and not r.get("compacted_steps") and (r.get("emitted_user_turns") or 0) > 0)
             rep.ok("pend.clean_flag", r.get("clean") is exp, w, "clean %r but counters %r" % (r.get("clean"), c))
+            # SPEC v18 §3.2: clean_v18 (judge failures do not exclude), next to the v17 flag
+            if "clean_v18" in r or v18:
+                import rl_reward as RR_
+                rep.ok("pend.clean_v18_flag", r.get("clean_v18") is RR_.clean_v18(r), w,
+                       "clean_v18 %r but counters %r / capped %r / compacted %r / turns %r" % (
+                           r.get("clean_v18"), c, r.get("emitted_capped_steps"), r.get("compacted_steps"),
+                           r.get("emitted_user_turns")))
         else:
             rep.ok("pend.clean_flag", False, w, "episode has no clean flag / per-episode counters")
         for s in r.get("trace") or []:
@@ -673,6 +682,18 @@ def adapter_name(rl_dir, pv):
             d, tag = os.path.join(rl_dir, "ckpt", "u%05d" % pv, "adapter"), "p%d" % pv
         _ADAPTER_NAMES[key] = ("%s-%s" % (tag, vllm_planner.sha_dir(d)[:12])) if os.path.isdir(d) else None
     return _ADAPTER_NAMES[key]
+
+
+def meta_spec(meta_path):
+    """The spec_version a train_planner_rl run_meta.jsonl (or a test_meta row) names; None for any other meta."""
+    try:
+        for line in open(meta_path, encoding="utf-8"):
+            if line.strip():
+                r = json.loads(line)
+                return r.get("spec_version") or (r.get("config") or {}).get("spec_version")
+    except (OSError, ValueError):
+        return None
+    return None
 
 
 def spec_version(rl_dir):
@@ -1492,7 +1513,10 @@ def _check_t1prob_file(rl_dir, fname, rep, real_vllm):
 
 def check_rl(rl_dir, rollouts, ckpt_pattern, rep, splits_path=None):
     check_intervention(rl_dir, rep)
-    if spec_version(rl_dir) == "v17":
+    if spec_version(rl_dir) == "v18":
+        import verify_v18
+        verify_v18.check_v18(rl_dir, rep, splits_path)
+    elif spec_version(rl_dir) == "v17":
         check_v17(rl_dir, rep, splits_path)
     else:
         check_v16(rl_dir, rep, splits_path)
@@ -1569,7 +1593,8 @@ def verify(episodes, meta_path, splits_path, fold, split, arm=None, training=Fal
         files = sorted(p for p in glob.glob(os.path.join(rl_dir, "rollouts*.jsonl")) + glob.glob(os.path.join(rl_dir, "rollouts", "*.jsonl"))
                        if not os.path.basename(p).startswith("rollouts_task1"))
         t1p = os.path.join(rl_dir, "rollouts_task1.jsonl")
-        v17 = spec_version(rl_dir) == "v17"
+        v17 = spec_version(rl_dir) in ("v17", "v18")
+        v18_run = spec_version(rl_dir) == "v18"
         if os.path.exists(t1p):
             folds = {int(f["fold"]): f for f in splits["folds"]}
             f = folds.get(fold, {})
@@ -1581,7 +1606,9 @@ def verify(episodes, meta_path, splits_path, fold, split, arm=None, training=Fal
                        w, "Task 1 training group on a non-train conversation")
                 rep.ok("rl.task1_groups", r.get("real_final") == (r.get("t") == r.get("n_real")) and r.get("samples"), w,
                        "real_final must be exactly t == n_real, with samples")
-                rep.ok("rl.task1_groups", (r.get("t") or 0) >= 2, w, "Task 1 stop group at turn 1 (cannot end)")
+                # SPEC v18 §3.1: Task 1 groups at t = 1..n (turn 1: act / length / format only)
+                rep.ok("rl.task1_groups", (r.get("t") or 0) >= (1 if v18_run else 2), w,
+                       "Task 1 stop group at turn 1 (cannot end)")
                 for x in r.get("samples") or []:
                     g = x.get("planner_gen") or {}
                     valid = x.get("decision_valid", True)
@@ -1611,18 +1638,22 @@ def verify(episodes, meta_path, splits_path, fold, split, arm=None, training=Fal
             rep.note("%s.system_prompt_sha" % arm, "expected sha recomputed from sepsim")
     check_system_sha(meta, arm, expected_sha, rep)
     check_leakage(all_rows, splits, fold, split, training, rep)
+    v18 = (rl_dir and spec_version(rl_dir) == "v18") or meta_spec(meta_path) == "v18"
     if arm == "pend":
         check_fewshot_leak(all_rows, splits, fold, rep)
         if not training:
             # evaluation: an unclean episode (cut R0 reply, lost ledger verdict, capped emission, compaction)
-            # has a wrong coverage/turn count and cannot be silently averaged in -- rerun it
+            # has a wrong coverage/turn count and cannot be silently averaged in -- rerun it. SPEC v18 §3.2: a v18
+            # evaluation is judged by clean_v18 (a lost ledger verdict only makes its coverage None)
+            key = "clean_v18" if v18 else "clean"
             for r in rows:
-                rep.ok("eval.clean", r.get("clean") is True, "%s s%s" % (str(r.get("conversation_id"))[:12], r.get("seed")),
-                       "evaluation episode is not clean: %r" % (r.get("episode_counters"),))
+                rep.ok("eval.clean", r.get(key) is True, "%s s%s" % (str(r.get("conversation_id"))[:12], r.get("seed")),
+                       "evaluation episode is not %s: %r" % (key, r.get("episode_counters"),))
     check_structure(all_rows, arm, rep)
     sb = speaker_budget or meta.get("speaker_budget") or F.SPEAKER_BUDGET
     check_truncation(all_rows, arm, meta, sb, judge_budget, max_new_warn, rep)
-    {"a2": check_a2, "pend": check_pend, "a0": check_a0}[check_family(arm)](all_rows, rep, arm)
+    pend_kw = {"v18": bool(v18)} if arm == "pend" else {}
+    {"a2": check_a2, "pend": check_pend, "a0": check_a0}[check_family(arm)](all_rows, rep, arm, **pend_kw)
     if rl_dir:
         check_rl(rl_dir, rollouts, ckpt_pattern, rep, splits_path)
         check_vllm_generation(rl_dir, rollouts, meta, rep)
@@ -1634,7 +1665,7 @@ def verify(episodes, meta_path, splits_path, fold, split, arm=None, training=Fal
             if vrows:
                 check_structure(vrows, arm, rep)
                 check_truncation(vrows, arm, meta, sb, judge_budget, max_new_warn, rep)
-                {"a2": check_a2, "pend": check_pend, "a0": check_a0}[check_family(arm)](vrows, rep, arm)
+                {"a2": check_a2, "pend": check_pend, "a0": check_a0}[check_family(arm)](vrows, rep, arm, **pend_kw)
                 if arm == "pend":
                     check_fewshot_leak(vrows, splits, fold, rep)
             check_selection(vp, rl_dir, rep)
@@ -1679,7 +1710,7 @@ def check_endpoints(meta, rep):
 def check_selection(vp, rl_dir, rep):
     """validation summaries: D5 settings, the selection score recomputed from its logged parts, best = argmax.
     v16 branch only (v17 B8: a v17 run selects nothing; its validation schedule is checked in check_v17)."""
-    if spec_version(rl_dir) == "v17":
+    if spec_version(rl_dir) in ("v17", "v18"):
         return
     summ = [json.loads(l) for l in open(vp, encoding="utf-8") if l.strip() and json.loads(l).get("kind") == "summary"]
     meta0 = _jl(os.path.join(rl_dir, "run_meta.jsonl"))[:1]
@@ -1777,7 +1808,7 @@ def check_rl_selection(rl_dir, splits, fold, rep):
     v17 (B8): Task 2 episodes on validation, Task 1 rows on validation_all; no best.json / re-selection."""
     folds = {int(f["fold"]): f for f in splits["folds"]}
     f = folds.get(fold, {})
-    v17 = spec_version(rl_dir) == "v17"
+    v17 = spec_version(rl_dir) in ("v17", "v18")          # v18: the same validation layout, no best.json
     val, train_all = set(f.get("validation", [])), set(f.get("train_all", f.get("train", [])))
     val_all = set(f.get("validation_all", f.get("validation", []))) if v17 else val
     vp = os.path.join(rl_dir, "validation.jsonl")
@@ -1797,7 +1828,7 @@ def check_rl_selection(rl_dir, splits, fold, rep):
     if v17:
         rep.ok("rl.best", not os.path.exists(os.path.join(rl_dir, "best.json"))
                and not os.path.exists(os.path.join(rl_dir, "reselect.jsonl")), rl_dir,
-               "a v17 run has best.json / reselect.jsonl (no checkpoint selection in v17)")
+               "a v17 / v18 run has best.json / reselect.jsonl (v17: no selection; v18: final.json holds it)")
     else:
         rep.ok("rl.best", os.path.exists(os.path.join(rl_dir, "best.json")), rl_dir, "best.json missing")
         check_reselect_ids(rl_dir, val, train_all, rep)

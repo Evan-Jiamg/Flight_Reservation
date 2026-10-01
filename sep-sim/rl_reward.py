@@ -24,6 +24,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import math
 
 ASSESSED = ("SATISFIED", "PARTIAL", "NOT")
 CONSTRAINTS = ("unparsed", "hit_max_new", "no_survivor", "judge_unknown")
@@ -275,6 +276,240 @@ def reward(episode, cfg, ctx=None):
             raise ValueError("reward v4 needs ctx={'p_h': ..., 'q': ...}")
         return reward_v4(episode, cfg, ctx)
     return reward_v3(episode, cfg) if v == "v3" else reward_v2(episode, cfg)
+
+
+# ================================================================== SPEC v18 (ops/SPEC_v18_multiobj_rerank.md)
+# Pure python; the act rules use the E1.6 tree's own sepsim.acts (normalise, COARSE_ORDER), loaded by load_acts() -- the
+# trainer, the verifier and the labeller all call these functions, so r_act / r_len are recomputed with the SAME code.
+V18_MOVES = ("Disclose", "Reveal", "Inquire", "Navigate", "Note")        # A: the five non-closing moves (§3.1.2)
+V18_Q7 = ("Disclose", "Reveal", "Inquire", "Navigate", "Note", "Complete", "Other")
+_ACTS = {}
+
+
+def load_acts():
+    """The sepsim.acts module of the E1.6 tree (cf19400). Already importable in a run (task2_env puts the tree on sys.path);
+    else from $E1R_TREE, the server tree, or the local audit snapshot ../audit_e1r. -> module (cached)."""
+    if "m" in _ACTS:
+        return _ACTS["m"]
+    import importlib
+    import os
+    import sys
+    try:
+        m = importlib.import_module("sepsim.acts")
+    except ImportError:
+        here = os.path.dirname(os.path.abspath(__file__))
+        for root in (os.environ.get("E1R_TREE"), "/tmp2/mzjiang_usersim/grpo_planner/trees/e1r_cf19400",
+                     os.path.join(here, "..", "audit_e1r")):
+            if root and os.path.isfile(os.path.join(root, "sepsim", "acts.py")):
+                sys.path.insert(0, os.path.abspath(root))
+                break
+        m = importlib.import_module("sepsim.acts")
+    _ACTS["m"] = m
+    return m
+
+
+def acts_sha():
+    import os
+    m = load_acts()
+    return hashlib.sha256(open(m.__file__, "rb").read()).hexdigest() if os.path.isfile(m.__file__) else None
+
+
+def _float_or_none(x):
+    try:
+        v = float(x)
+    except (TypeError, ValueError):
+        return None
+    return v if math.isfinite(v) else None
+
+
+def act_entries(dist):
+    """§3.1.2 drop rules 1-2, exactly as E1.6 sample_act: the entries of an act_distribution that are dicts, whose
+    (move, act) normalise without turning a non-"other" act into "other", and whose p converts to float.
+    -> [(move, act, p, raw entry)] (p may be <= 0)."""
+    acts = load_acts()
+    out = []
+    for e in (dist if isinstance(dist, list) else []):
+        if not isinstance(e, dict):
+            continue
+        mv, ac = acts.normalise(str(e.get("move", "")), str(e.get("act", "")))
+        if ac == "other" and str(e.get("act", "")).strip().lower() != "other":
+            continue
+        p = _float_or_none(e.get("p"))
+        if p is None:
+            continue
+        out.append((mv, ac, p, e))
+    return out
+
+
+def act_dist_parseable(dist):
+    """§3.1.5 (turn 1): at least one act_distribution entry survives the drop rules."""
+    return bool(act_entries(dist))
+
+
+def plan_act_probs(dist):
+    """§3.1.2: the plan's distribution p over A = the five non-closing moves (rules 1-4: drop, p <= 0 not counted, the
+    same move's entries summed, A only, renormalised); A-mass 0 -> the uniform distribution (fallback True).
+    -> (dict move -> p, fallback)."""
+    mass = {m: 0.0 for m in V18_MOVES}
+    for mv, _ac, p, _e in act_entries(dist):
+        if p > 0 and mv in mass:
+            mass[mv] += p
+    tot = sum(mass.values())
+    if tot <= 0:
+        return {m: 1.0 / len(V18_MOVES) for m in V18_MOVES}, True
+    return {m: v / tot for m, v in mass.items()}, False
+
+
+def label_majority(q7):
+    """The majority move of a soft label (most votes; ties broken by acts.COARSE_ORDER). None for an empty label."""
+    order = load_acts().COARSE_ORDER
+    best = None
+    for m in order:
+        v = float((q7 or {}).get(m, 0.0))
+        if v > 0 and (best is None or v > best[1]):
+            best = (m, v)
+    return best[0] if best else None
+
+
+def human_act_probs(q7):
+    """§3.1.2: the human's q = q7 without Complete / Other, renormalised over A; None when nothing is left."""
+    q = {m: float((q7 or {}).get(m, 0.0)) for m in V18_MOVES}
+    tot = sum(q.values())
+    return {m: v / tot for m, v in q.items()} if tot > 0 else None
+
+
+def r_act_of(dist, label, t, n):
+    """§3.1.2 r_act = 1 - 1/2 sum_{m in A} (p(m) - q(m))^2 of one plan. label: {"q7", "n_valid_votes"} (None = no label).
+    -> (value or None, skip reason or None, uniform fallback used)."""
+    if label is None or int(label.get("n_valid_votes", 0)) < 2:
+        return None, "votes", False
+    if t >= n:
+        return None, "final", False
+    maj = label_majority(label.get("q7"))
+    if maj == "Complete":
+        return None, "complete", False
+    if maj == "Other" or maj is None:
+        return None, "other", False
+    q = human_act_probs(label["q7"])
+    if q is None:
+        return None, "other", False
+    p, fb = plan_act_probs(dist)
+    return 1.0 - 0.5 * sum((p[m] - q[m]) ** 2 for m in V18_MOVES), None, fb
+
+
+def plan_length_for(dist, move):
+    """§3.1.3: the FIRST act_distribution entry whose normalised move is `move` and whose length_words converts to a
+    positive integer (round), matched as read_plan_v3 matches. -> int or None."""
+    acts = load_acts()
+    for e in (dist if isinstance(dist, list) else []):
+        if not isinstance(e, dict):
+            continue
+        mv, _ac = acts.normalise(str(e.get("move", "")), str(e.get("act", "")))
+        if mv != move:
+            continue
+        v = _float_or_none(e.get("length_words"))
+        if v is None:
+            continue
+        lw = int(round(v))
+        if lw > 0:
+            return lw
+    return None
+
+
+def r_len_of(dist, label, human_words, band=2.0 / 3.0):
+    """§3.1.3 r_len = min(1, rho / rho0), rho = min(l+1, L*+1) / max(l+1, L*+1), l = the plan length of the human's
+    majority move m*. -> (value or None, skip reason or None): None/"votes" (< 2 valid votes), None/"other" (m* Other),
+    0.0/"missing" (no entry of m* with a positive length)."""
+    if label is None or int(label.get("n_valid_votes", 0)) < 2:
+        return None, "votes"
+    maj = label_majority(label.get("q7"))
+    if maj is None or maj == "Other":
+        return None, "other"
+    lw = plan_length_for(dist, maj)
+    if lw is None:
+        return 0.0, "missing"
+    a, b = lw + 1.0, float(human_words) + 1.0
+    rho = min(a, b) / max(a, b)
+    return min(1.0, rho / float(band)), None
+
+
+def act_entropy(dist):
+    """Entropy (nats) of the plan's distribution over A (the uniform fallback included)."""
+    p, _ = plan_act_probs(dist)
+    return -sum(v * math.log(v) for v in p.values() if v > 0)
+
+
+def task1_components(sample, t, n, label, human_words, band=2.0 / 3.0):
+    """SPEC v18 §3.1 / §3.1.5: the reward components of ONE Task 1 sample (a task2_env.task1_sample row, already scored:
+    status in valid / dropped / invalid and, at t >= 2 and valid, p_end). -> {"r_stop", "r_act", "r_len", "r_fmt"} with
+    None = "not applicable", plus "skip" reasons. A dropped sample has no component at all (no gradient)."""
+    st = sample.get("status")
+    out = {"r_stop": None, "r_act": None, "r_len": None, "r_fmt": None, "skip": {}}
+    if st == "dropped":
+        return out
+    if st == "invalid":
+        out["r_fmt"] = 0.0
+        return out
+    if st != "valid":
+        raise ValueError("Task 1 sample status %r" % st)
+    out["r_fmt"] = 1.0
+    if t >= 2:
+        pe = sample.get("p_end")
+        if pe is None:
+            raise ValueError("a valid t >= 2 sample without P_end")
+        y = 1.0 if t == n else 0.0
+        out["r_stop"] = 1.0 - (float(pe) - y) ** 2
+    dist = sample.get("act_distribution_raw")
+    ra, why_a, fb = r_act_of(dist, label, t, n)
+    out["r_act"] = ra
+    if why_a:
+        out["skip"]["act"] = why_a
+    out["uniform_fallback"] = bool(fb)
+    rl, why_l = r_len_of(dist, label, human_words, band)
+    out["r_len"] = rl
+    if why_l:
+        out["skip"]["len"] = why_l
+    return out
+
+
+def r_fmt2_of(episode):
+    """§3.2 r_fmt2 = 1 - (steps that are unparsed, capped or without a guard survivor) / decision steps (a step counted
+    once when several hold)."""
+    trace, n = _steps(episode)
+    if n == 0:
+        raise ValueError("episode without decision steps")
+    bad = sum(1 for s in trace if s.get("planner_unparsed") or s.get("planner_hit_max_new") or s.get("no_survivor"))
+    return 1.0 - bad / n
+
+
+def reward_v5(episode, t_max=10, w_cov=0.0):
+    """SPEC v18 §3.2 Task 2 components: r_turn = 1 - |T - min(H, t_max)| / t_max and r_fmt2; coverage is a diagnostic
+    only (w_cov 0, §17 Q8 (a)) -- a judge failure makes it None. -> {"r_turn", "r_fmt2", "coverage_diag"}."""
+    if float(w_cov) != 0.0:
+        raise ValueError("reward v5: w_cov must be 0 (SPEC v18 §17 Q8 (a): coverage is a diagnostic only)")
+    if "human_turns" not in episode:
+        raise ValueError("reward v5 needs episode['human_turns']")
+    T, H = int(episode["emitted_user_turns"]), int(episode["human_turns"])
+    tm = int(t_max)
+    return {"r_turn": 1.0 - abs(T - min(H, tm)) / float(tm), "r_fmt2": r_fmt2_of(episode),
+            "coverage_diag": coverage_diag(episode), "turns": T, "human_turns": H}
+
+
+def coverage_diag(episode):
+    """§3.2: the Ledger coverage as a diagnostic; None when a ledger verdict was lost (judge_empty / unparseable / error)."""
+    c = episode.get("episode_counters") or {}
+    if c.get("judge_empty", 0) or c.get("judge_unparseable", 0) or c.get("judge_error", 0):
+        return None
+    cov = episode.get("coverage")
+    return None if cov is None else float(cov)
+
+
+def clean_v18(episode):
+    """§3.2 clean_v18 recomputed from an episode row: no cut / empty R0 reply, no emitted capped message, no compacted
+    step, at least one emitted turn (the ledger-judge counters are recorded only)."""
+    c = episode.get("episode_counters") or {}
+    return (c.get("r0_len_truncated", 0) == 0 and c.get("r0_empty", 0) == 0 and not episode.get("emitted_capped_steps")
+            and not episode.get("compacted_steps") and int(episode.get("emitted_user_turns") or 0) > 0)
 
 
 AGG_KEYS = {"v2": ["goal", "over_continue", "early_stop", "decision_steps"],

@@ -185,6 +185,9 @@ def episode_samples(episode, policy_version=None):
                     "note_mask": list(g["note_mask"]) if g.get("note_mask") is not None else None,
                     # v17 S2: the tokens before the end_session value (Task 1 samples with a located value)
                     "prefix_mask": list(g["prefix_mask"]) if g.get("prefix_mask") is not None else None,
+                    # SPEC v18 §4.4: the plan advantage's mask and the turn-1 value mask (Task 1 samples)
+                    "plan_mask": list(g["plan_mask"]) if g.get("plan_mask") is not None else None,
+                    "value_mask": list(g["value_mask"]) if g.get("value_mask") is not None else None,
                     "behav_logp": list(g["gen_logprobs"]) if g.get("gen_logprobs") is not None else None,
                     "gen_adapter": g.get("gen_adapter")})
     return out
@@ -216,16 +219,162 @@ def token_advantages(s, n_tokens):
     a, ap, ast = float(s.get("adv") or 0.0), float(s.get("adv_prefix") or 0.0), float(s.get("adv_stop") or 0.0)
     if ap and pm is None:
         raise AssertionError("adv_prefix without a prefix_mask")
+    # SPEC v18 §4.4: A_plan on plan_mask = the whole plan minus the end_session value tokens (the stop_mask at t >= 2, the
+    # turn-1 value_mask at t = 1); never on a value token
+    apl = float(s.get("adv_plan") or 0.0)
+    plm, vm = mask("plan_mask"), mask("value_mask")
+    if apl and plm is None:
+        raise AssertionError("adv_plan without a plan_mask")
+    for other, name in ((sm, "stop_mask"), (vm, "value_mask")):
+        if plm is not None and other is not None and any(x and y for x, y in zip(plm, other)):
+            raise AssertionError("plan_mask overlaps the %s (a value token would get the plan advantage)" % name)
     out = []
     for i in range(n_tokens):
         keep = 1.0 - (note[i] if note is not None else 0.0)
         v = a * keep
         if pm is not None:
             v += ap * pm[i] * keep
+        if plm is not None:
+            v += apl * plm[i] * keep
         if sm is not None:
             v += ast * sm[i]
         out.append(v)
     return out
+
+
+# ------------------------------------------------------------------ SPEC v18 §4 (fixed scales, token-weighted kappa)
+SPREAD_EPS = 1e-6
+
+
+def plan_mask_of(n_tokens, value_mask=None):
+    """SPEC v18 §4.4: 1 on every generated token except the end_session value tokens (value_mask = the stop_mask at
+    t >= 2 or the turn-1 value mask); all ones without a mask (an invalid plan)."""
+    if value_mask is None:
+        return [1] * int(n_tokens)
+    if len(value_mask) != n_tokens:
+        raise AssertionError("value mask length %d != %d generated tokens" % (len(value_mask), n_tokens))
+    return [0 if v else 1 for v in value_mask]
+
+
+def centre(values):
+    """§3.3 / §4.1: group-centred values of one component. values: per member the component or None (not applicable).
+    -> (c list with None where not applicable, has_spread). < 2 applicable members -> every c None (the component is 0
+    in this group)."""
+    idx = [i for i, v in enumerate(values) if v is not None]
+    if len(idx) < 2:
+        return [None] * len(values), False
+    xs = [float(values[i]) for i in idx]
+    m = sum(xs) / len(xs)
+    out = [None] * len(values)
+    for i in idx:
+        out[i] = float(values[i]) - m
+    return out, (max(xs) - min(xs)) > SPREAD_EPS
+
+
+def measure_scales(groups, keys, min_groups, min_scale, fixed=None):
+    """SPEC v18 §4.1 items 1-4: on the measurement batch, per component k the scale s_k = mean |c_k,i| over the applicable
+    members of the groups in which k has spread (max - min > 1e-6); fixed = {k: s} components that are not measured
+    (r_fmt, r_fmt2: 0.5). groups: list of groups, a group = list of member dicts {k: value or None}. min_groups: {k: n}
+    (a component with fewer spread groups is frozen), min_scale: s_k < min_scale is frozen.
+    -> {k: {"scale", "n_spread_groups", "n_groups", "n_values", "frozen", "why"}}."""
+    fixed = dict(fixed or {})
+    out = {}
+    for k in keys:
+        if k in fixed:
+            out[k] = {"scale": float(fixed[k]), "n_spread_groups": None, "n_groups": len(groups), "n_values": None,
+                      "frozen": False, "why": "fixed"}
+            continue
+        absc, n_sp = [], 0
+        for g in groups:
+            c, sp = centre([m.get(k) for m in g])
+            if sp:
+                n_sp += 1
+                absc += [abs(x) for x in c if x is not None]
+        s = (sum(absc) / len(absc)) if absc else 0.0
+        why = None
+        if n_sp < int(min_groups[k]):
+            why = "spread_groups %d < %d" % (n_sp, int(min_groups[k]))
+        elif s < float(min_scale):
+            why = "scale %.6g < %g" % (s, float(min_scale))
+        out[k] = {"scale": s, "n_spread_groups": n_sp, "n_groups": len(groups), "n_values": len(absc),
+                  "frozen": why is not None, "why": why}
+    return out
+
+
+def fixed_scale_z(group, keys, scales, frozen, z_clip):
+    """SPEC v18 §4.2: per member c_k (group-centred, §3.3) and z_k = clip(c_k / s_k, -z_clip, z_clip); a frozen or
+    not-applicable component has z 0. -> (rows [{"c": {k}, "z": {k}, "clipped": {k}}], spread {k: bool})."""
+    cs, spread = {}, {}
+    for k in keys:
+        cs[k], spread[k] = centre([m.get(k) for m in group])
+    rows = []
+    for i in range(len(group)):
+        c, z, cl = {}, {}, {}
+        for k in keys:
+            ci = cs[k][i]
+            c[k] = ci
+            if ci is None or k in frozen:
+                z[k], cl[k] = 0.0, False
+                continue
+            raw = ci / float(scales[k])
+            z[k] = max(-float(z_clip), min(float(z_clip), raw))
+            cl[k] = abs(raw) > float(z_clip)
+        rows.append({"c": c, "z": z, "clipped": cl})
+    return rows, spread
+
+
+# the name SPEC v18 §18 item 3 uses (z per component; the weights and kappa are combined in v18_rules.advantages_t1 / _t2)
+fixed_scale_advantages = fixed_scale_z
+
+
+def token_weighted_tau(samples, sources=("task1", "task2")):
+    """SPEC v18 §4.3: tau_src = sum over the source's samples and generated tokens of |a_tok| / their generated tokens
+    (token_advantages, the learner's own function: masks and note applied; zero tokens count in the denominator).
+    -> {src: {"tau", "n_tokens", "n_nonzero", "sum_abs"}}."""
+    out = {}
+    for src in sources:
+        tot, n, nz = 0.0, 0, 0
+        for s in samples:
+            if s.get("source") != src:
+                continue
+            a = token_advantages(s, len(s["gen_ids"]))
+            tot += sum(abs(x) for x in a)
+            n += len(a)
+            nz += sum(1 for x in a if x != 0.0)
+        out[src] = {"tau": (tot / n) if n else 0.0, "n_tokens": n, "n_nonzero": nz, "sum_abs": tot}
+    return out
+
+
+def calibrate_kappa(tau1, tau2, target1, target2):
+    """SPEC v18 §4.3: kappa_src = target_src / tau_src(kappa = 1). No fallback: tau = 0 is a program error (the freezing
+    rules guarantee a Task 1 and a Task 2 spread) -> AssertionError."""
+    if not (tau1 > 0) or not (tau2 > 0):
+        raise AssertionError("token-weighted tau(kappa=1) is 0 (task1 %r, task2 %r): a program error (SPEC v18 §4.3)"
+                             % (tau1, tau2))
+    return float(target1) / float(tau1), float(target2) / float(tau2)
+
+
+def batch_ids(task2_rows, task1_rows):
+    """The measurement batch's row identities, sorted: Task 2 (update, slot, replicate, policy_sha, time), Task 1
+    (update, conversation_id, t, policy_sha, time)."""
+    return sorted([["task2", r["update"], r["slot"], r["replicate"], r["policy_sha"], r["time"]] for r in task2_rows],
+                  key=lambda x: json_key(x)) + \
+        sorted([["task1", r["update"], r["conversation_id"], r["t"], r["policy_sha"], r["time"]] for r in task1_rows],
+               key=lambda x: json_key(x))
+
+
+def fingerprint_of_ids(ids):
+    return hashlib.sha256(json_key(ids).encode()).hexdigest()
+
+
+def batch_fingerprint(task2_rows, task1_rows):
+    """SPEC v18 §4.1 item 5: sha256 of the canonical JSON of the measurement batch's row identities (batch_ids)."""
+    return fingerprint_of_ids(batch_ids(task2_rows, task1_rows))
+
+
+def json_key(x):
+    import json
+    return json.dumps(x, sort_keys=True, separators=(",", ":"))
 
 
 def aux_split(n_aux, order, k):

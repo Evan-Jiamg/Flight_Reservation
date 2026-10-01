@@ -384,7 +384,8 @@ Task 1 的逐樣本 advantage 紀錄與 `rollouts*.jsonl` 的遮罩重建每個 
 1. **候選集合**：u ∈ {1..最後完成的 update}，同時滿足：
    - `nll(u) ≤ nll(u0) + 0.05`；`act_score(u) ≥ act_score(u0) − 0.02`；`len_score(u) ≥ len_score(u0) − 0.05`；
    - `act_entropy(u) ≥ 0.5 · act_entropy(u0)`（防 act 分布塌縮）；`n_invalid(u) ≤ n_invalid(u0) + 1`；
-   - 該 update 沒有觸發長度漂移。
+   - 該 update 沒有觸發長度漂移。（實作註記，稽核 B NIT 1：「觸發」指 §5 的長度漂移停止規則在 u 觸發，即 u−1 與 u 兩次
+     update 的 mean(T − min(H, 10)) 都 < −1.0；單一 update 的訓練 rollout 漂移量的是 π_{u−1}，不據此排除 u。`v18_rules.drift_stop_at`。）
 2. **分數** `J(u) = Σ_k w_k · (s_k(u) − s_k(u0))`，s = (stop_score, act_score, len_score)，w 同 §3.4 的 Task 1 權重（1, 1, 0.5）；
    三者都是越高越好，所以 J 越大越好。選 J 最大者，同分取較晚的 update。
    **J 與守門一律用名目權重**（1, 1, 0.5），即使 r_len 在訓練中被凍結（§4.1）：validation 仍要量長度，凍結只表示訓練沒有用它。

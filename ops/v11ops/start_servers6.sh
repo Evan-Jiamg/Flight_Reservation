@@ -20,6 +20,8 @@
 # re-planned at most MAX_SAME_RACE (3) times per server + GPU. Any other failure (model path, config, a memory error
 # with no other process involved) -> exit 1.  Exit 0 = both servers up.
 # SS6_LIB=1: only define the functions (test_start_servers6.py sources this file).
+# OSS_ONLY=1 (SPEC v18 labelling, audit A): only gpt-oss is needed -- exit 0 as soon as gpt-oss is up; the Planner vLLM is
+# not started (its share stays with the placeholder).
 G=/tmp2/mzjiang_usersim/grpo_planner; H=${HOLD_DIR:-$G/hold}   # HOLD_DIR: only for a cut-over next to an old placeholder
 PYDIR=/home/mzjiang/miniconda3/envs/consistent-test/bin
 R=/tmp2/mzjiang_usersim/r0_vllm; Q=/tmp2/mzjiang_usersim/planner_vllm
@@ -218,6 +220,7 @@ Q4=$(ls -d /tmp2/hf_shared/hub/models--Qwen--Qwen3-4B-Instruct-2507/snapshots/*/
 holder_alive
 while true; do
   OUP=0; PUP=0; up 8029 gpt-oss-120b && OUP=1; up 8031 planner-base && PUP=1
+  [ "${OSS_ONLY:-0}" = 1 ] && [ $OUP = 1 ] && { echo "gpt-oss up (OSS_ONLY: no planner vLLM)"; exit 0; }
   if [ ! -f $H/role_train ]; then
     if hint; then
       echo "servers already up: gpt-oss on GPU $(gpu_of $R), planner vLLM on GPU $(gpu_of $Q) (placeholder plans the training GPU only)"; exit 0; fi
@@ -237,6 +240,7 @@ while true; do
     [ $rc = 0 ] || exit 1
   fi
   echo "gpt-oss up"
+  [ "${OSS_ONLY:-0}" = 1 ] && { echo "OSS_ONLY: the planner vLLM is not started"; exit 0; }
   if [ $PUP = 0 ]; then
     start_server planner $PG; rc=$?
     [ $rc = 75 ] && { request_replan; continue; }

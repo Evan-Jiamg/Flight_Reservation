@@ -34,6 +34,175 @@ def ok(cond, msg):
     return cond
 
 
+
+
+def boot_v18(run, meta, first):
+    """SPEC v18 §8: check the v18 test rows (the final policy only, clean_v18, the coverage diagnostic over the non-null
+    episodes) and compare with v17's existing test rows -- v17 SFT (u0) and v17 GRPO (u5), read from the file test_meta
+    names (its sha must not have changed). Paired bootstrap by conversation (Task 2 paired on (conversation, seed) pairs
+    clean in both: v18 clean_v18, v17 its own clean), 10000 resamples, seed 0. Report wording: v17 SFT (u0), v17 GRPO
+    (u5), v18 (GRPO+R)."""
+    import v18_rules as V18
+    fails_ = []
+
+    def ok_(c, m):
+        if not c:
+            fails_.append(m)
+            print("FAIL", m)
+        return c
+    args_ = first["config"]["args"]
+    ok_(TP.sha_file(args_["splits"]) == first["splits_sha256"] == meta["splits_sha256"], "splits sha")
+    fold_ = {int(f["fold"]): f for f in json.load(open(args_["splits"], encoding="utf-8"))["folds"]}[int(args_["fold"])]
+    test_, test_all_ = sorted(fold_["test"]), sorted(fold_["test_all"])
+    ok_(meta["task2_ids"] == test_ and meta["task1_ids"] == test_all_, "meta ids differ from splits test / test_all")
+    for k in ("train", "train_all", "validation", "validation_all"):
+        ok_(not set(test_all_) & set(fold_.get(k) or []), "test_all intersects %s" % k)
+    here = os.path.dirname(os.path.abspath(__file__))
+    for f_ in ("eval_test_rl.py", "eval_test_boot.py"):
+        ok_((meta.get("eval_code_sha256") or {}).get(f_) == TP.sha_file(os.path.join(here, f_)), "%s changed" % f_)
+    fp_ = os.path.join(run, "final.json")
+    fin_ = json.load(open(fp_)) if os.path.exists(fp_) else {}
+    fu_ = fin_.get("final_update")
+    ok_(meta.get("final_json_sha256") == TP.sha_file(fp_), "final.json changed after the test")
+    ok_(meta["updates"] == [fu_] and not meta.get("include_base"), "tested updates %r (v18: [final])" % meta["updates"])
+    ref = meta.get("v17_reference") or {}
+    ok_(os.path.exists(ref.get("test_jsonl", "")) and TP.sha_file(ref["test_jsonl"]) == ref.get("test_jsonl_sha256"),
+        "the v17 comparison file changed / missing")
+    if fails_:
+        print("TEST CHECK FAILED (%d)" % len(fails_))
+        sys.exit(1)
+    t_max = int(first["config"]["selection_cfg"]["t_max"])
+    seeds_ = meta["seeds"]
+    rows18 = [r for r in TP.read_jsonl(os.path.join(run, "test.jsonl"))]
+    rows17 = [r for r in TP.read_jsonl(ref["test_jsonl"])]
+    g17 = int(ref.get("grpo_update", 5))
+    grpo_name = "v17 GRPO (u%d)" % g17
+    pols = {"v18 (GRPO+R)": (rows18, fu_, "clean_v18"), "v17 SFT (u0)": (rows17, int(ref.get("sft_update", 0)), "clean"),
+            grpo_name: (rows17, g17, "clean")}
+    import verify_v18 as VV
+    real_vllm = args_.get("planner_backend") == "vllm" and not args_.get("dry_run")
+    # audit B (SHOULD 2): v17's checks for the v18 rows -- policy sha from ckpt u's state.json, served adapters,
+    # the unscored-point rule, sum(n - 1) probe points
+    for msg in VV.check_test_rows(run, rows18, fu_, set(test_), set(test_all_), list(seeds_), real_vllm):
+        ok_(False, "v18 (GRPO+R): " + msg)
+    ok_({r.get("update") for r in rows18 if r.get("kind")} <= {fu_}, "v18 test rows of another update than the final")
+    eps_, t1_ = {}, {}
+    for name, (rows, u, ck) in pols.items():
+        summ = [r for r in rows if r.get("kind") == "summary" and r.get("update") == u]
+        ok_(len(summ) >= 1, "%s: no test summary" % name)
+        if name.startswith("v18"):
+            psha = json.load(open(os.path.join(run, "ckpt", "u%05d" % fu_, "state.json")))["policy_sha"]
+        else:
+            psha = summ[-1]["policy_sha"] if summ else None
+        e, t = {}, {}
+        for r in rows:
+            if r.get("update") != u or r.get("policy_sha") != psha:
+                continue
+            if r.get("kind") == "episode":
+                e[(r["conversation_id"], r["seed"])] = r["episode"]
+            elif r.get("kind") == "task1":
+                t[r["conversation_id"]] = r
+        ok_(sorted(e) == sorted((c, s_) for c in test_ for s_ in seeds_), "%s: Task 2 episodes incomplete" % name)
+        ok_(sorted(t) == test_all_, "%s: Task 1 conversations != test_all" % name)
+        eps_[name], t1_[name] = (e, ck), t
+        if name.startswith("v18") and summ:
+            sm = summ[-1]
+            E = [x for x in e.values() if x[ck]]
+            ts = TP.turn_stats_v18(E, t_max) if E else {}
+            for k in ("turn_w1", "abs_diff_mean", "sim_turns_mean", "coverage_mean", "coverage_missing"):
+                ok_(close((sm.get("turn_stats") or {}).get(k), ts.get(k)), "v18 summary %s %r != recomputed %r"
+                    % (k, (sm.get("turn_stats") or {}).get(k), ts.get(k)))
+            ok_(sm.get("n_unclean_episodes") == len(e) - len(E), "v18 unclean count")
+            rs = [t[c] for c in test_all_]
+            m = T1.task1_stop_metrics([r["task1"] for r in rs])
+            m.update(T1.task1_prob_metrics([p for r in rs for p in r["end_probs"]]))
+            for k in ("term_f1", "bal_p", "auc", "nll"):
+                ok_(close(sm["task1"].get(k), m.get(k)), "v18 summary %s" % k)
+    if fails_:
+        print("TEST CHECK FAILED (%d)" % len(fails_))
+        sys.exit(1)
+    print("TEST CHECK PASSED")
+
+    def t2(name, keys):
+        e, ck = eps_[name]
+        E = [e[k] for k in keys]
+        sim = [x["emitted_user_turns"] for x in E]
+        hum = [min(int(x["human_turns"]), t_max) for x in E]
+        covs = [(x.get("coverage_diag") if ck == "clean_v18" else x.get("coverage")) for x in E]
+        have = [float(c) for c in covs if c is not None]
+        return {"w1": TP.turn_w1(sim, hum), "abs_err": sum(abs(a_ - b_) for a_, b_ in zip(sim, hum)) / len(E),
+                "cov": (sum(have) / len(have)) if have else None, "sim": sum(sim) / len(sim), "hum": sum(hum) / len(hum)}
+
+    def t1s(name, convs):
+        rs = [t1_[name][c] for c in convs]
+        m = T1.task1_stop_metrics([r["task1"] for r in rs])
+        m.update(T1.task1_prob_metrics([p for r in rs for p in r["end_probs"]]))
+        return m
+    lb = {"w1": True, "abs_err": True, "cov": False, "sim": None, "term_f1": False, "bal_p": False, "auc": False}
+    for name in pols:
+        e, ck = eps_[name]
+        keys = sorted(k for k, x in e.items() if x[ck])
+        x2, x1 = t2(name, keys), t1s(name, test_all_)
+        print("%-15s Task 2 %d clean episodes: sim %.2f human %.2f W1 %.3f |diff| %.2f cov(diag) %s | Task 1: term_f1 "
+              "%.3f bal_p %.3f auc %s nll %s" % (name, len(keys), x2["sim"], x2["hum"], x2["w1"], x2["abs_err"],
+                                                 None if x2["cov"] is None else round(x2["cov"], 3), x1["term_f1"],
+                                                 x1["bal_p"], None if x1["auc"] is None else round(x1["auc"], 3),
+                                                 None if x1["nll"] is None else round(x1["nll"], 4)))
+    print("NOTE: v18 vs v17 is the combined effect of the reward, the advantage and the reranker (SPEC v18 §0, §8); "
+          "9 test conversations: directions only, no significance claims.")
+    for base in ("v17 SFT (u0)", grpo_name):
+        a_n, b_n = base, "v18 (GRPO+R)"
+        ea, cka = eps_[a_n]
+        eb, ckb = eps_[b_n]
+        both = sorted(k for k in set(ea) & set(eb) if ea[k][cka] and eb[k][ckb])
+        rng = random.Random(0)
+        by_c = {c: [k for k in both if k[0] == c] for c in test_}
+        convs = [c for c in test_ if by_c[c]]
+        d = collections.defaultdict(list)
+        for _ in range(10000):
+            ks = [k for c in (rng.choice(convs) for _ in convs) for k in by_c[c]]
+            x, y = t2(a_n, ks), t2(b_n, ks)
+            for m in ("w1", "abs_err", "cov", "sim"):
+                if x[m] is not None and y[m] is not None:
+                    d[m].append(y[m] - x[m])
+        full = {n: t2(n, both) for n in (a_n, b_n)}
+        print("%s vs %s, Task 2: %d paired episodes on %d conversations (clean in both)" % (b_n, a_n, len(both), len(convs)))
+        for m in ("w1", "abs_err", "cov", "sim"):
+            show_(m, d[m], full[a_n][m], full[b_n][m], lb[m], a_n, b_n)
+        d1 = collections.defaultdict(list)
+        for _ in range(10000):
+            cs = [rng.choice(test_all_) for _ in test_all_]
+            x, y = t1s(a_n, cs), t1s(b_n, cs)
+            for m in ("term_f1", "bal_p", "auc"):
+                if x[m] is not None and y[m] is not None:
+                    d1[m].append(y[m] - x[m])
+        f1 = {n: t1s(n, test_all_) for n in (a_n, b_n)}
+        print("%s vs %s, Task 1: %d conversations" % (b_n, a_n, len(test_all_)))
+        for m in ("term_f1", "bal_p", "auc"):
+            show_(m, d1[m], f1[a_n][m], f1[b_n][m], lb[m], a_n, b_n)
+    sys.exit(0)
+
+
+def close(a_, b_):
+    return a_ == b_ or (a_ is not None and b_ is not None and abs(a_ - b_) < 1e-9)
+
+
+def show_(m, d, fa, fb, lower_better, la, lb_):
+    if not d:
+        print("   %-8s no paired value" % m)
+        return
+    d = sorted(d)
+    lo, hi = d[int(0.025 * len(d))], d[int(0.975 * len(d)) - 1]
+    extra = "" if lower_better is None else "  P(%s better) %.3f" % (
+        lb_, sum(1 for x in d if (x < 0 if lower_better else x > 0)) / len(d))
+    print("   %-8s %s %s -> %s %s  diff %s  95%% CI [%.3f, %.3f]%s" % (
+        m, la, "None" if fa is None else "%.3f" % fa, lb_, "None" if fb is None else "%.3f" % fb,
+        "None" if None in (fa, fb) else "%.3f" % (fb - fa), lo, hi, extra))
+
+
+if (first.get("config") or {}).get("spec_version") == "v18":
+    boot_v18(run, meta, first)
+
 # ---- ids against the splits file of the run
 args = first["config"]["args"]
 ok(TP.sha_file(args["splits"]) == first["splits_sha256"] == meta["splits_sha256"], "splits file sha differs from the run's")

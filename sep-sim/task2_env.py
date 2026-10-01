@@ -189,6 +189,40 @@ def rl_masks(planner, g, unparsed, diag, t):
     return sm, nm
 
 
+def t1_value_mask(planner, g, diag):
+    """SPEC v18 §3.1.5: the turn-1 end_session VALUE tokens (planner.stop_mask, the value is ignored at turn 1), with the
+    same decode check as rl_masks: the masked text must contain the parsed end_session_raw value, else None (counted:
+    diag["t1_value_mismatch"]). Used only to keep the plan advantage off those tokens (no stop credit, no aux)."""
+    diag = diag if diag is not None else {}
+    sm = planner.stop_mask(g["gen_ids"])
+    if sm is None:
+        return None
+    raw = diag.get("end_session_raw")
+    want = "true" if (raw is True or str(raw).strip().lower() == "true") else "false"
+    txt = planner.tok.decode([x for x, m in zip(g["gen_ids"], sm) if m], skip_special_tokens=False)
+    if want not in txt.lower():
+        diag["t1_value_mismatch"] = True
+        return None
+    return sm
+
+
+def _act_distribution_of(step):
+    """The act_distribution the Planner wrote at this step (as parsed JSON, unmodified), None for a cut / unparsed plan."""
+    if step.get("planner_unparsed") or step.get("planner_hit_max_new"):
+        return None
+    from sepsim import state
+    d = state.json_of(step.get("planner_raw") or "") or {}
+    return d.get("act_distribution") if isinstance(d, dict) else None
+
+
+def episode_clean_v18(counts, capped, compacted, turns):
+    """SPEC v18 §3.2: an episode may enter a v18 reward group / count in a v18 validation or test when no R0 reply was cut
+    or empty, no capped message was emitted, no step was compacted and at least one message was emitted. The ledger-judge
+    counters are recorded only (coverage is a diagnostic in v18; its value is None after a judge failure)."""
+    return counts.get("r0_len_truncated", 0) == 0 and counts.get("r0_empty", 0) == 0 and capped == 0 \
+        and compacted == 0 and turns > 0
+
+
 def step_compacted(step):
     """True when the Planner prompt or any Speaker candidate prompt of this step was compacted (history
     dropped to fit): never allowed for pend (verify FAILs; the episode leaves the reward groups)."""
@@ -608,7 +642,8 @@ class PlannerLM:
 
 class Task2Env:
     def __init__(self, arm, gpu, planner, judge=None, ditto_path=DITTO, corpus="/home/mzjiang/v5-latency/data.jsonl",
-                 batch=False, max_batch=8, implicit_profile=False, fewshot_pool=None, selector="length", task1_only=False):
+                 batch=False, max_batch=8, implicit_profile=False, fewshot_pool=None, selector="length", task1_only=False,
+                 reranker=None, rerank_topk=2):
         self.task1_only = bool(task1_only)     # Task 1 generation only: no R0 agent, no ledger judge
         if arm not in ARM_ENV:
             raise ValueError(arm)
@@ -644,15 +679,22 @@ class Task2Env:
         if (implicit_profile or fewshot_pool is not None) and arm != "pend":
             raise ValueError("the Implicit Profile is implemented for the pend arm")
         self.ip, self.fewshot = bool(implicit_profile), fewshot_pool
-        if selector not in ("length", "borda"):
+        if selector not in ("length", "borda", "borda_rerank"):
             raise ValueError(selector)
-        if selector == "borda" and arm != "pend":
+        if selector in ("borda", "borda_rerank") and arm != "pend":
             raise ValueError("the length+style selector is implemented for the pend arm")
+        if (selector == "borda_rerank") != (reranker is not None):
+            raise ValueError("selector borda_rerank needs a reranker json (and only it takes one)")
         self.selector = selector
         self.style_scorer = None
-        if selector == "borda":
+        self.hl_scorer, self.rerank_topk = None, int(rerank_topk)
+        if selector in ("borda", "borda_rerank"):
             import style_select
             self.style_scorer = style_select.StyleScorer()
+        if selector == "borda_rerank":
+            # SPEC v18 §6.4: Borda first, the human-likeness reranker chooses among the Borda top-k
+            import style_select
+            self.hl_scorer = style_select.HumanLikenessScorer(reranker, embedder=self.style_scorer)
         if arm == "pend":
             self.system = V3.system_prompt_pend(implicit_profile=self.ip)
             assert '"goal_met"' in self.system and '"last_reply_helpful"' not in self.system
@@ -782,6 +824,9 @@ class Task2Env:
                 "tree": tree_of(self.arm), "arm_env": ARM_ENV[self.arm], "t1_sampling": self.t1_sampling,
                 "implicit_profile": self.ip, "fewshot": self.fewshot.describe() if self.fewshot else None,
                 "selector": self.selector, "speaker_max_new": self.speaker.max_new, "planner_max_new": self.planner.max_new,
+                # SPEC v18 §6: the reranker file (sha, C, gate result) and top-k; None for the v17 selectors
+                "reranker": self.hl_scorer.describe() if getattr(self, "hl_scorer", None) is not None else None,
+                "rerank_topk": getattr(self, "rerank_topk", None) if getattr(self, "hl_scorer", None) is not None else None,
                 "judge_cache_dir": getattr(self, "judge_cache_dir", None), "task1_only": self.task1_only,
                 # v17 S12: the Speaker is Ditto-8B, which has NO conversation-end token (endconv None): a session ends
                 # only by the Planner's end_session or a blank selected message; the Ditto guardrail redraws a blank
@@ -1112,10 +1157,15 @@ class Task2Env:
             fallback = "whole_nonblank" if pool and any((cands[i] or "").strip() for i in pool) else \
                 ("whole_blank" if pool else "all_capped")
         sel = None
-        if self.selector == "borda":
+        if self.selector in ("borda", "borda_rerank"):
             own = S["mode"] == "task1" and t >= 2
             refs = list(hist_u) if own else [e["text"] for e in all_examples()]
-            idx, sel = SS.select(cands, pool, fields.get("length_words"), refs, self.style_scorer)
+            if self.selector == "borda_rerank":
+                # SPEC v18 §6.4: the same Borda pool and scores, the reranker picks within the top-k
+                idx, sel = SS.select_rerank(cands, pool, fields.get("length_words"), refs, self.style_scorer,
+                                            self.hl_scorer, self.rerank_topk)
+            else:
+                idx, sel = SS.select(cands, pool, fields.get("length_words"), refs, self.style_scorer)
             sel["refs"] = "own_real_messages" if own else ("fewshot" if refs else "none")
         else:
             idx = run_v2.choose(cands, fields.get("length_words"), None, pool)
@@ -1183,6 +1233,11 @@ class Task2Env:
                 # this episode's own incidents; an unclean episode never enters a reward group
                 "episode_counters": counts, "emitted_capped_steps": capped, "compacted_steps": compacted,
                 "clean": clean,
+                # SPEC v18 §3.2: the v18 definition (judge failures do not exclude) and the coverage diagnostic (None
+                # after a lost ledger verdict); "clean" keeps the v17 meaning
+                "clean_v18": episode_clean_v18(counts, capped, compacted, ep["emitted_user_turns"]),
+                "coverage_diag": None if (counts.get("judge_empty", 0) or counts.get("judge_unparseable", 0)
+                                          or counts.get("judge_error", 0)) else cov_final,
                 "human_turns": self.human_turns(conversation_id)}
 
     def task1_generate(self, conversation_id, seed=0, keep_prompts=False):
@@ -1239,6 +1294,8 @@ class Task2Env:
                          "fewshot": st.get("fewshot"), "speaker_hit_max_new": st.get("speaker_hit_max_new"),
                          "guard_reasons": st.get("guard_reasons"), "dup_redraws": st.get("dup_redraws"),
                          "selected_index": st.get("selected_index"), "selection": st.get("selection"),
+                         # SPEC v18 §7.2: the greedy plan's own act_distribution (the validation act / length scores)
+                         "act_distribution_raw": _act_distribution_of(st),
                          "planner_prompt_tokens": (st.get("planner_fit") or {}).get("prompt_tokens")})
             if keep_prompts:
                 rows[-1]["planner_prompt"] = st["planner_prompt"]
@@ -1291,6 +1348,13 @@ class Task2Env:
         users, _ = pipeline.split_messages(self.recs[conversation_id])
         return len(users)
 
+    def human_words(self, conversation_id):
+        """SPEC v18 §1.3: the whitespace word count of every real message (style_select.n_words), the r_len gold."""
+        from sepsim import pipeline
+        import style_select as SS
+        users, _ = pipeline.split_messages(self.recs[conversation_id])
+        return [SS.n_words(u["text"]) for u in users]
+
     def task1_prompts(self, conversation_id):
         """Greedy teacher-forced pass (current policy) -> per turn the exact Planner user prompt, so a
         Task 1 training group can sample G decisions from the same state the Planner would be in. The pass
@@ -1304,20 +1368,25 @@ class Task2Env:
                  "planner_fit": r.get("planner_fit"), "emitted_capped": bool(r.get("emitted_capped")),
                  "planner_hit_max_new": bool(r.get("planner_hit_max_new"))} for r in rows]
 
-    def task1_sample(self, conversation_id, t, user_prompt, real_final, G, temperature, top_p, seed):
+    def task1_sample(self, conversation_id, t, user_prompt, real_final, G, temperature, top_p, seed, t1=False):
         """G sampled Planner decisions at one real turn t >= 2 (turn 1 cannot end, so it teaches nothing about
         stopping); "correct" 1 if end_session == (message t was the person's last), else 0 (v17: logged only; the
         trainer's reward is the Brier score of the learner's P(end) on the sample's own prefix). A sample whose plan
         was not parsed, was cut by the token cap, or has no valid end_session value is not a decision: correct 0,
         no stop mask (so no stop credit), never used as the supervision example. A valid sample with a located
         value carries mask_ok, prefix_ids, target_true and target_false (v17 S1). Returned in the rollout schema
-        (one step with planner_gen each)."""
+        (one step with planner_gen each).
+        SPEC v18 (t1=True): turn 1 is sampled too (§3.1.5); every sample also carries the plan's act_distribution as
+        parsed (act_distribution_raw), and at t = 1 valid_t1 = parsed, not capped, act_distribution parseable, a valid
+        end_session value (although ignored) -- with the value tokens located by t1_value_mask (decode-checked) in
+        planner_gen.value_mask (None: not located / mismatch -> the trainer drops the sample)."""
         if self.arm != "pend":
             raise ValueError("task1_sample is implemented for the pend arm")
-        if t < 2:
+        if t < 2 and not t1:
             raise ValueError("Task 1 stop groups start at turn 2 (turn 1 cannot end)")
-        from sepsim import stopping
+        from sepsim import stopping, state
         import planner_prompt_v3 as V3
+        import rl_reward as RR
         scenario = self.recs[conversation_id]["scenario"]
         out = []
         seeds = [int(hashlib.sha256(("t1s|%s|%d|%d|%d" % (conversation_id, t, g, seed)).encode()).hexdigest()[:8], 16)
@@ -1354,7 +1423,19 @@ class Task2Env:
                 i = sm.index(1)
                 j = len(sm) - 1 - sm[::-1].index(1)
                 rt_ok = (tt if end else tf)["target_ids"] == list(gen["gen_ids"][i:j + 1])
-            out.append({"t": t, "replicate": g, "real_final": bool(real_final), "ended_planner": bool(end),
+            v18 = {}
+            vm = None
+            if t1:
+                dj = (state.json_of(gen["raw"]) or {}) if not (unparsed or gen["hit_max_new"]) else {}
+                dist_raw = dj.get("act_distribution") if isinstance(dj, dict) else None
+                v18 = {"act_distribution_raw": dist_raw}
+                if t == 1:
+                    vt1 = (not unparsed and not gen["hit_max_new"] and RR.act_dist_parseable(dist_raw)
+                           and (diag or {}).get("end_session_valid") is True)
+                    if vt1:
+                        vm = t1_value_mask(self.planner, gen, diag)
+                    v18.update(valid_t1=bool(vt1), value_mask_ok=(vm is not None) if vt1 else None)
+            out.append({**v18, "t": t, "replicate": g, "real_final": bool(real_final), "ended_planner": bool(end),
                         "planner_unparsed": unparsed, "planner_hit_max_new": gen["hit_max_new"],
                         "decision_valid": valid, "planner_diag": diag, "planner_fit": gen.get("fit"),
                         # v17: the 0/1 agreement is logged only (the reward is the trainer's Brier score)
@@ -1363,10 +1444,11 @@ class Task2Env:
                         "prefix_ids": tt["prefix_ids"] if mask_ok else None,
                         "target_true": tt["target_ids"] if mask_ok else None,
                         "target_false": tf["target_ids"] if mask_ok else None,
-                        "planner_gen": {"prompt_ids": gen["prompt_ids"], "gen_ids": gen["gen_ids"], "stop_mask": sm,
-                                        "note_mask": nm, "hit_max_new": gen["hit_max_new"],
-                                        "gen_logprobs": gen.get("gen_logprobs"), "gen_adapter": gen.get("gen_adapter"),
-                                        "temperature": temperature, "top_p": top_p, "seed": pseed}})
+                        "planner_gen": dict({"prompt_ids": gen["prompt_ids"], "gen_ids": gen["gen_ids"], "stop_mask": sm,
+                                             "note_mask": nm, "hit_max_new": gen["hit_max_new"],
+                                             "gen_logprobs": gen.get("gen_logprobs"), "gen_adapter": gen.get("gen_adapter"),
+                                             "temperature": temperature, "top_p": top_p, "seed": pseed},
+                                            **({"value_mask": vm} if (t1 and t == 1) else {}))})
         # (v17: the stop-supervision example of a position is built by the trainer from the first valid sample's own
         # prefix and targets -- Trainer.aux_examples; the v16 per-row "aux" field is gone, fix round 1 A-5)
         return out
@@ -1407,7 +1489,12 @@ class Task2Env:
                  "planner_hit_max_new": bool(r.get("planner_hit_max_new")),
                  "goal_met": r.get("goal_met"), "planner_diag": r.get("planner_diag"),
                  "planner_fit": r.get("planner_fit"), "speaker_fits": r.get("speaker_fits"),
-                 "speaker_hit_max_new": r.get("speaker_hit_max_new"), "emitted_capped": r.get("emitted_capped")}
+                 "speaker_hit_max_new": r.get("speaker_hit_max_new"), "emitted_capped": r.get("emitted_capped"),
+                 # SPEC v18 §7.2 validation inputs: the greedy plan's act_distribution, the selected message's words,
+                 # whether the reranker changed the Borda choice
+                 "act_distribution_raw": r.get("act_distribution_raw"),
+                 "selected_words": len((r.get("greedy") or "").split()),
+                 "rerank_changed": (r.get("selection") or {}).get("rerank_changed")}
             if keep_prompts:
                 x["user_prompt"] = r["planner_prompt"]
             turns.append(x)
