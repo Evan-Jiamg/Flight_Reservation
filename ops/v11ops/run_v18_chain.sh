@@ -10,6 +10,7 @@ G=/tmp2/mzjiang_usersim/grpo_planner
 D=$(cd "$(dirname "$0")" && pwd)
 echo "=== CHAIN v18 start $(date)"
 bash $D/run_v18_fold.sh 2 || { echo "CHAIN STOP: training $(date)"; exit 1; }
+# ALLOW_CODE_CHANGE (env) is passed through to the test step
 KEEP_SERVERS=1 bash $D/run_v18_test.sh 2 || { echo "CHAIN STOP: test $(date)"; exit 1; }
 bash $D/run_v18_bench.sh 2 || { echo "CHAIN STOP: benchmark $(date)"; exit 1; }
 echo "=== CHAIN v18 DONE $(date)"

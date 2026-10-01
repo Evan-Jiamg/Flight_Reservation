@@ -137,3 +137,9 @@ def test_start_servers6_up_is_ownership_checked():
     s = text("start_servers6.sh").decode()
     assert 'up() { pgrep -u $ME -f "vllm serve .*--port $1" > /dev/null && curl' in s
     assert "foreign $port && {" in s
+
+
+
+def test_test_launcher_allow_code_change_switch():
+    t = text("run_v18_test.sh").decode()
+    assert 'ALLOW_CODE_CHANGE:-0}" = "1" ] && { ACC="--allow-code-change"' in t and "$V18ARGS $ACC" in t

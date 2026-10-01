@@ -497,7 +497,32 @@ def check_a2(rows, rep, arm="a2"):
 PEND_FORBIDDEN = A2_FORBIDDEN + ("GOAL STATUS", E16_ROWS)
 
 
-def check_r0_attribution(rows, rep):
+def crashed_process(rl_dir, token):
+    """SPEC v18 run (2026-10-02): did the trainer process `token` end in a crash? The token is "<pid>-<start epoch>-<rand>"
+    (task2_env.PROCESS_TOKEN, created at import, before the launch's run_meta row). Its launch = the first run_meta
+    start / resume row at or after that epoch; it crashed iff a LATER launch (a --resume) exists with no "stop" row
+    between them (a launch that ends cleanly is the last one: it writes final.json and the stop row).
+    -> (crashed, why)."""
+    try:
+        start = int(str(token).split("-")[1])
+    except (IndexError, ValueError):
+        return False, "token %r has no start time" % (token,)
+    meta = sorted(_jl(os.path.join(rl_dir, "run_meta.jsonl")), key=lambda m: float(m.get("time") or 0))
+    launches = [m for m in meta if m.get("kind") in ("start", "resume")]
+    mine = next((m for m in launches if float(m.get("time") or 0) >= start - 5), None)
+    if mine is None:
+        return False, "no run_meta launch row after the process start %d" % start
+    nxt = next((m for m in launches if float(m["time"]) > float(mine["time"])), None)
+    if nxt is None:
+        return False, "the process's launch (%s at %.0f) is the last one" % (mine.get("kind"), float(mine["time"]))
+    stops = [m for m in meta if m.get("kind") == "stop" and float(mine["time"]) <= float(m["time"]) <= float(nxt["time"])]
+    if stops:
+        return False, "a stop row between its launch and the next one"
+    return True, "launch %s at %.0f followed by a %s at %.0f without a stop row" % (
+        mine.get("kind"), float(mine["time"]), nxt.get("kind"), float(nxt["time"]))
+
+
+def check_r0_attribution(rows, rep, rl_dir=None):
     """Every R0 reply cut by the token budget must be charged to the episode that received it (that
     episode is then unclean, pend.clean_flag, and never enters a reward group / evaluation). The
     *_total fields are running totals of one process, so rows are grouped by process_token (all rows
@@ -511,7 +536,23 @@ def check_r0_attribution(rows, rep):
         g = groups.setdefault(r.get("process_token"), [0, 0])
         g[0] = max(g[0], r.get("r0_len_truncated_total") or 0)
         g[1] += (r.get("episode_counters") or {}).get("r0_len_truncated", 0)
+    v18 = bool(rl_dir) and spec_version(rl_dir) == "v18"
+    workers = 1
+    if v18:
+        args = ((_jl(os.path.join(rl_dir, "run_meta.jsonl")) or [{}])[0].get("config") or {}).get("args") or {}
+        workers = max(1, int(args.get("rollout_workers") or 1))
     for tok, (total, attributed) in sorted(groups.items(), key=lambda kv: str(kv[0])):
+        if tok is not None and v18 and attributed < total:
+            # a crashed process's in-flight episodes (at most one per rollout worker) never wrote their rows, so their R0
+            # incidents are counted in the process total but charged to no logged episode; those episodes never entered a
+            # group or a validation summary. Tolerated ONLY for a demonstrably crashed process, as a WARN naming it.
+            crashed, why = crashed_process(rl_dir, tok)
+            if crashed and total - attributed <= workers:
+                rep._c("trunc.r0_attributed")
+                rep.warn("trunc.r0_attributed", "process %s: R0 truncations counted %d, charged to episodes %d -- the "
+                         "process crashed (%s); <= %d in-flight episode(s) without a row" % (tok, total, attributed, why,
+                                                                                             workers))
+                continue
         if tok is None:
             rep.ok("trunc.r0_attributed", attributed >= total, "legacy rows (no process_token)",
                    "R0 truncations counted %d, charged to episodes %d" % (total, attributed))
@@ -1555,6 +1596,12 @@ def check_rl(rl_dir, rollouts, ckpt_pattern, rep, splits_path=None):
             return u["reward_components"]
         agg = u.get("train_aggregate") or {}
         return agg["components_mean"] if "components_mean" in agg else None
+    if spec_version(rl_dir) == "v18":
+        # SPEC v18: the Task 1 / Task 2 components (task1_stats / task2_stats, per-sample components) are recomputed from
+        # the logs by rl.v18_reward / rl.v18_task1 / rl.v18_task2 / rl.v18_advantage -- not this v17-shaped field check
+        rep._c("rl.reward_components")
+        rep.note("rl.reward_components", "SKIP: covered by rl.v18_reward / rl.v18_task1 / rl.v18_task2 (SPEC v18 run)")
+        return
     up_has = [comps(u) is not None for u in ups]
     ro_has = [("reward_components" in r) for r in rollouts]
     for u in ups:
@@ -1684,7 +1731,7 @@ def verify(episodes, meta_path, splits_path, fold, split, arm=None, training=Fal
         vr = [r for r in (load_jsonl(vp, rep) if vp and os.path.exists(vp) else [])]
         rp = os.path.join(rl_dir, "reselect.jsonl") if rl_dir else None
         rr = [r for r in (load_jsonl(rp, rep) if rp and os.path.exists(rp) else [])]
-        check_r0_attribution(all_rows + vr + rr, rep)
+        check_r0_attribution(all_rows + vr + rr, rep, rl_dir)
         n_reuse = sum(1 for r in all_rows for s in (r.get("trace") or []) if s.get("ended_planner")
                       and s.get("guard_reasons") and "reuse" in [x for x in s["guard_reasons"] if x])
         name = "pend.close_rejected_as_reuse"

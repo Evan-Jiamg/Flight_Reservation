@@ -1249,3 +1249,55 @@ def test_label_acts_refuses_a_server_that_is_not_ours():
     assert L.server_is_ours(8029, user="me", pgrep=lambda c: seen.append(c) or 0)
     assert seen[0][:3] == ["pgrep", "-u", "me"] and "--port 8029" in seen[0][-1]
     assert not L.server_is_ours(8029, user="me", pgrep=lambda c: 1)
+
+
+# ================================================================== 2026-10-02 verify false positives on the fold-2 run
+def test_full_verify_skips_v17_reward_components_for_v18():
+    d, sp, out = fresh(updates=1)
+    rep = V.verify([], os.path.join(out, "run_meta.jsonl"), sp, 0, "train", "pend", rl_dir=out, expected_sha="x")
+    c = rep.checks["rl.reward_components"]
+    assert c["fail"] == 0 and any("covered by rl.v18" in n for n in c["notes"])
+
+
+def _r0_rows(tok, counted, charged):
+    rows = [{"r0_len_truncated_total": counted, "process_token": tok,
+             "episode_counters": {"r0_len_truncated": 1 if i < charged else 0}} for i in range(3)]
+    return rows
+
+
+def _meta(out, rows):
+    p = os.path.join(out, "run_meta.jsonl")
+    meta = T.read_jsonl(p)
+    base = meta[0]
+    rewrite(p, [dict(base, **r) for r in rows])
+
+
+def test_r0_attribution_tolerates_only_a_crashed_process():
+    d, sp, out = fresh(updates=1)
+    t0 = 1790867243
+    tok = "3926060-%d-3771cc8a" % t0
+    # the process's launch at t0+60 was followed by a --resume (no stop row between): crashed -> WARN
+    _meta(out, [{"kind": "start", "time": t0 + 60}, {"kind": "resume", "time": t0 + 9000},
+                {"kind": "stop", "time": t0 + 20000}])
+    rep = V.Report()
+    V.check_r0_attribution(_r0_rows(tok, 3, 2), rep, out)
+    c = rep.checks["trunc.r0_attributed"]
+    assert c["fail"] == 0 and c["warn"] and tok in c["notes"][0]
+    # more uncharged incidents than rollout workers: FAIL
+    rep = V.Report()
+    V.check_r0_attribution(_r0_rows(tok, 3 + 10, 2), rep, out)
+    assert rep.checks["trunc.r0_attributed"]["fail"] == 1
+    # the process's launch is the last one (no later --resume): not a crash -> FAIL
+    _meta(out, [{"kind": "start", "time": t0 + 60}, {"kind": "stop", "time": t0 + 20000}])
+    rep = V.Report()
+    V.check_r0_attribution(_r0_rows(tok, 3, 2), rep, out)
+    assert rep.checks["trunc.r0_attributed"]["fail"] == 1
+    # a stop row between the launch and the next one: ended cleanly -> FAIL
+    _meta(out, [{"kind": "start", "time": t0 + 60}, {"kind": "stop", "time": t0 + 100}, {"kind": "resume", "time": t0 + 9000}])
+    rep = V.Report()
+    V.check_r0_attribution(_r0_rows(tok, 3, 2), rep, out)
+    assert rep.checks["trunc.r0_attributed"]["fail"] == 1
+    # without a v18 run dir (v17 / no rl_dir): unchanged, FAIL
+    rep = V.Report()
+    V.check_r0_attribution(_r0_rows(tok, 3, 2), rep)
+    assert rep.checks["trunc.r0_attributed"]["fail"] == 1

@@ -65,6 +65,9 @@ FU=$($PY -c "import json; f = json.load(open('$RUN/final.json')); assert f['vali
   || { echo "STOP: final.json is not validated"; exit 1; }
 REASON=$($PY -c "import json; f = json.load(open('$RUN/final.json')); print(f['stop_reason'], 'GRPO adopted' if f['grpo_adopted'] else 'GRPO NOT adopted (final = u0)')")
 V18ARGS="--spec v18 --init-adapter $INIT --act-labels $LABELS --act-labels-val $LABELS_VAL --reranker $RERANK"
+# a snapshot deployed after training (e.g. a verifier fix) changes code_sha256: eval_test_rl's provenance check refuses it
+# unless ALLOW_CODE_CHANGE=1 (passes --allow-code-change, recorded in test_meta's args; labels / reranker stay pinned)
+ACC=""; [ "${ALLOW_CODE_CHANGE:-0}" = "1" ] && { ACC="--allow-code-change"; echo "TEST: --allow-code-change (ALLOW_CODE_CHANGE=1)"; }
 trap release EXIT
 if pgrep -u mzjiang -f "python.* .*gpu_holder3\.py" > /dev/null; then
   echo "TEST: reusing the running placeholder ($H)"
@@ -81,7 +84,7 @@ for attempt in $(seq 1 10); do
   SZ=$(stat -c %s $RUN/test.log 2>/dev/null || echo 0)
   echo "=== test evaluation on GPU $GPU (attempt $attempt) $(date)"
   $PY eval_test_rl.py --final --test-seeds 0 1 2 3 4 5 6 7 --test-updates $FU --v17-run $RUN17 \
-      --fold $F --planner-path $Q4 --gpu $GPU --rollout-workers 4 --out $RUN $V18ARGS >> $RUN/test.log 2>&1
+      --fold $F --planner-path $Q4 --gpu $GPU --rollout-workers 4 --out $RUN $V18ARGS $ACC >> $RUN/test.log 2>&1
   rc=$?; settarget $TG $TN; TG=""; echo "test rc=$rc $(date)"
   [ $rc -eq 0 ] && break
   if tail -c +$((SZ + 1)) $RUN/test.log | grep -cE "CUDA out of memory|CUDA error: out of memory|OutOfMemoryError|GPU budget not available" > /dev/null; then
