@@ -37,7 +37,11 @@ STARTUP_RE="less than desired GPU memory utilization"
 MEM_RE="CUDA out of memory|CUDA error: out of memory|OutOfMemoryError|Error in memory profiling|No available memory for the cache blocks"
 FATAL_RE="Engine core initialization failed"   # a bare Traceback may be a non-fatal warning path
 declare -A RACES BACKOFF
-up() { curl -s -m 5 http://127.0.0.1:$1/v1/models | grep -q "$2"; }
+# 2026-10-01: a server counts as up only if OUR vllm process serves the port -- another user's server on the same
+# localhost port (seen at 20:03 on 8029) must never be reused
+up() { pgrep -u $ME -f "vllm serve .*--port $1" > /dev/null && curl -s -m 5 http://127.0.0.1:$1/v1/models | grep -q "$2"; }
+# a port that answers HTTP while no vllm process of ours serves it: another user's server -- never reused, never raced
+foreign() { ! pgrep -u $ME -f "vllm serve .*--port $1" > /dev/null && curl -s -m 5 http://127.0.0.1:$1/v1/models > /dev/null 2>&1; }
 held() { cat $H/status_$1 2>/dev/null || echo 0; }
 tgt() { cat $H/target_$1 2>/dev/null || echo 0; }
 role() { cat $H/role_$1 2>/dev/null; }
@@ -220,6 +224,10 @@ Q4=$(ls -d /tmp2/hf_shared/hub/models--Qwen--Qwen3-4B-Instruct-2507/snapshots/*/
 holder_alive
 while true; do
   OUP=0; PUP=0; up 8029 gpt-oss-120b && OUP=1; up 8031 planner-base && PUP=1
+  for port in 8029 8031; do
+    [ "${OSS_ONLY:-0}" = 1 ] && [ $port = 8031 ] && continue
+    foreign $port && { echo "STOP: port $port answers but is not served by a vllm process of $ME -- not ours, not reused"; exit 1; }
+  done
   [ "${OSS_ONLY:-0}" = 1 ] && [ $OUP = 1 ] && { echo "gpt-oss up (OSS_ONLY: no planner vLLM)"; exit 0; }
   if [ ! -f $H/role_train ]; then
     if hint; then

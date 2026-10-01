@@ -368,6 +368,22 @@ def parse(argv=None):
     return a
 
 
+def local_port_of(url):
+    m = re.match(r"https?://(?:127\.0\.0\.1|localhost):(\d+)", url or "")
+    return int(m.group(1)) if m else None
+
+
+def server_is_ours(port, user=None, pgrep=None):
+    """2026-10-01 (the 20:03 incident: another user's server answered on localhost:8029): a local endpoint is used only
+    when a vllm process of OUR user serves that port. -> bool."""
+    import getpass
+    import subprocess
+    user = user or getpass.getuser()
+    cmd = ["pgrep", "-u", user, "-f", "vllm serve .*--port %d" % int(port)]
+    run = pgrep or (lambda c: subprocess.run(c, capture_output=True).returncode)
+    return run(cmd) == 0
+
+
 def main(argv=None, chat=None):
     a = parse(argv)
     sys.addaudithook(_audit)
@@ -375,6 +391,10 @@ def main(argv=None, chat=None):
     if chat is None:
         if a.dry_run:
             raise SystemExit("--dry-run needs a chat function (tests)")
+        port = local_port_of(a.base_url)
+        if port is not None and not server_is_ours(port):
+            raise SystemExit("%s: no vllm process of ours serves port %d -- refusing to label with another user's server"
+                             % (a.base_url, port))
         chat = lambda system, user, seed: http_chat(a.base_url, a.model, system, user, seed, effort=a.effort)
     return label_split(a, acts, chat)
 

@@ -80,7 +80,7 @@ def test_label_and_reranker_launchers():
     # audit A: gpt-oss only (no Planner vLLM), and never two labellers / a trainer at once
     assert "OSS_ONLY=1 bash $G/start_servers6.sh" in s and 'pgrep -u mzjiang -f "label_acts.py|train_planner_rl.py' in s
     ss = text("start_servers6.sh").decode()
-    assert ss.count('"${OSS_ONLY:-0}" = 1') == 2
+    assert ss.count('"${OSS_ONLY:-0}" = 1') == 3        # exit when up, exit after the start, skip the 8031 foreign check
     r = text("run_v18_reranker.sh").decode()
     assert '"train_all 0 1" "validation_all 0"' in r and "train_reranker.py fit" in r and "--force-unload" in r
 
@@ -103,3 +103,37 @@ def test_fold_refuses_without_approval(tmp_path):
     (tmp_path / "labels.jsonl.APPROVED").write_text(hashlib.sha256(lab.read_bytes()).hexdigest() + "\n")
     r = subprocess.run([BASH, "-c", script], capture_output=True, text=True)
     assert "GUARD_OK" in r.stdout, r.stdout + r.stderr
+
+
+# ------------------------------------------------------------------ server ownership (2026-10-01, the 20:03 incident)
+def _label_guard_script(tmp_path, ours, answers):
+    s = text("run_v18_label.sh").decode()
+    start = s.index("ours_oss() {")
+    end = s.index("\n", s.index('echo "STOP: port 8029 is served by a process that is not ours'))
+    stub = ('pgrep() { case "$*" in *"vllm serve"*"8029"*) %s;; *) return 1;; esac; }\n'
+            'curl() { %s; }\n' % ("return 0" if ours else "return 1",
+                                   "echo '{\"data\": [{\"id\": \"gpt-oss-120b\"}]}'" if answers else "return 7"))
+    return "set -uo pipefail\n" + stub + s[start:end + 1] + "echo GUARD_PASSED\n"
+
+
+@pytest.mark.parametrize("ours,answers,passed", [(False, True, False), (True, True, True), (False, False, True)])
+def test_label_refuses_a_foreign_8029(tmp_path, ours, answers, passed):
+    if BASH is None:
+        pytest.skip("no POSIX bash")
+    r = subprocess.run([BASH, "-c", _label_guard_script(tmp_path, ours, answers)], capture_output=True, text=True)
+    assert ("GUARD_PASSED" in r.stdout) == passed, r.stdout + r.stderr
+    if not passed:
+        assert "not ours" in r.stdout
+
+
+def test_scoring_requires_our_judge_process():
+    for f in ("bench_score_f2.sh", "bench_score_f2_v18.sh"):
+        s = open(os.path.join(SEP, f), encoding="utf-8").read()
+        g = s.index('pgrep -u mzjiang -f "vllm serve .*--port 8029"')
+        assert g < s.index('if ! curl -s -m 10 $JUDGE_URL/models'), f
+
+
+def test_start_servers6_up_is_ownership_checked():
+    s = text("start_servers6.sh").decode()
+    assert 'up() { pgrep -u $ME -f "vllm serve .*--port $1" > /dev/null && curl' in s
+    assert "foreign $port && {" in s

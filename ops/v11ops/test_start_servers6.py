@@ -206,3 +206,24 @@ start_server oss 0 > /dev/null; echo "rc2=$? target=$(tgt 0) next=$NEXT_BACKOFF"
     assert lines[1] == "rc2=75 target=91 next=gpt-oss-120b@g0"
     calls = [c for c in (fake / "calls").read_text().splitlines() if not c.startswith("p")]
     assert calls == ["killed target=14", "---", "sleep 60 target=91", "killed target=14"]
+
+
+# ------------------------------------------------------------------ server ownership (2026-10-01, the 20:03 incident)
+CURL = r"""
+curl() { u="${@: -1}"; case "$u" in *:8029/*) [ -f $FAKE/answers_8029 ] && cat $FAKE/answers_8029 ;; *:8031/*) [ -f $FAKE/answers_8031 ] && cat $FAKE/answers_8031 ;; esac; [ -n "$(case "$u" in *:8029/*) cat $FAKE/answers_8029 2>/dev/null;; *:8031/*) cat $FAKE/answers_8031 2>/dev/null;; esac)" ]; }
+"""
+
+
+def test_up_requires_our_vllm_process(tmp_path):
+    for sub in ("a", "b", "c"):                     # a fresh fake dir per case
+        (tmp_path / sub).mkdir()
+    body = CURL + 'up 8029 gpt-oss-120b && echo UP || echo DOWN; foreign 8029 && echo FOREIGN || echo NOTFOREIGN'
+    # another user's server answers on 8029, no vllm process of ours: not up, foreign
+    out, err, _ = run(tmp_path / "a", body, {"answers_8029": '{"data": [{"id": "gpt-oss-120b"}]}'})
+    assert out.split() == ["DOWN", "FOREIGN"], out + err
+    # our vllm process serves it: up, not foreign
+    out, err, _ = run(tmp_path / "b", body, {"answers_8029": '{"data": [{"id": "gpt-oss-120b"}]}', "port_pids": "4242"})
+    assert out.split() == ["UP", "NOTFOREIGN"], out + err
+    # nothing answers: neither
+    out, err, _ = run(tmp_path / "c", body, {})
+    assert out.split() == ["DOWN", "NOTFOREIGN"], out + err

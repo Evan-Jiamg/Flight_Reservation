@@ -1240,3 +1240,12 @@ def test_bench_boot_says_2afc_is_point_value_only(tmp_path):
                    str(tmp_path / "c.json"), "--corpus", corpus, "--n-boot", "20", "--out", str(tmp_path / "o.json")])
     k = [x for x in out["not_bootstrapped"] if "two_alternative_forced_choice" in x]
     assert k and "POINT VALUE ONLY" in out["not_bootstrapped"][k[0]]
+
+
+def test_label_acts_refuses_a_server_that_is_not_ours():
+    import label_acts as L
+    assert L.local_port_of("http://127.0.0.1:8029/v1") == 8029 and L.local_port_of("https://api.x.com/v1") is None
+    seen = []
+    assert L.server_is_ours(8029, user="me", pgrep=lambda c: seen.append(c) or 0)
+    assert seen[0][:3] == ["pgrep", "-u", "me"] and "--port 8029" in seen[0][-1]
+    assert not L.server_is_ours(8029, user="me", pgrep=lambda c: 1)

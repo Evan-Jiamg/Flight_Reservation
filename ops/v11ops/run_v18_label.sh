@@ -38,7 +38,11 @@ if pgrep -u mzjiang -f "label_acts.py|train_planner_rl.py|eval_test_rl.py|smoke_
   echo "STOP: label_acts.py or another job of ours is already running"; exit 1; fi
 mkdir -p $L
 trap release EXIT
-if ! curl -s -m 5 http://127.0.0.1:8029/v1/models | grep -q gpt-oss-120b; then
+# 2026-10-01: reuse only OUR gpt-oss (another user's server on localhost:8029 answered the first 3 calls at 20:03)
+ours_oss() { pgrep -u mzjiang -f "vllm serve .*--port 8029" > /dev/null && curl -s -m 5 http://127.0.0.1:8029/v1/models | grep -q gpt-oss-120b; }
+if ! ours_oss && curl -s -m 5 http://127.0.0.1:8029/v1/models > /dev/null 2>&1; then
+  echo "STOP: port 8029 is served by a process that is not ours -- refusing to label with it"; exit 1; fi
+if ! ours_oss; then
   pgrep -u mzjiang -f "vllm serve" > /dev/null || STARTED_SERVERS=1
   if ! pgrep -u mzjiang -f "python.* .*gpu_holder3\.py" > /dev/null; then
     STARTED_HOLDER=1; rm -rf $H; mkdir -p $H

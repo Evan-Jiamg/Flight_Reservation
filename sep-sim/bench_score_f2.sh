@@ -160,6 +160,10 @@ n_end = sum(r["greedy_end_decision"] for r in rows)
 print("generations OK: %d rows = %d gold user turns, %d END rows" % (len(rows), len(gold), n_end))
 PY
   [ -n "${PREFLIGHT_ONLY:-}" ] && { echo "u$U: preflight OK (PREFLIGHT_ONLY: not scored)"; continue; }
+  # 2026-10-01 (20:03 incident): the judge on :8029 must be OUR vllm process (another user's server answered there)
+  case "$JUDGE_URL" in *127.0.0.1:8029*|*localhost:8029*)
+    pgrep -u mzjiang -f "vllm serve .*--port 8029" > /dev/null || { echo "STOP: $JUDGE_URL answers but no vllm process of ours serves port 8029 -- not our judge"; exit 1; };;
+  esac
   if ! curl -s -m 10 $JUDGE_URL/models | grep -q "\"$JMODEL\""; then
     echo "STOP: the judge $JMODEL does not answer at $JUDGE_URL/models."
     echo "      Generation does not need it, scoring does: start gpt-oss-120b on :8029 (e.g. on the GPU the generation"
